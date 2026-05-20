@@ -200,20 +200,34 @@ impl<'a> Processor<'a> {
             }
             (html, final_base)
         };
-        let mut chunks = html::extract_chunks(&html, &final_base);
         let html_build_id = html::extract_build_id(&html);
-        let build_id = html_build_id
-            .clone()
-            .or_else(|| Some(cache::fingerprint(&chunks)));
-
-        if let Some(path) = cache_path {
-            if let (Some(bytes), Some(t0)) =
-                (cache::read_build_bytes(path, build_id.as_deref()), t0)
-            {
+        if let (Some(path), Some(build_id), Some(t0)) = (cache_path, html_build_id.as_deref(), t0) {
+            if let Some(bytes) = cache::read_build_bytes(path, Some(build_id)) {
                 return Ok((
                     serde_json::from_slice::<Output>(&bytes)?.mark(Some(t0), "hit", None),
                     true,
                 ));
+            }
+        }
+
+        let scan_base = final_base.clone();
+        let html_result =
+            tokio::task::spawn_blocking(move || scan::scan_document(&html, &scan_base)).await?;
+        let mut chunks = html_result.refs;
+        let build_id = html_build_id
+            .clone()
+            .or_else(|| Some(cache::fingerprint(&chunks)));
+
+        if html_build_id.is_none() {
+            if let Some(path) = cache_path {
+                if let (Some(bytes), Some(t0)) =
+                    (cache::read_build_bytes(path, build_id.as_deref()), t0)
+                {
+                    return Ok((
+                        serde_json::from_slice::<Output>(&bytes)?.mark(Some(t0), "hit", None),
+                        true,
+                    ));
+                }
             }
         }
 
@@ -225,14 +239,6 @@ impl<'a> Processor<'a> {
             ))
         });
 
-        let html_scan_body = html.clone();
-        let html_scan_task = tokio::task::spawn_blocking(move || {
-            let mut apis = ApiMap::default();
-            let mut candidates = CandidateMap::default();
-            scan::scan(&html_scan_body, &mut apis);
-            scan::scan_candidates(&html_scan_body, &mut candidates);
-            (apis, candidates)
-        });
         let mut manifest_apis = ApiMap::default();
         let mut manifest_candidates = CandidateMap::default();
         scan_next_manifests(
@@ -245,8 +251,8 @@ impl<'a> Processor<'a> {
             &mut chunks,
         )
         .await;
-        let mut apis = ApiMap::default();
-        let mut candidates = CandidateMap::default();
+        let mut apis = html_result.apis;
+        let mut candidates = html_result.candidates;
         let chunk_stats = fetch::scan_chunks(
             self.client.clone(),
             chunks.iter().cloned(),
@@ -262,9 +268,6 @@ impl<'a> Processor<'a> {
             &mut candidates,
         )
         .await;
-        let (html_apis, html_candidates) = html_scan_task.await?;
-        scan::merge_into(&mut apis, html_apis);
-        scan::merge_candidates_into(&mut candidates, html_candidates);
         scan::merge_into(&mut apis, manifest_apis);
         scan::merge_candidates_into(&mut candidates, manifest_candidates);
         for url in apis.keys() {
@@ -355,9 +358,10 @@ async fn scan_next_manifests(
         let Ok(Some(body)) = task.await else {
             continue;
         };
-        scan::scan(&body, apis);
-        scan::scan_candidates(&body, candidates);
-        chunks.extend(html::extract_chunk_refs(&body, &manifest_url));
+        let result = scan::scan_document(&body, &manifest_url);
+        scan::merge_into(apis, result.apis);
+        scan::merge_candidates_into(candidates, result.candidates);
+        chunks.extend(result.refs);
     }
 }
 

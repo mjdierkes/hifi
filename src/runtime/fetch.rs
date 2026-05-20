@@ -1,4 +1,3 @@
-use crate::scan::html;
 use crate::scan::{self, ApiMap, CandidateMap};
 
 use super::cache::{self, ChunkData};
@@ -270,15 +269,15 @@ async fn scan_body(
     memory: Option<ChunkMemoryCache>,
     validators: cache::ChunkValidators,
 ) -> Result<ScannedChunk, ()> {
-    let mut apis = ApiMap::default();
-    let mut candidates = CandidateMap::default();
-    let refs = html::extract_chunk_refs(&body, &url);
     let raw_body = body.clone();
-    scan_bytes(body, &mut apis, &mut candidates).await?;
+    let scan_url = url.clone();
+    let result = tokio::task::spawn_blocking(move || scan::scan_document(&body, scan_url.as_ref()))
+        .await
+        .map_err(|_| ())?;
     let chunk = Arc::new(ChunkData {
-        apis,
-        candidates,
-        refs,
+        apis: result.apis,
+        candidates: result.candidates,
+        refs: result.refs,
     });
     if use_cache {
         cache::write_chunk_with_validators(&url, &chunk, cache_key, &validators);
@@ -328,25 +327,6 @@ fn memory_key(url: &Url, cache_key: Option<&str>) -> String {
         Some(cache_key) => format!("{cache_key}\n{}", url.as_str()),
         None => url.as_str().to_string(),
     }
-}
-
-async fn scan_bytes(
-    bytes: Bytes,
-    apis: &mut ApiMap,
-    candidates: &mut CandidateMap,
-) -> Result<(), ()> {
-    let (chunk_apis, chunk_candidates) = tokio::task::spawn_blocking(move || {
-        let mut chunk_apis = ApiMap::default();
-        let mut chunk_candidates = CandidateMap::default();
-        scan::scan(&bytes, &mut chunk_apis);
-        scan::scan_candidates(&bytes, &mut chunk_candidates);
-        (chunk_apis, chunk_candidates)
-    })
-    .await
-    .map_err(|_| ())?;
-    scan::merge_into(apis, chunk_apis);
-    scan::merge_candidates_into(candidates, chunk_candidates);
-    Ok(())
 }
 
 async fn fetch_chunk_body(

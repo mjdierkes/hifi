@@ -1,4 +1,5 @@
-use hifi::scan::{scan, scan_candidates, ApiMap, CandidateMap};
+use hifi::scan::{scan, scan_candidates, scan_document, ApiMap, CandidateMap};
+use url::Url;
 
 #[test]
 fn finds_fetch_url_and_shape() {
@@ -75,6 +76,29 @@ fn finds_unquoted_api_candidates() {
 
     assert!(candidates.contains_key("/api/raw"));
     assert!(candidates.contains_key("/_next/data/b1/raw.json"));
+}
+
+#[test]
+fn fused_scan_collects_apis_candidates_and_chunk_refs() {
+    let base = Url::parse("https://example.com/_next/static/chunks/app/main.js").unwrap();
+    let result = scan_document(
+        br#"
+            fetch("/api/users", {method:"POST", headers:{"Content-Type":"application/json"}});
+            const route=`/api/team/${id}`;
+            self.__next_f.push([1,/_next/data/b1/raw.json]);
+            e.u=function(e){return"static/chunks/app/dashboard-deadbeef.js"};
+        "#,
+        &base,
+    );
+
+    assert_eq!(result.apis["/api/users"].methods_csv(), "POST");
+    assert_eq!(result.apis["/api/users"].flags_csv(), "headers,json");
+    assert!(result.candidates.contains_key("/api/team/{dynamic}"));
+    assert!(result.candidates.contains_key("/_next/data/b1/raw.json"));
+    assert!(result
+        .refs
+        .iter()
+        .any(|url| url.as_str().ends_with("app/dashboard-deadbeef.js")));
 }
 
 fn scanned(bytes: &[u8]) -> ApiMap {

@@ -1,8 +1,9 @@
-use self::literals::{BAD_EXTS, CALL_LITERALS, SHAPE_LITERALS};
-use aho_corasick::AhoCorasick;
-use rustc_hash::FxHashMap;
+use self::literals::{BAD_EXTS, CALL_LITERALS, SHAPE_LITERALS, SKIPPED_CHUNK_FRAGMENTS};
+use aho_corasick::{AhoCorasick, MatchKind};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
+use std::{collections::VecDeque, sync::LazyLock};
+use url::Url;
 
 static CALL_AC: LazyLock<AhoCorasick> =
     LazyLock::new(|| AhoCorasick::new(CALL_LITERALS).expect("valid call literals"));
@@ -10,6 +11,20 @@ static SHAPE_AC: LazyLock<AhoCorasick> =
     LazyLock::new(|| AhoCorasick::new(SHAPE_LITERALS).expect("valid shape literals"));
 static CANDIDATE_AC: LazyLock<AhoCorasick> =
     LazyLock::new(|| AhoCorasick::new(CANDIDATE_LITERALS).expect("valid candidate literals"));
+static DOCUMENT_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    let mut patterns = Vec::with_capacity(
+        CALL_LITERALS.len() + SHAPE_LITERALS.len() + CANDIDATE_LITERALS.len() + 2,
+    );
+    patterns.extend_from_slice(CALL_LITERALS);
+    patterns.extend_from_slice(SHAPE_LITERALS);
+    patterns.extend_from_slice(CANDIDATE_LITERALS);
+    patterns.push("/_next/");
+    patterns.push("static/chunks/");
+    AhoCorasick::builder()
+        .match_kind(MatchKind::LeftmostLongest)
+        .build(patterns)
+        .expect("valid document literals")
+});
 
 pub type ApiMap = FxHashMap<String, Shape>;
 pub type CandidateMap = FxHashMap<String, ()>;
@@ -32,6 +47,14 @@ const METHODS: [(u8, &str); 5] = [
 ];
 const CONTENT_TYPES: [(u8, &str); 1] = [(CONTENT_JSON, "application/json")];
 const CANDIDATE_LITERALS: &[&str] = &["/api", "/graphql", "/trpc", "/_next/data"];
+const SHAPE_WINDOW: usize = 400;
+
+#[derive(Default)]
+pub struct ScanResult {
+    pub apis: ApiMap,
+    pub candidates: CandidateMap,
+    pub refs: Vec<Url>,
+}
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Shape {
@@ -83,9 +106,118 @@ impl Shape {
     }
 }
 
-pub fn scan(bytes: &[u8], apis: &mut ApiMap) {
-    const WIN: usize = 400;
+struct PendingApi {
+    url: String,
+    shape: Shape,
+    expires_at: usize,
+}
 
+pub fn scan_document(bytes: &[u8], base: &Url) -> ScanResult {
+    let mut out = ScanResult::default();
+    let mut seen_refs = FxHashSet::default();
+    let mut recent_shapes: VecDeque<(usize, ShapeKind)> = VecDeque::new();
+    let mut pending: Vec<PendingApi> = Vec::new();
+
+    for m in DOCUMENT_AC.find_iter(bytes) {
+        let pos = m.start();
+        flush_pending(&mut pending, &mut out.apis, pos);
+        prune_recent_shapes(&mut recent_shapes, pos);
+
+        let pattern = m.pattern().as_usize();
+        if pattern < CALL_LITERALS.len() {
+            let after = m.end();
+            let Some(url) = extract_url_arg(bytes, after) else {
+                continue;
+            };
+            if !is_url_like(url) {
+                continue;
+            }
+
+            let mut shape = Shape::default();
+            shape.methods |= method_hint(CALL_LITERALS[pattern]);
+            for (_, kind) in &recent_shapes {
+                apply_shape_kind(&mut shape, *kind);
+            }
+            pending.push(PendingApi {
+                url: url.to_owned(),
+                shape,
+                expires_at: after.saturating_add(SHAPE_WINDOW),
+            });
+            continue;
+        }
+
+        let shape_start = CALL_LITERALS.len();
+        let shape_end = shape_start + SHAPE_LITERALS.len();
+        if pattern < shape_end {
+            let kind = shape_kind(pattern - shape_start);
+            recent_shapes.push_back((pos, kind));
+            for pending in &mut pending {
+                if pos <= pending.expires_at {
+                    apply_shape_kind(&mut pending.shape, kind);
+                }
+            }
+            continue;
+        }
+
+        let candidate_start = shape_end;
+        let candidate_end = candidate_start + CANDIDATE_LITERALS.len();
+        if pattern < candidate_end {
+            if let Some(url) = extract_candidate_at(bytes, pos) {
+                out.candidates.entry(url).or_default();
+            }
+            continue;
+        }
+
+        if pattern == candidate_end {
+            let start = walk_chunk_url_start(bytes, pos);
+            let end = pos + chunk_url_len(&bytes[pos..], false);
+            push_chunk_ref(
+                &bytes[start..end],
+                base,
+                false,
+                &mut seen_refs,
+                &mut out.refs,
+            );
+        } else {
+            if pos >= 7 && &bytes[pos - 7..pos] == b"/_next/" {
+                continue;
+            }
+            let end = pos + chunk_url_len(&bytes[pos..], true);
+            push_chunk_ref(&bytes[pos..end], base, true, &mut seen_refs, &mut out.refs);
+        }
+    }
+
+    flush_pending(&mut pending, &mut out.apis, usize::MAX);
+    out
+}
+
+fn flush_pending(pending: &mut Vec<PendingApi>, apis: &mut ApiMap, pos: usize) {
+    let mut i = 0;
+    while i < pending.len() {
+        if pending[i].expires_at >= pos {
+            i += 1;
+            continue;
+        }
+        let mut pending_api = pending.swap_remove(i);
+        if pending_api.shape.methods == 0 {
+            pending_api.shape.methods = METHOD_GET;
+        }
+        apis.entry(pending_api.url)
+            .or_default()
+            .merge_ref(&pending_api.shape);
+    }
+}
+
+fn prune_recent_shapes(recent_shapes: &mut VecDeque<(usize, ShapeKind)>, pos: usize) {
+    while recent_shapes
+        .front()
+        .is_some_and(|(shape_pos, _)| shape_pos.saturating_add(SHAPE_WINDOW) < pos)
+    {
+        recent_shapes.pop_front();
+    }
+}
+
+pub fn scan(bytes: &[u8], apis: &mut ApiMap) {
     let mut calls = CALL_AC.find_iter(bytes).peekable();
     if calls.peek().is_none() {
         return;
@@ -100,8 +232,8 @@ pub fn scan(bytes: &[u8], apis: &mut ApiMap) {
             continue;
         }
 
-        let ws = m.start().saturating_sub(WIN);
-        let we = (after + WIN).min(bytes.len());
+        let ws = m.start().saturating_sub(SHAPE_WINDOW);
+        let we = (after + SHAPE_WINDOW).min(bytes.len());
 
         let entry = apis.entry(url.to_owned()).or_default();
 
@@ -141,14 +273,18 @@ fn shape_kind(pattern: usize) -> ShapeKind {
 
 fn apply_shape_window(entry: &mut Shape, bytes: &[u8]) {
     for m in SHAPE_AC.find_iter(bytes) {
-        match shape_kind(m.pattern().as_usize()) {
-            ShapeKind::Method(method) => entry.methods |= method,
-            ShapeKind::Body => entry.has_body = true,
-            ShapeKind::Headers => entry.has_headers = true,
-            ShapeKind::Json => entry.content_types |= CONTENT_JSON,
-            ShapeKind::Auth => entry.auth = true,
-            ShapeKind::Ignore => {}
-        }
+        apply_shape_kind(entry, shape_kind(m.pattern().as_usize()));
+    }
+}
+
+fn apply_shape_kind(entry: &mut Shape, kind: ShapeKind) {
+    match kind {
+        ShapeKind::Method(method) => entry.methods |= method,
+        ShapeKind::Body => entry.has_body = true,
+        ShapeKind::Headers => entry.has_headers = true,
+        ShapeKind::Json => entry.content_types |= CONTENT_JSON,
+        ShapeKind::Auth => entry.auth = true,
+        ShapeKind::Ignore => {}
     }
 }
 
@@ -337,20 +473,44 @@ fn scan_template_candidate_text(bytes: &[u8], candidates: &mut CandidateMap) {
 
 fn extract_candidate_at(bytes: &[u8], pos: usize) -> Option<String> {
     let start = walk_candidate_start(bytes, pos);
-    let end = candidate_end(bytes, pos);
-    let raw = std::str::from_utf8(&bytes[start..end]).ok()?;
-    let url = raw.trim_matches('\\');
-    is_api_candidate(url).then(|| url.to_owned())
+    let url = candidate_string(bytes, start)?;
+    is_api_candidate(&url).then_some(url)
 }
 
-fn candidate_end(bytes: &[u8], mut i: usize) -> usize {
+fn candidate_string(bytes: &[u8], start: usize) -> Option<String> {
+    let mut normalized = None;
+    let end = candidate_end(bytes, start, &mut normalized);
+    if let Some(normalized) = normalized {
+        return String::from_utf8(normalized)
+            .ok()
+            .map(|url| url.trim_matches('\\').to_string());
+    }
+
+    let raw = std::str::from_utf8(&bytes[start..end]).ok()?;
+    Some(raw.trim_matches('\\').to_string())
+}
+
+fn candidate_end(bytes: &[u8], mut i: usize, normalized: &mut Option<Vec<u8>>) -> usize {
+    let start = i;
     while i < bytes.len() {
         if bytes[i..].starts_with(b"{dynamic}") {
+            if let Some(out) = normalized {
+                out.extend_from_slice(b"{dynamic}");
+            }
             i += b"{dynamic}".len();
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'$' && bytes[i + 1] == b'{' {
+            let out = normalized.get_or_insert_with(|| bytes[start..i].to_vec());
+            out.extend_from_slice(b"{dynamic}");
+            i = skip_template_expr(bytes, i + 2);
             continue;
         }
         if is_candidate_delim(bytes[i]) {
             break;
+        }
+        if let Some(out) = normalized {
+            out.push(bytes[i]);
         }
         i += 1;
     }
@@ -427,4 +587,70 @@ fn is_bad_asset_url(s: &[u8]) -> bool {
 
 fn ends_with_ci(s: &[u8], suffix: &[u8]) -> bool {
     s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+fn walk_chunk_url_start(bytes: &[u8], needle_pos: usize) -> usize {
+    let mut s = needle_pos;
+    while s > 0 {
+        let b = bytes[s - 1];
+        if b.is_ascii_whitespace()
+            || matches!(
+                b,
+                b'"' | b'\'' | b'`' | b'<' | b'>' | b'=' | b'(' | b',' | b';' | b'['
+            )
+        {
+            break;
+        }
+        s -= 1;
+    }
+    s
+}
+
+fn chunk_url_len(bytes: &[u8], backtick: bool) -> usize {
+    bytes
+        .iter()
+        .position(|b| {
+            b.is_ascii_whitespace()
+                || matches!(b, b'"' | b'\'' | b'<' | b'>' | b')' | b',' | b';')
+                || (backtick && *b == b'`')
+        })
+        .unwrap_or(bytes.len())
+}
+
+fn push_chunk_ref(
+    src: &[u8],
+    base: &Url,
+    nested: bool,
+    seen: &mut FxHashSet<Url>,
+    out: &mut Vec<Url>,
+) {
+    if is_skipped_chunk(src)
+        || (nested && !src.ends_with(b".js"))
+        || (!nested && memchr::memmem::find(src, b".js").is_none())
+    {
+        return;
+    }
+    let Ok(src) = std::str::from_utf8(src) else {
+        return;
+    };
+    let url = if nested {
+        base.join(&format!("/_next/{src}"))
+    } else {
+        base.join(src)
+    };
+    if let Ok(url) = url {
+        push_unique_ref(url, seen, out);
+    }
+}
+
+fn push_unique_ref(url: Url, seen: &mut FxHashSet<Url>, out: &mut Vec<Url>) {
+    if seen.insert(url.clone()) {
+        out.push(url);
+    }
+}
+
+fn is_skipped_chunk(src: &[u8]) -> bool {
+    SKIPPED_CHUNK_FRAGMENTS
+        .iter()
+        .any(|f| memchr::memmem::find(src, f.as_bytes()).is_some())
 }
