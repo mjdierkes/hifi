@@ -1,11 +1,6 @@
-mod cache;
-mod fetch;
-mod html;
-mod literals;
-mod scan;
-
+use hifi::scan::ApiMap;
+use hifi::{cache, fetch, html, scan};
 use reqwest::Client;
-use scan::ApiMap;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -17,14 +12,16 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{oneshot, Mutex};
 use url::Url;
 
 const MAX_CHUNK_CONCURRENCY: usize = 32;
 const CACHE_FRESH_SECS: u64 = 300;
 const CACHE_STALE_SECS: u64 = 3600;
 
-type MemoryCache = Arc<RwLock<HashMap<PathBuf, (String, Instant)>>>;
-type DaemonState = Arc<(Client, MemoryCache)>;
+type MemoryCache = Arc<RwLock<HashMap<String, (String, Instant)>>>;
+type Inflight = Arc<Mutex<HashMap<String, Vec<oneshot::Sender<String>>>>>;
+type DaemonState = Arc<(Client, MemoryCache, Inflight)>;
 
 fn socket_path() -> PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR")
@@ -65,7 +62,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let url = url.ok_or("usage: hifi <url> | hifi serve")?;
 
-    // try daemon first
     if !no_daemon {
         if let Some(json) = try_daemon(&url, no_cache).await {
             println!("{}", json);
@@ -126,6 +122,7 @@ async fn serve() -> Result<(), Box<dyn Error>> {
     let state = Arc::new((
         make_client(concurrency)?,
         Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(Mutex::new(HashMap::new())),
     ));
 
     loop {
@@ -151,23 +148,20 @@ async fn handle_conn(
     let url = std::str::from_utf8(req.get(1..).unwrap_or_default())?;
 
     if !no_cache {
-        if let Ok(base) = Url::parse(url) {
-            let cache_path = cache::path_for(&base);
-            if let Some((body, age)) = read_memory(&state.1, &cache_path) {
-                if age < CACHE_STALE_SECS {
-                    if age >= CACHE_FRESH_SECS {
-                        spawn_refresh(
-                            &state.0,
-                            url,
-                            &cache_path,
-                            concurrency,
-                            Some(state.1.clone()),
-                        );
-                    }
-                    stream.write_all(body.as_bytes()).await?;
-                    stream.flush().await?;
-                    return Ok(());
+        if let Some((body, age)) = read_memory(&state.1, url) {
+            if age < CACHE_STALE_SECS {
+                if age >= CACHE_FRESH_SECS {
+                    spawn_refresh(&state.0, url, concurrency, Some(state.1.clone()));
                 }
+                return reply(&mut stream, &body).await;
+            }
+        }
+    }
+
+    if !no_cache {
+        if let Some(rx) = join_inflight(&state.2, url).await {
+            if let Ok(body) = rx.await {
+                return reply(&mut stream, &body).await;
             }
         }
     }
@@ -187,13 +181,34 @@ async fn handle_conn(
     };
     let body = serde_json::to_string(&out)?;
     if !no_cache {
-        if let Ok(base) = Url::parse(url) {
-            write_memory(&state.1, cache::path_for(&base), body.clone());
-        }
+        write_memory(&state.1, url.to_string(), body.clone());
+        finish_inflight(&state.2, url, body.clone()).await;
     }
+    reply(&mut stream, &body).await
+}
+
+async fn reply(stream: &mut UnixStream, body: &str) -> Result<(), Box<dyn Error>> {
     stream.write_all(body.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
+}
+
+async fn join_inflight(inflight: &Inflight, url: &str) -> Option<oneshot::Receiver<String>> {
+    let mut in_flight = inflight.lock().await;
+    if let Some(waiters) = in_flight.get_mut(url) {
+        let (tx, rx) = oneshot::channel();
+        waiters.push(tx);
+        Some(rx)
+    } else {
+        in_flight.insert(url.to_string(), Vec::new());
+        None
+    }
+}
+
+async fn finish_inflight(inflight: &Inflight, url: &str, body: String) {
+    for tx in inflight.lock().await.remove(url).unwrap_or_default() {
+        let _ = tx.send(body.clone());
+    }
 }
 
 async fn process(
@@ -213,7 +228,7 @@ async fn process(
                 let status = if age < CACHE_FRESH_SECS {
                     "fresh"
                 } else {
-                    spawn_refresh(client, url, &cache_path, concurrency, memory.clone());
+                    spawn_refresh(client, url, concurrency, memory.clone());
                     "stale"
                 };
                 return Ok(annotate(v, t0, status, age));
@@ -233,39 +248,32 @@ async fn process(
     if !no_cache && !cache_hit {
         cache::write(&cache_path, &out);
         if let Some(memory) = memory {
-            write_memory(&memory, cache_path, serde_json::to_string(&out)?);
+            write_memory(&memory, url.to_string(), serde_json::to_string(&out)?);
         }
     }
     Ok(out)
 }
 
-fn read_memory(memory: &MemoryCache, path: &Path) -> Option<(String, u64)> {
+fn read_memory(memory: &MemoryCache, url: &str) -> Option<(String, u64)> {
     memory
         .read()
         .ok()?
-        .get(path)
+        .get(url)
         .cloned()
         .map(|(body, t)| (body, t.elapsed().as_secs()))
 }
 
-fn spawn_refresh(
-    client: &Client,
-    url: &str,
-    cache_path: &Path,
-    concurrency: usize,
-    memory: Option<MemoryCache>,
-) {
+fn spawn_refresh(client: &Client, url: &str, concurrency: usize, memory: Option<MemoryCache>) {
     let client = client.clone();
     let url = url.to_string();
-    let cache_path = cache_path.to_path_buf();
     tokio::spawn(async move {
-        let _ = refresh(&client, &url, &cache_path, concurrency, memory).await;
+        let _ = refresh(&client, &url, concurrency, memory).await;
     });
 }
 
-fn write_memory(memory: &MemoryCache, path: PathBuf, body: String) {
+fn write_memory(memory: &MemoryCache, url: String, body: String) {
     if let Ok(mut entries) = memory.write() {
-        entries.insert(path, (body, Instant::now()));
+        entries.insert(url, (body, Instant::now()));
     }
 }
 
@@ -281,19 +289,23 @@ fn annotate(mut v: Value, t0: Instant, status: &str, age_secs: u64) -> Value {
 async fn refresh(
     client: &Client,
     url: &str,
-    cache_path: &Path,
     concurrency: usize,
     memory: Option<MemoryCache>,
 ) -> Result<(), Box<dyn Error>> {
     let base = Url::parse(url)?;
-    let (out, _) = collect(client, url, &base, Some(cache_path), None, concurrency).await?;
-    cache::write(cache_path, &out);
+    let cache_path = cache::path_for(&base);
+    let (out, _) = collect(
+        client,
+        url,
+        &base,
+        Some(cache_path.as_path()),
+        None,
+        concurrency,
+    )
+    .await?;
+    cache::write(&cache_path, &out);
     if let Some(memory) = memory {
-        write_memory(
-            &memory,
-            cache_path.to_path_buf(),
-            serde_json::to_string(&out)?,
-        );
+        write_memory(&memory, url.to_string(), serde_json::to_string(&out)?);
     }
     Ok(())
 }

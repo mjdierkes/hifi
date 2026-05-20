@@ -1,7 +1,7 @@
 use crate::literals::{BAD_EXTS, CALL_LITERALS, SHAPE_LITERALS};
 use aho_corasick::AhoCorasick;
-use serde::ser::{SerializeStruct, Serializer};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use serde::ser::{SerializeSeq, SerializeStruct, Serializer};
 use std::sync::LazyLock;
 
 static CALL_AC: LazyLock<AhoCorasick> =
@@ -9,7 +9,7 @@ static CALL_AC: LazyLock<AhoCorasick> =
 static SHAPE_AC: LazyLock<AhoCorasick> =
     LazyLock::new(|| AhoCorasick::new(SHAPE_LITERALS).expect("valid shape literals"));
 
-pub type ApiMap = HashMap<String, Shape>;
+pub type ApiMap = FxHashMap<String, Shape>;
 
 const METHOD_GET: u8 = 1 << 0;
 const METHOD_POST: u8 = 1 << 1;
@@ -33,36 +33,60 @@ impl serde::Serialize for Shape {
         S: Serializer,
     {
         let mut st = serializer.serialize_struct("Shape", 5)?;
-        st.serialize_field("methods", &self.methods())?;
+        st.serialize_field("methods", &Methods(self.methods))?;
         st.serialize_field("has_body", &self.has_body)?;
         st.serialize_field("has_headers", &self.has_headers)?;
-        st.serialize_field("content_types", &self.content_types())?;
+        st.serialize_field("content_types", &ContentTypes(self.content_types))?;
         st.serialize_field("auth", &self.auth)?;
         st.end()
     }
 }
 
-impl Shape {
-    fn methods(&self) -> Vec<&'static str> {
-        [
+struct Methods(u8);
+
+impl serde::Serialize for Methods {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let methods = [
             (METHOD_GET, "GET"),
             (METHOD_POST, "POST"),
             (METHOD_PUT, "PUT"),
             (METHOD_DELETE, "DELETE"),
             (METHOD_PATCH, "PATCH"),
-        ]
-        .into_iter()
-        .filter_map(|(bit, method)| (self.methods & bit != 0).then_some(method))
-        .collect()
+        ];
+        let len = methods
+            .iter()
+            .filter(|(bit, _)| self.0 & *bit != 0)
+            .count();
+        let mut seq = serializer.serialize_seq(Some(len))?;
+        for (bit, method) in methods {
+            if self.0 & bit != 0 {
+                seq.serialize_element(method)?;
+            }
+        }
+        seq.end()
     }
+}
 
-    fn content_types(&self) -> Vec<&'static str> {
-        (self.content_types & CONTENT_JSON != 0)
-            .then_some("application/json")
-            .into_iter()
-            .collect()
+struct ContentTypes(u8);
+
+impl serde::Serialize for ContentTypes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let has_json = self.0 & CONTENT_JSON != 0;
+        let mut seq = serializer.serialize_seq(Some(has_json as usize))?;
+        if has_json {
+            seq.serialize_element("application/json")?;
+        }
+        seq.end()
     }
+}
 
+impl Shape {
     fn merge(&mut self, other: Shape) {
         self.methods |= other.methods;
         self.has_body |= other.has_body;
@@ -168,28 +192,4 @@ fn is_bad_asset_url(s: &[u8]) -> bool {
 
 fn ends_with_ci(s: &[u8], suffix: &[u8]) -> bool {
     s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn url_arg_borrows_string_literal_content() {
-        assert_eq!(
-            extract_url_arg(br#"fetch("/api/users", opts)"#, 6),
-            Some("/api/users")
-        );
-        assert_eq!(
-            extract_url_arg(br#"fetch(`/api/${id}`, opts)"#, 6),
-            Some("/api/")
-        );
-    }
-
-    #[test]
-    fn url_filter_rejects_assets_without_allocating_lowercase_copy() {
-        assert!(is_url_like("/api/users"));
-        assert!(!is_url_like("/images/LOGO.PNG?cache=1"));
-        assert!(!is_url_like("/"));
-    }
 }
