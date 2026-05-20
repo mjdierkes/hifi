@@ -3,6 +3,7 @@ use super::processor::{
     read_memory, spawn_refresh, write_memory, Body, CacheContext, MemoryCache, Processor,
     RedirectMemory, CACHE_FRESH_SECS, CACHE_STALE_SECS,
 };
+use crate::app::{render_json_mode, OutputMode};
 use reqwest::Client;
 use rustc_hash::FxHashMap;
 use std::{
@@ -63,9 +64,12 @@ pub fn start() -> bool {
         .is_some()
 }
 
-pub async fn request(url: &str, no_cache: bool) -> Option<String> {
+pub async fn request(url: &str, no_cache: bool, mode: OutputMode) -> Option<String> {
     let mut stream = UnixStream::connect(socket_path()).await.ok()?;
-    stream.write_all(&[b'0' + no_cache as u8]).await.ok()?;
+    stream
+        .write_all(&[b'0' + no_cache as u8, mode.as_daemon_byte()])
+        .await
+        .ok()?;
     stream.write_all(url.as_bytes()).await.ok()?;
     stream.shutdown().await.ok();
 
@@ -104,7 +108,12 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
     let mut req = Vec::with_capacity(512);
     stream.read_to_end(&mut req).await?;
     let no_cache = req.first() == Some(&b'1');
-    let url = std::str::from_utf8(req.get(1..).unwrap_or_default())?;
+    let (mode, url_bytes) = req
+        .get(1)
+        .and_then(|b| OutputMode::from_daemon_byte(*b))
+        .map(|mode| (mode, req.get(2..).unwrap_or_default()))
+        .unwrap_or((OutputMode::Json, req.get(1..).unwrap_or_default()));
+    let url = std::str::from_utf8(url_bytes)?;
 
     if !no_cache {
         if let Some((body, age)) = read_memory(&state.memory, url) {
@@ -112,13 +121,15 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
                 if age >= CACHE_FRESH_SECS {
                     spawn_refresh(state.client.clone(), concurrency, url, state.cache());
                 }
-                return reply(&mut stream, body.as_ref()).await;
+                let rendered = render_json_mode(body.as_ref(), mode);
+                return reply(&mut stream, &rendered).await;
             }
         }
 
         if let Some(rx) = join_inflight(&state.inflight, url).await {
             if let Ok(body) = rx.await {
-                return reply(&mut stream, body.as_ref()).await;
+                let rendered = render_json_mode(body.as_ref(), mode);
+                return reply(&mut stream, &rendered).await;
             }
         }
     }
@@ -132,9 +143,11 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
         let body: Body = Arc::from(body);
         write_memory(&state.memory, url.to_string(), body.clone());
         finish_inflight(&state.inflight, url, body.clone()).await;
-        return reply(&mut stream, body.as_ref()).await;
+        let rendered = render_json_mode(body.as_ref(), mode);
+        return reply(&mut stream, &rendered).await;
     }
-    reply(&mut stream, &body).await
+    let rendered = render_json_mode(&body, mode);
+    reply(&mut stream, &rendered).await
 }
 
 async fn reply(stream: &mut UnixStream, body: &str) -> Result {

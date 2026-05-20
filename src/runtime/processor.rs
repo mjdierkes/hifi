@@ -4,7 +4,7 @@ use crate::scan::{ApiMap, CandidateMap};
 use super::{cache, fetch};
 use reqwest::Client;
 use rustc_hash::FxHashMap;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
     path::{Path, PathBuf},
@@ -21,6 +21,35 @@ type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
 pub type Body = Arc<str>;
 pub type MemoryCache = Arc<RwLock<FxHashMap<String, (Body, Instant)>>>;
 pub type RedirectMemory = Arc<RwLock<FxHashMap<String, Url>>>;
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Output {
+    pub apis: ApiMap,
+    #[serde(default, skip_serializing_if = "CandidateMap::is_empty")]
+    pub candidates: CandidateMap,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cache: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_age_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u128>,
+}
+
+impl Output {
+    pub fn to_json_string(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    fn mark(mut self, t0: Option<Instant>, cache: &str, age_secs: Option<u64>) -> Self {
+        self.cache.clear();
+        self.cache.push_str(cache);
+        self.cache_age_secs = age_secs;
+        self.elapsed_ms = t0.map(|t| t.elapsed().as_millis());
+        self
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct CacheContext {
@@ -45,6 +74,32 @@ impl<'a> Processor<'a> {
     }
 
     pub async fn process(&self, url: &str, no_cache: bool, t0: Instant) -> Result<String> {
+        self.process_for_json(url, no_cache, t0).await
+    }
+
+    pub async fn process_for_json(&self, url: &str, no_cache: bool, t0: Instant) -> Result<String> {
+        match self.process_typed(url, no_cache, Some(t0), true).await? {
+            Processed::Json(s) => Ok(s),
+            Processed::Output(out) => out.to_json_string(),
+        }
+    }
+
+    pub async fn process_for_display(
+        &self,
+        url: &str,
+        no_cache: bool,
+        t0: Instant,
+    ) -> Result<Processed> {
+        self.process_typed(url, no_cache, Some(t0), false).await
+    }
+
+    async fn process_typed(
+        &self,
+        url: &str,
+        no_cache: bool,
+        t0: Option<Instant>,
+        cached_as_json: bool,
+    ) -> Result<Processed> {
         let active_cache = if no_cache {
             CacheContext::default()
         } else {
@@ -63,7 +118,14 @@ impl<'a> Processor<'a> {
                 self.refresh_later(url, active_cache.clone());
                 "stale"
             };
-            return annotate_json(&json, t0, status, Some(age));
+            let t0 = t0.unwrap_or_else(Instant::now);
+            if cached_as_json {
+                return annotate_json(&json, t0, status, Some(age)).map(Processed::Json);
+            }
+            if let Ok(out) = serde_json::from_slice::<Output>(&json) {
+                return Ok(Processed::Output(out.mark(Some(t0), status, Some(age))));
+            }
+            return annotate_json(&json, t0, status, Some(age)).map(Processed::Json);
         }
 
         let (out, cache_hit) = self
@@ -72,17 +134,18 @@ impl<'a> Processor<'a> {
                 &base,
                 &request_base,
                 (!no_cache).then_some(cache_path.as_path()),
-                Some(t0),
+                t0,
+                cached_as_json,
                 active_cache,
             )
             .await?;
 
-        if let Collected::Value(v) = &out {
+        if let Processed::Output(v) = &out {
             if !no_cache && !cache_hit {
                 write_caches(&cache_path, v, url, self.cache.memory.clone())?;
             }
         }
-        out.into_string()
+        Ok(out)
     }
 
     pub async fn refresh(&self, url: &str) -> Result<()> {
@@ -94,15 +157,21 @@ impl<'a> Processor<'a> {
                 &request_base,
                 Some(cache_path.as_path()),
                 None,
+                true,
                 self.cache.clone(),
             )
             .await?;
-        write_caches(
-            &cache_path,
-            &out.into_value()?,
-            url,
-            self.cache.memory.clone(),
-        )
+        match out {
+            Processed::Output(out) => {
+                write_caches(&cache_path, &out, url, self.cache.memory.clone())
+            }
+            Processed::Json(json) => {
+                if let Some(memory) = self.cache.memory.clone() {
+                    write_memory(&memory, url.to_string(), Arc::from(json));
+                }
+                Ok(())
+            }
+        }
     }
 
     fn refresh_later(&self, url: &str, cache: CacheContext) {
@@ -116,8 +185,9 @@ impl<'a> Processor<'a> {
         request_base: &Url,
         cache_path: Option<&Path>,
         t0: Option<Instant>,
+        cached_as_json: bool,
         cache_ctx: CacheContext,
-    ) -> Result<(Collected, bool)> {
+    ) -> Result<(Processed, bool)> {
         let response = self.client.get(request_base.clone()).send().await?;
         let final_base = response.url().clone();
         remember_redirect(cache_ctx.redirects.as_ref(), original_base, &final_base);
@@ -132,18 +202,15 @@ impl<'a> Processor<'a> {
             if let (Some(bytes), Some(t0)) =
                 (cache::read_build_bytes(path, build_id.as_deref()), t0)
             {
+                if !cached_as_json {
+                    if let Ok(out) = serde_json::from_slice::<Output>(&bytes) {
+                        return Ok((Processed::Output(out.mark(Some(t0), "hit", None)), true));
+                    }
+                }
                 return Ok((
-                    Collected::Json(annotate_json(&bytes, t0, "hit", None)?),
+                    Processed::Json(annotate_json(&bytes, t0, "hit", None)?),
                     true,
                 ));
-            }
-            if let Some(v) = cache::read(path, build_id.as_deref()) {
-                let v = if let Some(t0) = t0 {
-                    annotate(v, t0, "hit", None)
-                } else {
-                    v
-                };
-                return Ok((Collected::Value(v), true));
             }
         }
 
@@ -174,42 +241,24 @@ impl<'a> Processor<'a> {
             candidates.remove(url);
         }
 
-        let _ = (manifest_stats, chunk_stats, build_id);
-        let mut out = json!({
-            "apis": apis,
-        });
-        if let Some(obj) = out.as_object_mut() {
-            if !candidates.is_empty() {
-                obj.insert("candidates".into(), json!(candidates));
-            }
-            obj.insert("cache".into(), json!("miss"));
-            if let Some(t0) = t0 {
-                insert_elapsed(obj, t0);
-            }
-        }
-        Ok((Collected::Value(out), false))
+        let _ = (manifest_stats, chunk_stats);
+        Ok((
+            Processed::Output(Output {
+                apis,
+                candidates,
+                build_id,
+                cache: "miss".into(),
+                cache_age_secs: None,
+                elapsed_ms: t0.map(|t| t.elapsed().as_millis()),
+            }),
+            false,
+        ))
     }
 }
 
-enum Collected {
+pub enum Processed {
     Json(String),
-    Value(Value),
-}
-
-impl Collected {
-    fn into_string(self) -> Result<String> {
-        match self {
-            Self::Json(s) => Ok(s),
-            Self::Value(v) => Ok(serde_json::to_string(&v)?),
-        }
-    }
-
-    fn into_value(self) -> Result<Value> {
-        match self {
-            Self::Json(s) => Ok(serde_json::from_str(&s)?),
-            Self::Value(v) => Ok(v),
-        }
-    }
+    Output(Output),
 }
 
 pub fn spawn_refresh(client: Client, concurrency: usize, url: &str, cache: CacheContext) {
@@ -330,14 +379,14 @@ fn origin_key(url: &Url) -> Option<String> {
 
 fn write_caches(
     cache_path: &Path,
-    out: &Value,
+    out: &Output,
     url: &str,
     memory: Option<MemoryCache>,
 ) -> Result<()> {
-    let cached = cache_value(out);
-    cache::write(cache_path, &cached);
+    let cached = out.clone().mark(None, "", None);
+    cache::write_with_build_id(cache_path, &cached, out.build_id.as_deref());
     if let Some(memory) = memory {
-        let body = Arc::from(serde_json::to_string(out)?);
+        let body = Arc::from(out.to_json_string()?);
         write_memory(&memory, url.to_string(), body);
     }
     Ok(())
@@ -348,17 +397,6 @@ fn prune_memory(entries: &mut FxHashMap<String, (Body, Instant)>, now: Instant) 
         now.saturating_duration_since(*written).as_secs() < CACHE_STALE_SECS
     });
     cache::prune_overflow(entries, MEMORY_CACHE_MAX_ENTRIES);
-}
-
-fn annotate(mut v: Value, t0: Instant, status: &str, age_secs: Option<u64>) -> Value {
-    if let Some(obj) = v.as_object_mut() {
-        insert_elapsed(obj, t0);
-        obj.insert("cache".into(), json!(status));
-        if let Some(age_secs) = age_secs {
-            obj.insert("cache_age_secs".into(), json!(age_secs));
-        }
-    }
-    v
 }
 
 fn annotate_json(bytes: &[u8], t0: Instant, status: &str, age_secs: Option<u64>) -> Result<String> {
@@ -378,38 +416,29 @@ fn annotate_json(bytes: &[u8], t0: Instant, status: &str, age_secs: Option<u64>)
     Ok(out)
 }
 
-fn cache_value(out: &Value) -> Value {
-    let mut cached = out.clone();
-    if let Some(obj) = cached.as_object_mut() {
-        for key in ["cache", "cache_age_secs", "elapsed_ms"] {
-            obj.remove(key);
-        }
-    }
-    cached
-}
-
-fn insert_elapsed(obj: &mut serde_json::Map<String, Value>, t0: Instant) {
-    obj.insert("elapsed_ms".into(), json!(t0.elapsed().as_millis()));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     #[test]
     fn cache_value_strips_dynamic_fields() {
-        let cached = cache_value(&json!({
-            "apis": {},
-            "cache": "miss",
-            "cache_age_secs": 1,
-            "elapsed_ms": 1,
-        }));
-        let obj = cached.as_object().unwrap();
-        assert!(obj.contains_key("apis"));
-        assert!(!obj.contains_key("cache"));
-        assert!(!obj.contains_key("elapsed_ms"));
+        let cached = Output {
+            apis: ApiMap::default(),
+            candidates: CandidateMap::default(),
+            build_id: Some("b1".into()),
+            cache: "miss".into(),
+            cache_age_secs: Some(1),
+            elapsed_ms: Some(1),
+        }
+        .mark(None, "", None);
+        let v = serde_json::to_value(&cached).unwrap();
+        assert!(v.get("apis").is_some());
+        assert!(v.get("build_id").is_some());
+        assert!(v.get("cache_age_secs").is_none());
+        assert!(v.get("elapsed_ms").is_none());
     }
 
     #[test]

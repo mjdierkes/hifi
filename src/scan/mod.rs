@@ -59,6 +59,49 @@ impl Default for Candidate {
     }
 }
 
+impl Shape {
+    pub fn methods_csv(&self) -> String {
+        METHODS
+            .iter()
+            .filter_map(|(bit, name)| (self.methods & bit != 0).then_some(*name))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    pub fn flags_csv(&self) -> String {
+        let mut flags: Vec<&str> = Vec::with_capacity(4);
+        if self.has_body {
+            flags.push("body");
+        }
+        if self.has_headers {
+            flags.push("headers");
+        }
+        for (bit, name) in CONTENT_TYPES {
+            if self.content_types & bit != 0 {
+                flags.push(if name == "application/json" {
+                    "json"
+                } else {
+                    name
+                });
+            }
+        }
+        if self.auth {
+            flags.push("auth");
+        }
+        flags.join(",")
+    }
+
+    pub fn tree_label(&self) -> String {
+        let methods = self.methods_csv();
+        let flags = self.flags_csv();
+        if flags.is_empty() {
+            format!("[{methods}]")
+        } else {
+            format!("[{methods}] [{flags}]")
+        }
+    }
+}
+
 fn serialize_flags<S: serde::Serializer>(
     bits: &u8,
     flags: &[(u8, &str)],

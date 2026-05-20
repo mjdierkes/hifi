@@ -1,9 +1,9 @@
 use crate::grep;
 use crate::runtime::daemon;
-use crate::runtime::processor::{CacheContext, Processor, CACHE_FRESH_SECS};
+use crate::runtime::processor::{CacheContext, Output, Processed, Processor, CACHE_FRESH_SECS};
 use reqwest::Client;
-use serde_json::Value;
-use std::io::IsTerminal;
+use rustc_hash::FxHashMap;
+use std::io::{self, IsTerminal, Write};
 use std::{error::Error, time::Duration};
 
 const MAX_CHUNK_CONCURRENCY: usize = 32;
@@ -12,7 +12,7 @@ const HELP: &str = "\
 hifi — map an HTTP API surface
 
 USAGE:
-    hifi <url> [--no-cache] [--no-daemon]
+    hifi <url> [--no-cache] [--no-daemon] [--flat|--tree|--json]
     hifi grep <url> <pattern> [-C N]
     hifi serve
 
@@ -25,7 +25,47 @@ FLAGS:
     -h, --help        show this help
         --no-cache    bypass cached results
         --no-daemon   skip the background daemon
+        --flat        print tab-separated output
+        --tree        print tree output
+        --json        print machine-readable JSON
 ";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputMode {
+    Auto,
+    Flat,
+    Tree,
+    Json,
+}
+
+impl OutputMode {
+    pub fn for_stdout(self) -> Self {
+        match self {
+            Self::Auto if std::io::stdout().is_terminal() => Self::Tree,
+            Self::Auto => Self::Flat,
+            mode => mode,
+        }
+    }
+
+    pub fn as_daemon_byte(self) -> u8 {
+        match self.for_stdout() {
+            Self::Auto => b'a',
+            Self::Flat => b'f',
+            Self::Tree => b't',
+            Self::Json => b'j',
+        }
+    }
+
+    pub fn from_daemon_byte(b: u8) -> Option<Self> {
+        Some(match b {
+            b'f' => Self::Flat,
+            b't' => Self::Tree,
+            b'j' => Self::Json,
+            b'a' => Self::Auto,
+            _ => return None,
+        })
+    }
+}
 
 pub async fn run(raw: Vec<String>) -> Result<i32, Box<dyn Error>> {
     if raw.is_empty() {
@@ -50,10 +90,14 @@ pub async fn run(raw: Vec<String>) -> Result<i32, Box<dyn Error>> {
 
     let mut url = None;
     let (mut no_cache, mut no_daemon) = (false, false);
+    let mut mode = OutputMode::Auto;
     for arg in &raw {
         match arg.as_str() {
             "--no-cache" => no_cache = true,
             "--no-daemon" => no_daemon = true,
+            "--flat" => mode = set_mode(mode, OutputMode::Flat)?,
+            "--tree" => mode = set_mode(mode, OutputMode::Tree)?,
+            "--json" => mode = set_mode(mode, OutputMode::Json)?,
             s if s.starts_with("--") || s.starts_with('-') => {
                 return Err(format!("unknown flag '{s}' (try --help)").into());
             }
@@ -65,17 +109,24 @@ pub async fn run(raw: Vec<String>) -> Result<i32, Box<dyn Error>> {
     let url = normalize_url(&url);
 
     if !no_daemon {
-        if let Some(json) = daemon_json(&url, no_cache).await {
-            print!("{}", render(&json));
+        if let Some(out) = daemon_output(&url, no_cache, mode).await {
+            print!("{out}");
             return Ok(0);
         }
     }
 
     let out = Processor::new(&client, concurrency, CacheContext::default())
-        .process(&url, no_cache, std::time::Instant::now())
+        .process_for_display(&url, no_cache, std::time::Instant::now())
         .await?;
-    print!("{}", render(&out));
+    render_processed(out, mode)?;
     Ok(0)
+}
+
+fn set_mode(current: OutputMode, next: OutputMode) -> Result<OutputMode, Box<dyn Error>> {
+    if current != OutputMode::Auto && current != next {
+        return Err("choose only one of --flat, --tree, or --json".into());
+    }
+    Ok(next)
 }
 
 pub fn normalize_url(url: &str) -> String {
@@ -88,11 +139,11 @@ pub fn normalize_url(url: &str) -> String {
 
 #[derive(Default)]
 struct Node<'a> {
-    shape: Option<&'a Value>,
-    children: std::collections::BTreeMap<String, Node<'a>>,
+    shape: Option<&'a crate::scan::Shape>,
+    children: FxHashMap<String, Node<'a>>,
 }
 
-fn insert<'a>(root: &mut Node<'a>, segments: &[&str], shape: Option<&'a Value>) {
+fn insert<'a>(root: &mut Node<'a>, segments: &[&str], shape: Option<&'a crate::scan::Shape>) {
     if segments.is_empty() {
         root.shape = shape;
         return;
@@ -101,53 +152,23 @@ fn insert<'a>(root: &mut Node<'a>, segments: &[&str], shape: Option<&'a Value>) 
     insert(child, &segments[1..], shape);
 }
 
-fn shape_label(shape: &Value) -> String {
-    let methods = shape
-        .get("methods")
-        .and_then(|m| m.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default();
-    let mut flags: Vec<&str> = Vec::new();
-    if shape.get("has_body") == Some(&Value::Bool(true)) {
-        flags.push("body");
-    }
-    if shape.get("has_headers") == Some(&Value::Bool(true)) {
-        flags.push("headers");
-    }
-    if let Some(cts) = shape.get("content_types").and_then(|x| x.as_array()) {
-        for ct in cts.iter().filter_map(|x| x.as_str()) {
-            flags.push(if ct == "application/json" { "json" } else { ct });
-        }
-    }
-    if shape.get("auth") == Some(&Value::Bool(true)) {
-        flags.push("auth");
-    }
-    if flags.is_empty() {
-        format!("[{methods}]")
-    } else {
-        format!("[{methods}] [{}]", flags.join(","))
-    }
-}
-
-fn render_node(out: &mut String, node: &Node, prefix: &str) {
-    let count = node.children.len();
-    for (i, (name, child)) in node.children.iter().enumerate() {
+fn render_node<W: Write>(out: &mut W, node: &Node, prefix: &str) -> io::Result<()> {
+    let mut children: Vec<_> = node.children.iter().collect();
+    children.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let count = children.len();
+    for (i, (name, child)) in children.into_iter().enumerate() {
         let last = i + 1 == count;
         let connector = if last { "└── " } else { "├── " };
         let label = child
             .shape
-            .map(|s| format!(" {}", shape_label(s)))
+            .map(|s| format!(" {}", s.tree_label()))
             .unwrap_or_default();
         let display = if name.is_empty() { "/" } else { name.as_str() };
-        out.push_str(&format!("{prefix}{connector}{display}{label}\n"));
+        writeln!(out, "{prefix}{connector}{display}{label}")?;
         let next_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
-        render_node(out, child, &next_prefix);
+        render_node(out, child, &next_prefix)?;
     }
+    Ok(())
 }
 
 fn segments_of(rel: &str) -> Vec<&str> {
@@ -159,7 +180,7 @@ fn segments_of(rel: &str) -> Vec<&str> {
 }
 
 fn group_paths<'a, I: Iterator<Item = &'a str>>(paths: I) -> Vec<(String, Vec<String>)> {
-    let mut groups: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut groups: FxHashMap<String, Vec<String>> = FxHashMap::default();
     for p in paths {
         let branch = if let Some(rest) = p.strip_prefix("http://").or(p.strip_prefix("https://")) {
             let host_end = rest.find('/').unwrap_or(rest.len());
@@ -178,7 +199,9 @@ fn group_paths<'a, I: Iterator<Item = &'a str>>(paths: I) -> Vec<(String, Vec<St
         };
         groups.entry(branch).or_default().push(p.to_string());
     }
-    groups.into_iter().collect()
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    groups
 }
 
 fn strip_branch(branch: &str, path: &str) -> String {
@@ -187,115 +210,121 @@ fn strip_branch(branch: &str, path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-fn render(json: &str) -> String {
-    if std::io::stdout().is_terminal() {
-        render_tree(json)
-    } else {
-        render_flat(json)
+pub fn render_json_mode(json: &str, mode: OutputMode) -> String {
+    match mode.for_stdout() {
+        OutputMode::Json => {
+            let mut out = String::with_capacity(json.len() + 1);
+            out.push_str(json);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out
+        }
+        OutputMode::Tree => render_tree(json),
+        OutputMode::Flat | OutputMode::Auto => render_flat(json),
     }
+}
+
+fn render_processed(out: Processed, mode: OutputMode) -> Result<(), Box<dyn Error>> {
+    match out {
+        Processed::Json(json) => {
+            print!("{}", render_json_mode(&json, mode));
+            Ok(())
+        }
+        Processed::Output(out) => {
+            let stdout = io::stdout();
+            let mut stdout = io::BufWriter::new(stdout.lock());
+            match mode.for_stdout() {
+                OutputMode::Json => {
+                    serde_json::to_writer(&mut stdout, &out)?;
+                    stdout.write_all(b"\n")?;
+                }
+                OutputMode::Tree => render_tree_output(&out, &mut stdout)?,
+                OutputMode::Flat | OutputMode::Auto => render_flat_output(&out, &mut stdout)?,
+            }
+            Ok(())
+        }
+    }
+}
+
+fn render_tree_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
+    let groups = group_paths(v.apis.keys().map(|s| s.as_str()));
+    for (branch, paths) in &groups {
+        let mut root = Node::default();
+        for p in paths {
+            let rel = strip_branch(branch, p);
+            let segs = segments_of(&rel);
+            insert(&mut root, &segs, v.apis.get(p.as_str()));
+        }
+        let root_label = root
+            .shape
+            .map(|s| format!(" {}", s.tree_label()))
+            .unwrap_or_default();
+        writeln!(out, "{branch}{root_label}")?;
+        render_node(out, &root, "")?;
+    }
+    if !v.candidates.is_empty() {
+        let groups = group_paths(v.candidates.keys().map(|s| s.as_str()));
+        for (branch, ps) in &groups {
+            let mut root = Node::default();
+            for p in ps {
+                let rel = strip_branch(branch, p);
+                let segs = segments_of(&rel);
+                insert(&mut root, &segs, None);
+            }
+            writeln!(out, "? {branch}")?;
+            render_node(out, &root, "")?;
+        }
+    }
+    writeln!(out, "{} {}ms", v.cache, v.elapsed_ms.unwrap_or(0))
+}
+
+fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
+    let mut keys: Vec<&String> = v.apis.keys().collect();
+    keys.sort_unstable();
+    for k in keys {
+        let shape = &v.apis[k];
+        writeln!(out, "{}\t{k}\t{}", shape.methods_csv(), shape.flags_csv())?;
+    }
+    let mut keys: Vec<&String> = v.candidates.keys().collect();
+    keys.sort_unstable();
+    for k in keys {
+        writeln!(out, "?\t{k}\t")?;
+    }
+    Ok(())
 }
 
 fn render_tree(json: &str) -> String {
-    let Ok(v) = serde_json::from_str::<Value>(json) else {
+    let Ok(v) = serde_json::from_str::<Output>(json) else {
         return format!("{json}\n");
     };
-    let mut out = String::new();
-    if let Some(apis) = v.get("apis").and_then(|x| x.as_object()) {
-        let groups = group_paths(apis.keys().map(|s| s.as_str()));
-        for (branch, paths) in &groups {
-            let mut root = Node::default();
-            for p in paths {
-                let rel = strip_branch(branch, p);
-                let segs = segments_of(&rel);
-                insert(&mut root, &segs, apis.get(p.as_str()));
-            }
-            let root_label = root
-                .shape
-                .map(|s| format!(" {}", shape_label(s)))
-                .unwrap_or_default();
-            out.push_str(&format!("{branch}{root_label}\n"));
-            render_node(&mut out, &root, "");
-        }
+    let mut out = Vec::new();
+    if render_tree_output(&v, &mut out).is_err() {
+        return format!("{json}\n");
     }
-    if let Some(cands) = v.get("candidates").and_then(|x| x.as_object()) {
-        let paths: Vec<&String> = cands.keys().collect();
-        if !paths.is_empty() {
-            let groups = group_paths(paths.iter().map(|s| s.as_str()));
-            for (branch, ps) in &groups {
-                let mut root = Node::default();
-                for p in ps {
-                    let rel = strip_branch(branch, p);
-                    let segs = segments_of(&rel);
-                    insert(&mut root, &segs, None);
-                }
-                out.push_str(&format!("? {branch}\n"));
-                render_node(&mut out, &root, "");
-            }
-        }
-    }
-    let cache = v.get("cache").and_then(|x| x.as_str()).unwrap_or("?");
-    let ms = v.get("elapsed_ms").and_then(|x| x.as_u64()).unwrap_or(0);
-    out.push_str(&format!("{cache} {ms}ms\n"));
-    out
+    String::from_utf8(out).unwrap_or_else(|_| format!("{json}\n"))
 }
 
 fn render_flat(json: &str) -> String {
-    let Ok(v) = serde_json::from_str::<Value>(json) else {
+    let Ok(v) = serde_json::from_str::<Output>(json) else {
         return format!("{json}\n");
     };
-    let mut out = String::new();
-    if let Some(apis) = v.get("apis").and_then(|x| x.as_object()) {
-        let mut keys: Vec<&String> = apis.keys().collect();
-        keys.sort();
-        for k in keys {
-            let shape = &apis[k];
-            let methods = shape
-                .get("methods")
-                .and_then(|m| m.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                })
-                .unwrap_or_default();
-            let mut flags: Vec<&str> = Vec::new();
-            if shape.get("has_body") == Some(&Value::Bool(true)) {
-                flags.push("body");
-            }
-            if shape.get("has_headers") == Some(&Value::Bool(true)) {
-                flags.push("headers");
-            }
-            if let Some(cts) = shape.get("content_types").and_then(|x| x.as_array()) {
-                for ct in cts.iter().filter_map(|x| x.as_str()) {
-                    flags.push(if ct == "application/json" { "json" } else { ct });
-                }
-            }
-            if shape.get("auth") == Some(&Value::Bool(true)) {
-                flags.push("auth");
-            }
-            out.push_str(&format!("{methods}\t{k}\t{}\n", flags.join(",")));
-        }
+    let mut out = Vec::new();
+    if render_flat_output(&v, &mut out).is_err() {
+        return format!("{json}\n");
     }
-    if let Some(cands) = v.get("candidates").and_then(|x| x.as_object()) {
-        let mut keys: Vec<&String> = cands.keys().collect();
-        keys.sort();
-        for k in keys {
-            out.push_str(&format!("?\t{k}\t\n"));
-        }
-    }
-    out
+    String::from_utf8(out).unwrap_or_else(|_| format!("{json}\n"))
 }
 
-async fn daemon_json(url: &str, no_cache: bool) -> Option<String> {
-    if let Some(json) = daemon::request(url, no_cache).await {
-        return Some(json);
+async fn daemon_output(url: &str, no_cache: bool, mode: OutputMode) -> Option<String> {
+    if let Some(out) = daemon::request(url, no_cache, mode).await {
+        return Some(out);
     }
     if daemon::start() {
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(25));
-            if let Some(json) = daemon::request(url, no_cache).await {
-                return Some(json);
+            if let Some(out) = daemon::request(url, no_cache, mode).await {
+                return Some(out);
             }
         }
     }

@@ -176,6 +176,13 @@ pub fn write(path: &Path, value: &serde_json::Value) {
     write_meta(path, value);
 }
 
+pub fn write_with_build_id<T: Serialize>(path: &Path, value: &T, build_id: Option<&str>) {
+    write_json(path, value);
+    if let Some(build_id) = build_id {
+        let _ = fs::write(meta_path(path), build_id);
+    }
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) {
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
