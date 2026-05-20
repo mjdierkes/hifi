@@ -286,11 +286,18 @@ fn write_memory(memory: &MemoryCache, url: String, body: Body) {
 
 fn annotate(mut v: Value, t0: Instant, status: &str, age_secs: u64) -> Value {
     if let Some(obj) = v.as_object_mut() {
+        insert_elapsed(obj, t0);
         obj.insert("cache".into(), json!(status));
         obj.insert("cache_age_secs".into(), json!(age_secs));
-        obj.insert("elapsed_ms".into(), json!(t0.elapsed().as_millis()));
     }
     v
+}
+
+fn insert_elapsed(obj: &mut serde_json::Map<String, Value>, t0: Instant) {
+    let elapsed = t0.elapsed();
+    obj.insert("elapsed_ms".into(), json!(elapsed.as_millis()));
+    obj.insert("elapsed_us".into(), json!(elapsed.as_micros()));
+    obj.insert("elapsed_ns".into(), json!(elapsed.as_nanos()));
 }
 
 async fn refresh(
@@ -335,8 +342,8 @@ async fn collect(
 
     if let Some(mut v) = cache_path.and_then(|p| cache::read(p, build_id.as_deref())) {
         if let (Some(obj), Some(t0)) = (v.as_object_mut(), t0) {
+            insert_elapsed(obj, t0);
             obj.insert("cache".into(), json!("hit"));
-            obj.insert("elapsed_ms".into(), json!(t0.elapsed().as_millis()));
         }
         return Ok((v, true));
     }
@@ -362,7 +369,7 @@ async fn collect(
         "cache": "miss",
     });
     if let (Some(obj), Some(t0)) = (out.as_object_mut(), t0) {
-        obj.insert("elapsed_ms".into(), json!(t0.elapsed().as_millis()));
+        insert_elapsed(obj, t0);
     }
     Ok((out, false))
 }
