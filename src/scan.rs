@@ -1,7 +1,7 @@
-use crate::literals::{BAD_EXTS, CALL_LITERALS, METHOD_HINTS, SHAPE_LITERALS};
+use crate::literals::{BAD_EXTS, CALL_LITERALS, SHAPE_LITERALS};
 use aho_corasick::AhoCorasick;
 use rustc_hash::FxHashMap;
-use serde::ser::{SerializeSeq, SerializeStruct, Serializer};
+use serde::Serialize;
 use std::sync::LazyLock;
 
 static CALL_AC: LazyLock<AhoCorasick> =
@@ -17,70 +17,36 @@ const METHOD_PUT: u8 = 1 << 2;
 const METHOD_DELETE: u8 = 1 << 3;
 const METHOD_PATCH: u8 = 1 << 4;
 const CONTENT_JSON: u8 = 1 << 0;
+const METHODS: [(u8, &str); 5] = [
+    (METHOD_GET, "GET"),
+    (METHOD_POST, "POST"),
+    (METHOD_PUT, "PUT"),
+    (METHOD_DELETE, "DELETE"),
+    (METHOD_PATCH, "PATCH"),
+];
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize)]
 pub struct Shape {
+    #[serde(serialize_with = "serialize_methods")]
     methods: u8,
     has_body: bool,
     has_headers: bool,
+    #[serde(serialize_with = "serialize_content_types")]
     content_types: u8,
     auth: bool,
 }
 
-impl serde::Serialize for Shape {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut st = serializer.serialize_struct("Shape", 5)?;
-        st.serialize_field("methods", &Methods(self.methods))?;
-        st.serialize_field("has_body", &self.has_body)?;
-        st.serialize_field("has_headers", &self.has_headers)?;
-        st.serialize_field("content_types", &ContentTypes(self.content_types))?;
-        st.serialize_field("auth", &self.auth)?;
-        st.end()
-    }
+fn serialize_methods<S: serde::Serializer>(bits: &u8, s: S) -> Result<S::Ok, S::Error> {
+    METHODS
+        .iter()
+        .filter_map(|(bit, method)| (bits & bit != 0).then_some(*method))
+        .collect::<Vec<_>>()
+        .serialize(s)
 }
 
-struct Methods(u8);
-
-impl serde::Serialize for Methods {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let methods = [
-            (METHOD_GET, "GET"),
-            (METHOD_POST, "POST"),
-            (METHOD_PUT, "PUT"),
-            (METHOD_DELETE, "DELETE"),
-            (METHOD_PATCH, "PATCH"),
-        ];
-        let len = methods.iter().filter(|(bit, _)| self.0 & *bit != 0).count();
-        let mut seq = serializer.serialize_seq(Some(len))?;
-        for (bit, method) in methods {
-            if self.0 & bit != 0 {
-                seq.serialize_element(method)?;
-            }
-        }
-        seq.end()
-    }
-}
-
-struct ContentTypes(u8);
-
-impl serde::Serialize for ContentTypes {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let has_json = self.0 & CONTENT_JSON != 0;
-        let mut seq = serializer.serialize_seq(Some(has_json as usize))?;
-        if has_json {
-            seq.serialize_element("application/json")?;
-        }
-        seq.end()
-    }
+fn serialize_content_types<S: serde::Serializer>(bits: &u8, s: S) -> Result<S::Ok, S::Error> {
+    let content_types = ["application/json"];
+    content_types[..(bits & CONTENT_JSON != 0) as usize].serialize(s)
 }
 
 impl Shape {
@@ -111,17 +77,7 @@ pub fn scan(bytes: &[u8], apis: &mut ApiMap) {
 
         let entry = apis.entry(url.to_owned()).or_default();
 
-        // Method hint from the anchor itself (e.g. .post( → POST)
-        if let Some(Some(hint)) = METHOD_HINTS.get(m.pattern().as_usize()) {
-            entry.methods |= match *hint {
-                "GET" => METHOD_GET,
-                "POST" => METHOD_POST,
-                "PUT" => METHOD_PUT,
-                "DELETE" => METHOD_DELETE,
-                "PATCH" => METHOD_PATCH,
-                _ => 0,
-            };
-        }
+        entry.methods |= method_hint(CALL_LITERALS[m.pattern().as_usize()]);
 
         for sm in SHAPE_AC.find_iter(window) {
             match sm.pattern().as_usize() {
@@ -196,18 +152,24 @@ fn extract_url_arg(bytes: &[u8], start: usize) -> Option<&str> {
     std::str::from_utf8(&bytes[s..e]).ok()
 }
 
+fn method_hint(anchor: &str) -> u8 {
+    match anchor {
+        "axios.get(" | "ky.get(" | ".get(" => METHOD_GET,
+        "axios.post(" | "ky.post(" | ".post(" => METHOD_POST,
+        "axios.put(" | ".put(" => METHOD_PUT,
+        "axios.delete(" | ".delete(" => METHOD_DELETE,
+        "axios.patch(" | ".patch(" => METHOD_PATCH,
+        _ => 0,
+    }
+}
+
 fn is_url_like(s: &str) -> bool {
     let bytes = s.as_bytes();
-    if bytes.len() < 2 || bytes.len() > 512 {
-        return false;
-    }
-    if !(s.starts_with('/') || s.starts_with("http://") || s.starts_with("https://")) {
-        return false;
-    }
-    if s == "/" || is_bad_asset_url(bytes) {
-        return false;
-    }
-    bytes.iter().any(u8::is_ascii_alphanumeric)
+    (2..=512).contains(&bytes.len())
+        && (s.starts_with('/') || s.starts_with("http://") || s.starts_with("https://"))
+        && s != "/"
+        && !is_bad_asset_url(bytes)
+        && bytes.iter().any(u8::is_ascii_alphanumeric)
 }
 
 fn is_bad_asset_url(s: &[u8]) -> bool {

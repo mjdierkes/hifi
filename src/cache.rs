@@ -22,15 +22,14 @@ pub fn path_for(base: &Url) -> std::path::PathBuf {
 }
 
 pub fn read(path: &std::path::Path, build_id: Option<&str>) -> Option<serde_json::Value> {
-    if let Some(expected) = build_id {
-        if let Some(cached) = read_build_id(path) {
-            return (cached == expected).then(|| read_any(path).map(|(v, _)| v))?;
-        }
+    let expected = build_id?;
+    if let Some(cached) = read_build_id(path) {
+        return (cached == expected).then(|| read_any(path).map(|(v, _)| v))?;
     }
 
     let (v, _) = read_any(path)?;
     let cached_build = v.get("build_id").and_then(|b| b.as_str());
-    matches!((build_id, cached_build), (Some(a), Some(b)) if a == b).then_some(v)
+    (cached_build == Some(expected)).then_some(v)
 }
 
 pub fn read_any(path: &std::path::Path) -> Option<(serde_json::Value, u64)> {
@@ -40,8 +39,7 @@ pub fn read_any(path: &std::path::Path) -> Option<(serde_json::Value, u64)> {
         .duration_since(modified)
         .ok()?
         .as_secs();
-    let bytes = std::fs::read(path).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let v = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     Some((v, age))
 }
 
@@ -63,10 +61,9 @@ fn read_build_id(path: &std::path::Path) -> Option<String> {
 }
 
 fn write_meta(path: &std::path::Path, value: &serde_json::Value) {
-    let Some(build_id) = value.get("build_id").and_then(|b| b.as_str()) else {
-        return;
-    };
-    let _ = std::fs::write(meta_path(path), build_id);
+    if let Some(build_id) = value.get("build_id").and_then(|b| b.as_str()) {
+        let _ = std::fs::write(meta_path(path), build_id);
+    }
 }
 
 fn meta_path(path: &std::path::Path) -> std::path::PathBuf {

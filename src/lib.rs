@@ -1,3 +1,4 @@
+pub mod app;
 pub mod cache;
 pub mod fetch;
 pub mod html;
