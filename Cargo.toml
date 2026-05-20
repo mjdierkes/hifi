@@ -12,7 +12,7 @@ futures-util = "0.3"
 memchr = "2"
 rustc-hash = "2"
 serde_json = "1"
-url = "2"
+url = { version = "2", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 
 [profile.release]

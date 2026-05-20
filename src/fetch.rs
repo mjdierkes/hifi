@@ -1,5 +1,6 @@
 use crate::{
-    cache, html,
+    cache::{self, ChunkData},
+    html,
     scan::{self, ApiMap},
 };
 use bytes::Bytes;
@@ -24,16 +25,15 @@ pub struct ChunkScanStats {
     pub errors: usize,
 }
 
-#[derive(Clone)]
-pub struct ChunkData {
-    apis: ApiMap,
-    refs: Vec<Url>,
+struct ChunkResult {
+    data: Arc<ChunkData>,
+    source: ChunkSource,
 }
 
-enum ChunkScan {
-    Fetched(ChunkData),
-    Cached(ChunkData),
-    MemoryCached(Arc<ChunkData>),
+enum ChunkSource {
+    Fetched,
+    Disk,
+    Memory,
 }
 
 pub async fn scan_chunks(
@@ -62,23 +62,12 @@ pub async fn scan_chunks(
 
         while let Some(res) = fetched.next().await {
             match res {
-                Ok(ChunkScan::Fetched(chunk)) => {
-                    stats.scanned += 1;
-                    merge_chunk(apis, &chunk);
-                    enqueue_refs(&chunk.refs, &mut visited, &mut queue);
+                Ok(chunk) => {
+                    stats.record(chunk.source);
+                    scan::merge_refs_into(apis, chunk.data.apis.iter());
+                    enqueue_refs(&chunk.data.refs, &mut visited, &mut queue);
                 }
-                Ok(ChunkScan::Cached(chunk)) => {
-                    stats.cache_hits += 1;
-                    merge_chunk(apis, &chunk);
-                    enqueue_refs(&chunk.refs, &mut visited, &mut queue);
-                }
-                Ok(ChunkScan::MemoryCached(chunk)) => {
-                    stats.cache_hits += 1;
-                    stats.memory_hits += 1;
-                    scan::merge_refs_into(apis, chunk.apis.iter());
-                    enqueue_refs(&chunk.refs, &mut visited, &mut queue);
-                }
-                _ => stats.errors += 1,
+                Err(()) => stats.errors += 1,
             }
         }
     }
@@ -87,8 +76,17 @@ pub async fn scan_chunks(
     stats
 }
 
-fn merge_chunk(apis: &mut ApiMap, chunk: &ChunkData) {
-    scan::merge_refs_into(apis, chunk.apis.iter());
+impl ChunkScanStats {
+    fn record(&mut self, source: ChunkSource) {
+        match source {
+            ChunkSource::Fetched => self.scanned += 1,
+            ChunkSource::Disk => self.cache_hits += 1,
+            ChunkSource::Memory => {
+                self.cache_hits += 1;
+                self.memory_hits += 1;
+            }
+        }
+    }
 }
 
 fn enqueue_refs(refs: &[Url], visited: &mut FxHashSet<String>, queue: &mut Vec<Url>) {
@@ -104,22 +102,20 @@ async fn fetch_scan(
     url: Url,
     use_cache: bool,
     memory: Option<ChunkMemoryCache>,
-) -> Result<ChunkScan, ()> {
+) -> Result<ChunkResult, ()> {
     if use_cache {
         if let Some(chunk) = read_memory_chunk(memory.as_ref(), &url) {
-            return Ok(ChunkScan::MemoryCached(chunk));
+            return Ok(ChunkResult {
+                data: chunk,
+                source: ChunkSource::Memory,
+            });
         }
-        if let Some(cached) = cache::read_chunk(&url) {
-            let chunk = ChunkData {
-                apis: cached.apis,
-                refs: cached
-                    .refs
-                    .into_iter()
-                    .filter_map(|s| Url::parse(&s).ok())
-                    .collect(),
-            };
-            write_memory_chunk(memory.as_ref(), &url, &chunk);
-            return Ok(ChunkScan::Cached(chunk));
+        if let Some(chunk) = cache::read_chunk(&url).map(Arc::new) {
+            write_memory_chunk(memory.as_ref(), &url, chunk.clone());
+            return Ok(ChunkResult {
+                data: chunk,
+                source: ChunkSource::Disk,
+            });
         }
     }
 
@@ -134,24 +130,27 @@ async fn fetch_scan(
     let body = response.bytes().await.map_err(|_| ())?;
     let refs = html::extract_chunk_refs(&body, &url);
     scan_bytes(body, &mut apis).await?;
-    let chunk = ChunkData { apis, refs };
+    let chunk = Arc::new(ChunkData { apis, refs });
     if use_cache {
-        cache::write_chunk(&url, &chunk.apis, &chunk.refs);
-        write_memory_chunk(memory.as_ref(), &url, &chunk);
+        cache::write_chunk(&url, &chunk);
+        write_memory_chunk(memory.as_ref(), &url, chunk.clone());
     }
-    Ok(ChunkScan::Fetched(chunk))
+    Ok(ChunkResult {
+        data: chunk,
+        source: ChunkSource::Fetched,
+    })
 }
 
 fn read_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url) -> Option<Arc<ChunkData>> {
     memory?.read().ok()?.get(url.as_str()).cloned()
 }
 
-fn write_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url, chunk: &ChunkData) {
+fn write_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url, chunk: Arc<ChunkData>) {
     let Some(memory) = memory else {
         return;
     };
     if let Ok(mut entries) = memory.write() {
-        entries.insert(url.as_str().to_string(), Arc::new(chunk.clone()));
+        entries.insert(url.as_str().to_string(), chunk);
         if entries.len() <= CHUNK_MEMORY_CACHE_MAX_ENTRIES {
             return;
         }

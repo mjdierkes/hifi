@@ -27,36 +27,21 @@ pub fn path_for(base: &Url) -> std::path::PathBuf {
     dir().join(format!("{host}.json"))
 }
 
-pub struct CachedChunk {
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ChunkData {
     pub apis: ApiMap,
-    pub refs: Vec<String>,
+    pub refs: Vec<Url>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct ChunkFile {
-    apis: ApiMap,
-    refs: Vec<String>,
+pub fn read_chunk(url: &Url) -> Option<ChunkData> {
+    serde_json::from_slice(&std::fs::read(chunk_path_for(url)).ok()?).ok()
 }
 
-pub fn read_chunk(url: &Url) -> Option<CachedChunk> {
-    let bytes = std::fs::read(chunk_path_for(url)).ok()?;
-    let chunk = serde_json::from_slice::<ChunkFile>(&bytes).ok()?;
-    Some(CachedChunk {
-        apis: chunk.apis,
-        refs: chunk.refs,
-    })
-}
-
-pub fn write_chunk(url: &Url, apis: &ApiMap, refs: &[Url]) {
+pub fn write_chunk(url: &Url, chunk: &ChunkData) {
     let path = chunk_path_for(url);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let refs = refs.iter().map(|u| u.as_str().to_string()).collect();
-    let chunk = ChunkFile {
-        apis: apis.clone(),
-        refs,
-    };
     if let Ok(bytes) = serde_json::to_vec(&chunk) {
         let _ = std::fs::write(path, bytes);
     }
@@ -155,14 +140,20 @@ mod tests {
         crate::scan::scan(br#"fetch("/api/users", {method:"POST"})"#, &mut apis);
         let refs = vec![Url::parse("https://example.com/_next/static/chunks/app-def.js").unwrap()];
 
-        write_chunk(&url, &apis, &refs);
+        write_chunk(
+            &url,
+            &ChunkData {
+                apis: apis.clone(),
+                refs: refs.clone(),
+            },
+        );
         let cached = read_chunk(&url).unwrap();
 
         assert_eq!(
             serde_json::to_value(&cached.apis).unwrap(),
             serde_json::to_value(&apis).unwrap()
         );
-        assert_eq!(cached.refs, vec![refs[0].as_str()]);
+        assert_eq!(cached.refs, refs);
 
         let _ = std::fs::remove_file(path);
     }
