@@ -59,7 +59,8 @@ pub async fn get_limited(
 }
 
 pub async fn read_limited(response: Response) -> Result<Bytes, NetError> {
-    if let Some(len) = response.content_length() {
+    let content_length = response.content_length();
+    if let Some(len) = content_length {
         if len > MAX_RESPONSE_BYTES {
             return Err(NetError::ResponseTooLarge {
                 actual: len,
@@ -68,7 +69,8 @@ pub async fn read_limited(response: Response) -> Result<Bytes, NetError> {
         }
     }
 
-    let mut body = BytesMut::new();
+    let mut body =
+        BytesMut::with_capacity(content_length.unwrap_or(0).min(MAX_RESPONSE_BYTES) as usize);
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -90,6 +92,23 @@ pub async fn get_bytes_limited(
     allow_private: bool,
 ) -> Result<Bytes, NetError> {
     read_limited(get_limited(client, url, allow_private).await?).await
+}
+
+pub async fn prewarm_connection(client: Client, url: Url, allow_private: bool) {
+    if validate_url(&url, allow_private).is_err() {
+        return;
+    }
+    let _ = client.head(url).send().await;
+}
+
+pub fn trace_response_version(label: &str, url: &Url, response: &Response) {
+    if std::env::var_os("HIFI_TRACE_HTTP").is_some() {
+        eprintln!(
+            "hifi: trace: {label} {} {:?}",
+            url.as_str(),
+            response.version()
+        );
+    }
 }
 
 pub fn is_private_ip(ip: IpAddr) -> bool {

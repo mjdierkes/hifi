@@ -1,9 +1,8 @@
-use crate::app::{escape_terminal, normalize_url};
+use crate::app::{escape_terminal, normalize_url, AppError};
 use crate::runtime::net;
 use crate::scan::html;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
-use std::error::Error;
 use url::Url;
 
 type Hit = (String, usize, String);
@@ -14,11 +13,7 @@ struct GrepResult {
     failed: usize,
 }
 
-pub async fn run(
-    args: &[String],
-    client: Client,
-    concurrency: usize,
-) -> Result<i32, Box<dyn Error>> {
+pub async fn run(args: &[String], client: Client, concurrency: usize) -> Result<i32, AppError> {
     let mut url = None;
     let mut pattern = None;
     let mut context: usize = 2;

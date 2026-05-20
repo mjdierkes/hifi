@@ -183,7 +183,7 @@ impl<'a> Processor<'a> {
         cache_ctx: &CacheContext,
     ) -> Result<(Output, bool)> {
         let (html, final_base) = if let Some((body, final_base)) = cache_path
-            .is_none()
+            .is_some()
             .then(|| cache::read_page(request_base))
             .flatten()
         {
@@ -195,7 +195,9 @@ impl<'a> Processor<'a> {
             let final_base = response.url().clone();
             remember_redirect(cache_ctx.redirects.as_ref(), original_base, &final_base);
             let html = net::read_limited(response).await?;
-            cache::write_page(request_base, &final_base, &html);
+            if cache_path.is_some() {
+                cache::write_page(request_base, &final_base, &html);
+            }
             (html, final_base)
         };
         let mut chunks = html::extract_chunks(&html, &final_base);
@@ -214,6 +216,14 @@ impl<'a> Processor<'a> {
                 ));
             }
         }
+
+        let _prewarm_task = chunks.first().cloned().map(|url| {
+            tokio::spawn(net::prewarm_connection(
+                self.client.clone(),
+                url,
+                cache_ctx.allow_private,
+            ))
+        });
 
         let html_scan_body = html.clone();
         let html_scan_task = tokio::task::spawn_blocking(move || {
@@ -243,7 +253,7 @@ impl<'a> Processor<'a> {
             fetch::ChunkScanOptions {
                 concurrency: self.concurrency,
                 use_processed_cache: cache_path.is_some(),
-                use_bundle_cache: true,
+                use_bundle_cache: cache_path.is_some(),
                 cache_key: build_id.clone(),
                 allow_private: cache_ctx.allow_private,
                 memory: cache_ctx.chunks.clone(),
@@ -265,6 +275,12 @@ impl<'a> Processor<'a> {
             warnings.push(format!(
                 "failed to read {} chunks; results may be incomplete",
                 chunk_stats.failed
+            ));
+        }
+        if chunk_stats.capped {
+            warnings.push(format!(
+                "stopped after {} discovered chunks; results may be incomplete",
+                chunk_stats.discovered
             ));
         }
 
@@ -322,11 +338,21 @@ async fn scan_next_manifests(
         return;
     };
 
+    let mut manifests = Vec::with_capacity(2);
     for name in ["_buildManifest.js", "_ssgManifest.js"] {
         let Ok(manifest_url) = base.join(&format!("/_next/static/{build_id}/{name}")) else {
             continue;
         };
-        let Some(body) = fetch_manifest(client, manifest_url.clone(), allow_private).await else {
+        let client = client.clone();
+        let fetch_url = manifest_url.clone();
+        manifests.push((
+            manifest_url,
+            tokio::spawn(async move { fetch_manifest(&client, fetch_url, allow_private).await }),
+        ));
+    }
+
+    for (manifest_url, task) in manifests {
+        let Ok(Some(body)) = task.await else {
             continue;
         };
         scan::scan(&body, apis);
@@ -539,5 +565,52 @@ mod tests {
             out.warnings,
             vec!["failed to read 1 chunks; results may be incomplete"]
         );
+    }
+
+    #[tokio::test]
+    async fn no_cache_bypasses_page_cache() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for body in [
+                r#"<script>fetch("/api/first")</script>"#,
+                r#"<script>fetch("/api/second")</script>"#,
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0; 2048];
+                    let _ = socket.read(&mut buf).await.unwrap();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let client = Client::new();
+        let processor = Processor::new(
+            &client,
+            2,
+            CacheContext {
+                allow_private: true,
+                ..CacheContext::default()
+            },
+        );
+        let url = format!("http://{addr}/");
+
+        let first = processor
+            .process_for_display(&url, true, Instant::now())
+            .await
+            .unwrap();
+        let second = processor
+            .process_for_display(&url, true, Instant::now())
+            .await
+            .unwrap();
+
+        assert!(first.apis.contains_key("/api/first"));
+        assert!(second.apis.contains_key("/api/second"));
+        assert!(!second.apis.contains_key("/api/first"));
     }
 }

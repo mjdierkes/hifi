@@ -38,16 +38,55 @@ pub struct ChunkData {
     pub refs: Vec<Url>,
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct ChunkValidators {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
+}
+
+impl ChunkValidators {
+    pub fn is_empty(&self) -> bool {
+        self.etag.is_none() && self.last_modified.is_none()
+    }
+}
+
+pub struct CachedChunk {
+    pub data: ChunkData,
+    pub age_secs: u64,
+    pub validators: ChunkValidators,
+}
+
 pub fn read_chunk(url: &Url, cache_key: Option<&str>) -> Option<ChunkData> {
-    let (bytes, _) = read_fresh(
-        &chunk_path_for(url, cache_key),
-        super::processor::CACHE_STALE_SECS,
-    )?;
-    serde_json::from_slice(&bytes).ok()
+    let cached = read_chunk_cached(url, cache_key)?;
+    (cached.age_secs < super::processor::CACHE_FRESH_SECS).then_some(cached.data)
+}
+
+pub fn read_chunk_cached(url: &Url, cache_key: Option<&str>) -> Option<CachedChunk> {
+    let path = chunk_path_for(url, cache_key);
+    let (bytes, age_secs) = read_fresh(&path, super::processor::CACHE_STALE_SECS)?;
+    let data = serde_json::from_slice(&bytes).ok()?;
+    Some(CachedChunk {
+        data,
+        age_secs,
+        validators: read_chunk_validators(&path).unwrap_or_default(),
+    })
 }
 
 pub fn write_chunk(url: &Url, chunk: &ChunkData, cache_key: Option<&str>) {
-    write_json(&chunk_path_for(url, cache_key), chunk);
+    write_chunk_with_validators(url, chunk, cache_key, &ChunkValidators::default());
+}
+
+pub fn write_chunk_with_validators(
+    url: &Url,
+    chunk: &ChunkData,
+    cache_key: Option<&str>,
+    validators: &ChunkValidators,
+) {
+    let path = chunk_path_for(url, cache_key);
+    write_json(&path, chunk);
+    write_chunk_validators(&path, validators);
 }
 
 pub fn read_bundle_pack(seed: &[Url], cache_key: Option<&str>) -> Option<Vec<(Url, Vec<u8>)>> {
@@ -62,7 +101,11 @@ pub fn write_bundle_pack(seed: &[Url], entries: &[(Url, Vec<u8>)], cache_key: Op
     let Some(path) = bundle_pack_path_for(seed, cache_key) else {
         return;
     };
-    let mut out = Vec::new();
+    let bytes_len = entries
+        .iter()
+        .map(|(url, body)| 12 + url.as_str().len() + body.len())
+        .sum::<usize>();
+    let mut out = Vec::with_capacity(BUNDLE_PACK_MAGIC.len() + bytes_len);
     out.extend_from_slice(BUNDLE_PACK_MAGIC);
     for (url, body) in entries {
         let url = url.as_str().as_bytes();
@@ -214,9 +257,29 @@ fn read_build_id(path: &Path) -> Option<String> {
     (!id.is_empty()).then(|| id.to_string())
 }
 
+fn read_chunk_validators(path: &Path) -> Option<ChunkValidators> {
+    let bytes = fs::read(validators_path(path)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_chunk_validators(path: &Path, validators: &ChunkValidators) {
+    let path = validators_path(path);
+    if validators.is_empty() {
+        let _ = fs::remove_file(path);
+    } else {
+        write_json(&path, validators);
+    }
+}
+
 fn meta_path(path: &Path) -> PathBuf {
     let mut meta = path.as_os_str().to_os_string();
     meta.push(".build");
+    meta.into()
+}
+
+fn validators_path(path: &Path) -> PathBuf {
+    let mut meta = path.as_os_str().to_os_string();
+    meta.push(".http");
     meta.into()
 }
 

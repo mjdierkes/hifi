@@ -8,20 +8,32 @@ use reqwest::Client;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::{
-    error::Error,
     io,
     path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
     time::Instant,
 };
+use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{oneshot, Mutex};
 
-type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
+type Result<T = ()> = std::result::Result<T, DaemonError>;
 type Inflight = Arc<Mutex<FxHashMap<String, Vec<oneshot::Sender<Body>>>>>;
 const MAX_DAEMON_REQUEST_BYTES: usize = 8192;
+
+#[derive(Debug, Error)]
+pub enum DaemonError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Runtime(#[from] super::processor::RuntimeError),
+    #[error(transparent)]
+    Utf8(#[from] std::str::Utf8Error),
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DaemonReply {
@@ -109,9 +121,7 @@ pub async fn request(url: &str, no_cache: bool, mode: OutputMode) -> Option<Daem
 
 pub async fn serve(client: Client, concurrency: usize) -> Result {
     let path = socket_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    prepare_socket_dir(&path)?;
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     set_socket_private(&path)?;
@@ -139,6 +149,25 @@ fn socket_path() -> PathBuf {
 fn private_runtime_dir() -> PathBuf {
     let uid = std::env::var("UID").unwrap_or_else(|_| std::process::id().to_string());
     std::env::temp_dir().join(format!("hifi-{uid}"))
+}
+
+#[cfg(unix)]
+fn prepare_socket_dir(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_socket_dir(path: &std::path::Path) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(())
 }
 
 async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -> Result {

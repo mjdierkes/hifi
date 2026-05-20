@@ -4,7 +4,8 @@ use crate::runtime::net;
 use crate::runtime::processor::{CacheContext, Output, Processor, CACHE_FRESH_SECS};
 use reqwest::Client;
 use std::io::{self, Write};
-use std::{error::Error, time::Duration};
+use std::time::Duration;
+use thiserror::Error;
 
 const MAX_CHUNK_CONCURRENCY: usize = 32;
 const HARD_MAX_CHUNK_CONCURRENCY: usize = 128;
@@ -29,6 +30,38 @@ FLAGS:
         --flat        print tab-separated output
         --json        print machine-readable JSON
 ";
+
+#[derive(Debug, Error)]
+pub enum AppError {
+    #[error("{0}")]
+    Message(String),
+    #[error(transparent)]
+    Daemon(#[from] daemon::DaemonError),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Net(#[from] net::NetError),
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
+    #[error(transparent)]
+    Runtime(#[from] crate::runtime::processor::RuntimeError),
+    #[error(transparent)]
+    Url(#[from] url::ParseError),
+}
+
+impl From<String> for AppError {
+    fn from(value: String) -> Self {
+        Self::Message(value)
+    }
+}
+
+impl From<&'static str> for AppError {
+    fn from(value: &'static str) -> Self {
+        Self::Message(value.to_string())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputMode {
@@ -63,7 +96,7 @@ impl OutputMode {
     }
 }
 
-pub async fn run(raw: Vec<String>) -> Result<i32, Box<dyn Error>> {
+pub async fn run(raw: Vec<String>) -> Result<i32, AppError> {
     if raw.is_empty() {
         print!("{HELP}");
         return Ok(0);
@@ -126,14 +159,14 @@ pub async fn run(raw: Vec<String>) -> Result<i32, Box<dyn Error>> {
     Ok(0)
 }
 
-fn set_mode(current: OutputMode, next: OutputMode) -> Result<OutputMode, Box<dyn Error>> {
+fn set_mode(current: OutputMode, next: OutputMode) -> Result<OutputMode, AppError> {
     if current != OutputMode::Auto && current != next {
         return Err("choose only one of --flat or --json".into());
     }
     Ok(next)
 }
 
-pub fn normalize_url(url: &str) -> Result<String, Box<dyn Error>> {
+pub fn normalize_url(url: &str) -> Result<String, AppError> {
     if url.contains("://") {
         let parsed = url::Url::parse(url)?;
         if !matches!(parsed.scheme(), "http" | "https") {
@@ -159,7 +192,7 @@ pub fn render_json_mode(json: &str, mode: OutputMode) -> String {
     }
 }
 
-fn render_processed(out: &Output, mode: OutputMode) -> Result<(), Box<dyn Error>> {
+fn render_processed(out: &Output, mode: OutputMode) -> Result<(), AppError> {
     let stdout = io::stdout();
     let mut stdout = io::BufWriter::new(stdout.lock());
     match mode.for_stdout() {
