@@ -30,8 +30,7 @@ fn hash_parts<'a>(parts: impl Iterator<Item = &'a str>) -> u64 {
 }
 
 pub fn path_for(base: &Url) -> PathBuf {
-    let host = base.host_str().unwrap_or("unknown").replace('/', "_");
-    dir().join(format!("{host}.json"))
+    dir().join(format!("{}.json", host(base)))
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -54,11 +53,7 @@ pub fn read_bundle(url: &Url) -> Option<Vec<u8>> {
 }
 
 pub fn write_bundle(url: &Url, bytes: &[u8]) {
-    let path = bundle_path_for(url);
-    if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
-    let _ = fs::write(path, bytes);
+    write_bytes(&bundle_path_for(url), bytes);
 }
 
 pub fn read_bundle_pack(seed: &[Url]) -> Option<Vec<(Url, Vec<u8>)>> {
@@ -70,9 +65,6 @@ pub fn write_bundle_pack(seed: &[Url], entries: &[(Url, Vec<u8>)]) {
     let Some(path) = bundle_pack_path_for(seed) else {
         return;
     };
-    if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
     let mut out = Vec::new();
     out.extend_from_slice(BUNDLE_PACK_MAGIC);
     for (url, body) in entries {
@@ -82,7 +74,7 @@ pub fn write_bundle_pack(seed: &[Url], entries: &[(Url, Vec<u8>)]) {
         out.extend_from_slice(url);
         out.extend_from_slice(body);
     }
-    let _ = fs::write(path, out);
+    write_bytes(&path, &out);
 }
 
 pub fn read_page(url: &Url) -> Option<(Vec<u8>, Url)> {
@@ -97,50 +89,43 @@ pub fn read_page(url: &Url) -> Option<(Vec<u8>, Url)> {
 
 pub fn write_page(url: &Url, final_url: &Url, bytes: &[u8]) {
     let path = page_path_for(url);
-    if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
-    let _ = fs::write(&path, bytes);
+    write_bytes(&path, bytes);
     let _ = fs::write(url_sidecar_path(&path), final_url.as_str());
 }
 
 fn chunk_path_for(url: &Url) -> PathBuf {
-    let host = url.host_str().unwrap_or("unknown").replace('/', "_");
-    let hash = hash_parts(std::iter::once(url.as_str()));
-    dir()
-        .join("chunks")
-        .join(host)
-        .join(format!("{hash:016x}.json"))
+    hashed_path("chunks", url, "json")
 }
 
 fn bundle_path_for(url: &Url) -> PathBuf {
-    let host = url.host_str().unwrap_or("unknown").replace('/', "_");
-    let hash = hash_parts(std::iter::once(url.as_str()));
-    dir()
-        .join("bundles")
-        .join(host)
-        .join(format!("{hash:016x}.bin"))
+    hashed_path("bundles", url, "bin")
 }
 
 fn bundle_pack_path_for(seed: &[Url]) -> Option<PathBuf> {
     let first = seed.first()?;
-    let host = first.host_str().unwrap_or("unknown").replace('/', "_");
     let hash = fingerprint(seed);
     Some(
         dir()
             .join("bundle-packs")
-            .join(host)
+            .join(host(first))
             .join(format!("{hash}.bin")),
     )
 }
 
 fn page_path_for(url: &Url) -> PathBuf {
-    let host = url.host_str().unwrap_or("unknown").replace('/', "_");
+    hashed_path("pages", url, "html")
+}
+
+fn hashed_path(kind: &str, url: &Url, ext: &str) -> PathBuf {
     let hash = hash_parts(std::iter::once(url.as_str()));
     dir()
-        .join("pages")
-        .join(host)
-        .join(format!("{hash:016x}.html"))
+        .join(kind)
+        .join(host(url))
+        .join(format!("{hash:016x}.{ext}"))
+}
+
+fn host(url: &Url) -> String {
+    url.host_str().unwrap_or("unknown").replace('/', "_")
 }
 
 const BUNDLE_PACK_MAGIC: &[u8] = b"HIFI-BUNDLEPACK-1\n";
@@ -199,12 +184,16 @@ pub fn write_with_build_id<T: Serialize>(path: &Path, value: &T, build_id: Optio
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) {
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        write_bytes(path, &bytes);
+    }
+}
+
+fn write_bytes(path: &Path, bytes: &[u8]) {
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    if let Ok(bytes) = serde_json::to_vec(value) {
-        let _ = fs::write(path, bytes);
-    }
+    let _ = fs::write(path, bytes);
 }
 
 pub fn prune_overflow<K: Clone + Eq + Hash, V>(entries: &mut FxHashMap<K, V>, max: usize) {

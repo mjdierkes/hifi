@@ -74,18 +74,6 @@ impl Shape {
         flags.join(",")
     }
 
-    pub fn tree_label(&self) -> String {
-        let methods = self.methods_csv();
-        let flags = self.flags_csv();
-        if flags.is_empty() {
-            format!("[{methods}]")
-        } else {
-            format!("[{methods}] [{flags}]")
-        }
-    }
-}
-
-impl Shape {
     fn merge_ref(&mut self, other: &Shape) {
         self.methods |= other.methods;
         self.has_body |= other.has_body;
@@ -175,28 +163,13 @@ pub fn scan_candidates(bytes: &[u8], candidates: &mut CandidateMap) {
             b'"' | b'\'' | b'`' => {
                 let quote = bytes[i];
                 let start = i + 1;
-                let mut end = start;
-                while end < bytes.len() && bytes[end] != quote {
-                    if bytes[end] == b'\\' && end + 1 < bytes.len() {
-                        end += 2;
-                        continue;
-                    }
-                    if quote == b'`'
-                        && bytes[end] == b'$'
-                        && end + 1 < bytes.len()
-                        && bytes[end + 1] == b'{'
-                    {
-                        end = skip_template_expr(bytes, end + 2);
-                        continue;
-                    }
-                    end += 1;
-                }
+                let (end, next) = quoted_end(bytes, i);
                 if quote == b'`' {
                     scan_template_candidate_text(&bytes[start..end], candidates);
                 } else {
                     scan_candidate_text(&bytes[start..end], candidates);
                 }
-                i = end.saturating_add(1);
+                i = next;
             }
             _ => i += 1,
         }
@@ -319,6 +292,10 @@ fn scan_unquoted_candidate_text(bytes: &[u8], candidates: &mut CandidateMap) {
 }
 
 fn skip_quoted(bytes: &[u8], start: usize) -> usize {
+    quoted_end(bytes, start).1
+}
+
+fn quoted_end(bytes: &[u8], start: usize) -> (usize, usize) {
     let quote = bytes[start];
     let mut i = start + 1;
     while i < bytes.len() {
@@ -331,11 +308,11 @@ fn skip_quoted(bytes: &[u8], start: usize) -> usize {
             continue;
         }
         if bytes[i] == quote {
-            return i + 1;
+            return (i, i + 1);
         }
         i += 1;
     }
-    bytes.len()
+    (bytes.len(), bytes.len())
 }
 
 fn scan_template_candidate_text(bytes: &[u8], candidates: &mut CandidateMap) {

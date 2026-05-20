@@ -2,8 +2,7 @@ use crate::grep;
 use crate::runtime::daemon;
 use crate::runtime::processor::{CacheContext, Output, Processor, CACHE_FRESH_SECS};
 use reqwest::Client;
-use rustc_hash::FxHashMap;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::{error::Error, time::Duration};
 
 const MAX_CHUNK_CONCURRENCY: usize = 32;
@@ -12,7 +11,7 @@ const HELP: &str = "\
 hifi — map an HTTP API surface
 
 USAGE:
-    hifi <url> [--no-cache] [--no-daemon] [--flat|--tree|--json]
+    hifi <url> [--no-cache] [--no-daemon] [--flat|--json]
     hifi grep <url> <pattern> [-C N]
     hifi serve
 
@@ -26,7 +25,6 @@ FLAGS:
         --no-cache    bypass cached results
         --no-daemon   skip the background daemon
         --flat        print tab-separated output
-        --tree        print tree output
         --json        print machine-readable JSON
 ";
 
@@ -34,14 +32,12 @@ FLAGS:
 pub enum OutputMode {
     Auto,
     Flat,
-    Tree,
     Json,
 }
 
 impl OutputMode {
     pub fn for_stdout(self) -> Self {
         match self {
-            Self::Auto if std::io::stdout().is_terminal() => Self::Tree,
             Self::Auto => Self::Flat,
             mode => mode,
         }
@@ -51,7 +47,6 @@ impl OutputMode {
         match self.for_stdout() {
             Self::Auto => b'a',
             Self::Flat => b'f',
-            Self::Tree => b't',
             Self::Json => b'j',
         }
     }
@@ -59,7 +54,6 @@ impl OutputMode {
     pub fn from_daemon_byte(b: u8) -> Option<Self> {
         Some(match b {
             b'f' => Self::Flat,
-            b't' => Self::Tree,
             b'j' => Self::Json,
             b'a' => Self::Auto,
             _ => return None,
@@ -96,7 +90,6 @@ pub async fn run(raw: Vec<String>) -> Result<i32, Box<dyn Error>> {
             "--no-cache" => no_cache = true,
             "--no-daemon" => no_daemon = true,
             "--flat" => mode = set_mode(mode, OutputMode::Flat)?,
-            "--tree" => mode = set_mode(mode, OutputMode::Tree)?,
             "--json" => mode = set_mode(mode, OutputMode::Json)?,
             s if s.starts_with("--") || s.starts_with('-') => {
                 return Err(format!("unknown flag '{s}' (try --help)").into());
@@ -124,7 +117,7 @@ pub async fn run(raw: Vec<String>) -> Result<i32, Box<dyn Error>> {
 
 fn set_mode(current: OutputMode, next: OutputMode) -> Result<OutputMode, Box<dyn Error>> {
     if current != OutputMode::Auto && current != next {
-        return Err("choose only one of --flat, --tree, or --json".into());
+        return Err("choose only one of --flat or --json".into());
     }
     Ok(next)
 }
@@ -137,79 +130,6 @@ pub fn normalize_url(url: &str) -> String {
     }
 }
 
-#[derive(Default)]
-struct Node<'a> {
-    shape: Option<&'a crate::scan::Shape>,
-    children: FxHashMap<String, Node<'a>>,
-}
-
-fn insert<'a>(root: &mut Node<'a>, segments: &[&str], shape: Option<&'a crate::scan::Shape>) {
-    if segments.is_empty() {
-        root.shape = shape;
-        return;
-    }
-    let child = root.children.entry(segments[0].to_string()).or_default();
-    insert(child, &segments[1..], shape);
-}
-
-fn render_node<W: Write>(out: &mut W, node: &Node, prefix: &str) -> io::Result<()> {
-    let mut children: Vec<_> = node.children.iter().collect();
-    children.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    let count = children.len();
-    for (i, (name, child)) in children.into_iter().enumerate() {
-        let last = i + 1 == count;
-        let connector = if last { "└── " } else { "├── " };
-        let label = child
-            .shape
-            .map(|s| format!(" {}", s.tree_label()))
-            .unwrap_or_default();
-        let display = if name.is_empty() { "/" } else { name.as_str() };
-        writeln!(out, "{prefix}{connector}{display}{label}")?;
-        let next_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
-        render_node(out, child, &next_prefix)?;
-    }
-    Ok(())
-}
-
-fn segments_of(rel: &str) -> Vec<&str> {
-    if rel.is_empty() {
-        return Vec::new();
-    }
-    let s = rel.strip_prefix('/').unwrap_or(rel);
-    s.split('/').collect()
-}
-
-fn group_paths<'a, I: Iterator<Item = &'a str>>(paths: I) -> Vec<(String, Vec<String>)> {
-    let mut groups: FxHashMap<String, Vec<String>> = FxHashMap::default();
-    for p in paths {
-        let branch = if let Some(rest) = p.strip_prefix("http://").or(p.strip_prefix("https://")) {
-            let host_end = rest.find('/').unwrap_or(rest.len());
-            let host = &rest[..host_end];
-            let scheme = if p.starts_with("https://") {
-                "https://"
-            } else {
-                "http://"
-            };
-            format!("{scheme}{host}")
-        } else if let Some(rest) = p.strip_prefix('/') {
-            let seg_end = rest.find('/').unwrap_or(rest.len());
-            format!("/{}", &rest[..seg_end])
-        } else {
-            p.to_string()
-        };
-        groups.entry(branch).or_default().push(p.to_string());
-    }
-    let mut groups: Vec<_> = groups.into_iter().collect();
-    groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    groups
-}
-
-fn strip_branch(branch: &str, path: &str) -> String {
-    path.strip_prefix(branch)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| path.to_string())
-}
-
 pub fn render_json_mode(json: &str, mode: OutputMode) -> String {
     match mode.for_stdout() {
         OutputMode::Json => {
@@ -220,7 +140,6 @@ pub fn render_json_mode(json: &str, mode: OutputMode) -> String {
             }
             out
         }
-        OutputMode::Tree => render_tree(json),
         OutputMode::Flat | OutputMode::Auto => render_flat(json),
     }
 }
@@ -233,42 +152,9 @@ fn render_processed(out: Output, mode: OutputMode) -> Result<(), Box<dyn Error>>
             serde_json::to_writer(&mut stdout, &out)?;
             stdout.write_all(b"\n")?;
         }
-        OutputMode::Tree => render_tree_output(&out, &mut stdout)?,
         OutputMode::Flat | OutputMode::Auto => render_flat_output(&out, &mut stdout)?,
     }
     Ok(())
-}
-
-fn render_tree_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
-    let groups = group_paths(v.apis.keys().map(|s| s.as_str()));
-    for (branch, paths) in &groups {
-        let mut root = Node::default();
-        for p in paths {
-            let rel = strip_branch(branch, p);
-            let segs = segments_of(&rel);
-            insert(&mut root, &segs, v.apis.get(p.as_str()));
-        }
-        let root_label = root
-            .shape
-            .map(|s| format!(" {}", s.tree_label()))
-            .unwrap_or_default();
-        writeln!(out, "{branch}{root_label}")?;
-        render_node(out, &root, "")?;
-    }
-    if !v.candidates.is_empty() {
-        let groups = group_paths(v.candidates.keys().map(|s| s.as_str()));
-        for (branch, ps) in &groups {
-            let mut root = Node::default();
-            for p in ps {
-                let rel = strip_branch(branch, p);
-                let segs = segments_of(&rel);
-                insert(&mut root, &segs, None);
-            }
-            writeln!(out, "? {branch}")?;
-            render_node(out, &root, "")?;
-        }
-    }
-    writeln!(out, "{} {}ms", v.cache, v.elapsed_us.unwrap_or(0) / 1000)
 }
 
 fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
@@ -284,17 +170,6 @@ fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
         writeln!(out, "?\t{k}\t")?;
     }
     Ok(())
-}
-
-fn render_tree(json: &str) -> String {
-    let Ok(v) = serde_json::from_str::<Output>(json) else {
-        return format!("{json}\n");
-    };
-    let mut out = Vec::new();
-    if render_tree_output(&v, &mut out).is_err() {
-        return format!("{json}\n");
-    }
-    String::from_utf8(out).unwrap_or_else(|_| format!("{json}\n"))
 }
 
 fn render_flat(json: &str) -> String {

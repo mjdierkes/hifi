@@ -6,10 +6,7 @@ use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::{
-    sync::{Arc, RwLock},
-    time::Instant,
-};
+use std::sync::{Arc, RwLock};
 use url::Url;
 
 const CHUNK_MEMORY_CACHE_MAX_ENTRIES: usize = 1024;
@@ -27,44 +24,13 @@ pub struct ChunkScanOptions {
 #[derive(Default)]
 pub struct ChunkScanStats {
     pub discovered: usize,
-    pub scanned: usize,
-    pub cache_hits: usize,
-    pub bundle_hits: usize,
-    pub bundle_pack_hits: usize,
     pub memory_hits: usize,
-    pub errors: usize,
-    pub bytes_fetched: u64,
-    pub bytes_scanned: u64,
-    pub fetch_us: u128,
-    pub scan_us: u128,
-    pub ref_us: u128,
-    pub api_scan_us: u128,
-    pub candidate_scan_us: u128,
 }
 
-enum ChunkSource {
-    Fetched,
-    Bundle,
-    Disk,
-    Memory,
-}
-
-#[derive(Default)]
-struct FetchMetrics {
-    bytes_fetched: u64,
-    bytes_scanned: u64,
-    fetch_us: u128,
-    scan_us: u128,
-    ref_us: u128,
-    api_scan_us: u128,
-    candidate_scan_us: u128,
-}
-
-struct FetchResult {
+struct ScannedChunk {
     url: Url,
     chunk: Arc<ChunkData>,
-    source: ChunkSource,
-    metrics: FetchMetrics,
+    memory_hit: bool,
     raw_body: Option<Bytes>,
 }
 
@@ -92,28 +58,22 @@ pub async fn scan_chunks(
             for (url, _) in &entries {
                 visited.insert(url.clone());
             }
-            stats.bundle_pack_hits = entries.len();
             pack_entries.extend(
                 entries
                     .iter()
                     .map(|(url, body)| (url.clone(), body.clone())),
             );
             let mut scanned = stream::iter(entries)
-                .map(|(url, body)| {
-                    scan_body(Bytes::from(body), url, ChunkSource::Bundle, false, None)
-                })
+                .map(|(url, body)| scan_body(Bytes::from(body), url, false, None))
                 .buffer_unordered(opts.concurrency);
 
             while let Some(res) = scanned.next().await {
-                match res {
-                    Ok(result) => {
-                        stats.record(result.source, result.metrics);
-                        let chunk = result.chunk;
-                        scan::merge_refs_into(apis, chunk.apis.iter());
-                        scan::merge_candidate_refs_into(candidates, chunk.candidates.iter());
-                        enqueue_refs(&chunk.refs, &mut visited, &mut queue);
-                    }
-                    Err(()) => stats.errors += 1,
+                if let Ok(result) = res {
+                    stats.record(result.memory_hit);
+                    let chunk = result.chunk;
+                    scan::merge_refs_into(apis, chunk.apis.iter());
+                    scan::merge_candidate_refs_into(candidates, chunk.candidates.iter());
+                    enqueue_refs(&chunk.refs, &mut visited, &mut queue);
                 }
             }
         }
@@ -136,19 +96,16 @@ pub async fn scan_chunks(
             .buffer_unordered(opts.concurrency);
 
         while let Some(res) = fetched.next().await {
-            match res {
-                Ok(result) => {
-                    if let Some(body) = &result.raw_body {
-                        pack_entries.push((result.url.clone(), body.to_vec()));
-                        pack_dirty = true;
-                    }
-                    stats.record(result.source, result.metrics);
-                    let chunk = result.chunk;
-                    scan::merge_refs_into(apis, chunk.apis.iter());
-                    scan::merge_candidate_refs_into(candidates, chunk.candidates.iter());
-                    enqueue_refs(&chunk.refs, &mut visited, &mut queue);
+            if let Ok(result) = res {
+                if let Some(body) = &result.raw_body {
+                    pack_entries.push((result.url.clone(), body.to_vec()));
+                    pack_dirty = true;
                 }
-                Err(()) => stats.errors += 1,
+                stats.record(result.memory_hit);
+                let chunk = result.chunk;
+                scan::merge_refs_into(apis, chunk.apis.iter());
+                scan::merge_candidate_refs_into(candidates, chunk.candidates.iter());
+                enqueue_refs(&chunk.refs, &mut visited, &mut queue);
             }
         }
     }
@@ -162,28 +119,10 @@ pub async fn scan_chunks(
 }
 
 impl ChunkScanStats {
-    fn record(&mut self, source: ChunkSource, metrics: FetchMetrics) {
-        match source {
-            ChunkSource::Fetched => self.scanned += 1,
-            ChunkSource::Bundle => {
-                self.scanned += 1;
-                self.bundle_hits += 1;
-            }
-            ChunkSource::Disk => {
-                self.cache_hits += 1;
-            }
-            ChunkSource::Memory => {
-                self.cache_hits += 1;
-                self.memory_hits += 1;
-            }
+    fn record(&mut self, memory_hit: bool) {
+        if memory_hit {
+            self.memory_hits += 1;
         }
-        self.bytes_fetched += metrics.bytes_fetched;
-        self.bytes_scanned += metrics.bytes_scanned;
-        self.fetch_us += metrics.fetch_us;
-        self.scan_us += metrics.scan_us;
-        self.ref_us += metrics.ref_us;
-        self.api_scan_us += metrics.api_scan_us;
-        self.candidate_scan_us += metrics.candidate_scan_us;
     }
 }
 
@@ -201,42 +140,32 @@ async fn fetch_scan(
     use_processed_cache: bool,
     use_bundle_cache: bool,
     memory: Option<ChunkMemoryCache>,
-) -> Result<FetchResult, ()> {
+) -> Result<ScannedChunk, ()> {
     if use_processed_cache {
         if let Some(chunk) = read_memory_chunk(memory.as_ref(), &url) {
-            return Ok(fetch_result(
+            return Ok(ScannedChunk {
                 url,
                 chunk,
-                ChunkSource::Memory,
-                FetchMetrics::default(),
-                None,
-            ));
+                memory_hit: true,
+                raw_body: None,
+            });
         }
         if let Some(chunk) = cache::read_chunk(&url).map(Arc::new) {
             write_memory_chunk(memory.as_ref(), &url, chunk.clone());
-            return Ok(fetch_result(
+            return Ok(ScannedChunk {
                 url,
                 chunk,
-                ChunkSource::Disk,
-                FetchMetrics::default(),
-                None,
-            ));
+                memory_hit: false,
+                raw_body: None,
+            });
         }
     }
     if use_bundle_cache {
         if let Some(body) = cache::read_bundle(&url) {
-            return scan_body(
-                Bytes::from(body),
-                url,
-                ChunkSource::Bundle,
-                use_processed_cache,
-                memory,
-            )
-            .await;
+            return scan_body(Bytes::from(body), url, use_processed_cache, memory).await;
         }
     }
 
-    let fetch_t0 = Instant::now();
     let response = client
         .get(url.clone())
         .send()
@@ -245,32 +174,21 @@ async fn fetch_scan(
         .error_for_status()
         .map_err(|_| ())?;
     let body = response.bytes().await.map_err(|_| ())?;
-    let fetch_elapsed = fetch_t0.elapsed();
     cache::write_bundle(&url, &body);
-    let mut result =
-        scan_body(body, url, ChunkSource::Fetched, use_processed_cache, memory).await?;
-    result.metrics.fetch_us = fetch_elapsed.as_micros();
-    result.metrics.bytes_fetched = result.metrics.bytes_scanned;
-    Ok(result)
+    scan_body(body, url, use_processed_cache, memory).await
 }
 
 async fn scan_body(
     body: Bytes,
     url: Url,
-    source: ChunkSource,
     use_cache: bool,
     memory: Option<ChunkMemoryCache>,
-) -> Result<FetchResult, ()> {
+) -> Result<ScannedChunk, ()> {
     let mut apis = ApiMap::default();
     let mut candidates = CandidateMap::default();
-    let bytes_scanned = body.len() as u64;
-    let refs_t0 = Instant::now();
     let refs = html::extract_chunk_refs(&body, &url);
-    let ref_us = refs_t0.elapsed().as_micros();
-    let scan_t0 = Instant::now();
     let raw_body = body.clone();
-    let breakdown = scan_bytes(body, &mut apis, &mut candidates).await?;
-    let scan_elapsed = scan_t0.elapsed();
+    scan_bytes(body, &mut apis, &mut candidates).await?;
     let chunk = Arc::new(ChunkData {
         apis,
         candidates,
@@ -280,37 +198,12 @@ async fn scan_body(
         cache::write_chunk(&url, &chunk);
         write_memory_chunk(memory.as_ref(), &url, chunk.clone());
     }
-    Ok(fetch_result(
+    Ok(ScannedChunk {
         url,
         chunk,
-        source,
-        FetchMetrics {
-            bytes_fetched: 0,
-            bytes_scanned,
-            fetch_us: 0,
-            scan_us: scan_elapsed.as_micros(),
-            ref_us,
-            api_scan_us: breakdown.api_us,
-            candidate_scan_us: breakdown.candidate_us,
-        },
-        Some(raw_body),
-    ))
-}
-
-fn fetch_result(
-    url: Url,
-    chunk: Arc<ChunkData>,
-    source: ChunkSource,
-    metrics: FetchMetrics,
-    raw_body: Option<Bytes>,
-) -> FetchResult {
-    FetchResult {
-        url,
-        chunk,
-        source,
-        metrics,
-        raw_body,
-    }
+        memory_hit: false,
+        raw_body: Some(raw_body),
+    })
 }
 
 fn read_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url) -> Option<Arc<ChunkData>> {
@@ -327,40 +220,23 @@ fn write_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url, chunk: Arc<C
     }
 }
 
-#[derive(Default)]
-struct ScanBreakdown {
-    api_us: u128,
-    candidate_us: u128,
-}
-
 async fn scan_bytes(
     bytes: Bytes,
     apis: &mut ApiMap,
     candidates: &mut CandidateMap,
-) -> Result<ScanBreakdown, ()> {
-    let (chunk_apis, chunk_candidates, breakdown) = tokio::task::spawn_blocking(move || {
+) -> Result<(), ()> {
+    let (chunk_apis, chunk_candidates) = tokio::task::spawn_blocking(move || {
         let mut chunk_apis = ApiMap::default();
         let mut chunk_candidates = CandidateMap::default();
-        let api_t0 = Instant::now();
         scan::scan(&bytes, &mut chunk_apis);
-        let api_us = api_t0.elapsed().as_micros();
-        let candidate_t0 = Instant::now();
         scan::scan_candidates(&bytes, &mut chunk_candidates);
-        let candidate_us = candidate_t0.elapsed().as_micros();
-        (
-            chunk_apis,
-            chunk_candidates,
-            ScanBreakdown {
-                api_us,
-                candidate_us,
-            },
-        )
+        (chunk_apis, chunk_candidates)
     })
     .await
     .map_err(|_| ())?;
     scan::merge_into(apis, chunk_apis);
     scan::merge_candidates_into(candidates, chunk_candidates);
-    Ok(breakdown)
+    Ok(())
 }
 
 #[cfg(test)]
