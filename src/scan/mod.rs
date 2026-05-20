@@ -327,8 +327,12 @@ impl Shape {
 pub fn scan(bytes: &[u8], apis: &mut ApiMap) {
     const WIN: usize = 400;
 
-    let shape_matches = collect_shape_matches(bytes);
-    for m in CALL_AC.find_iter(bytes) {
+    let mut calls = CALL_AC.find_iter(bytes).peekable();
+    if calls.peek().is_none() {
+        return;
+    }
+
+    for m in calls {
         let after = m.end();
         let Some(url) = extract_url_arg(bytes, after) else {
             continue;
@@ -344,17 +348,11 @@ pub fn scan(bytes: &[u8], apis: &mut ApiMap) {
 
         entry.methods |= method_hint(CALL_LITERALS[m.pattern().as_usize()]);
 
-        apply_shape_matches(entry, &shape_matches, ws, we);
+        apply_shape_window(entry, &bytes[ws..we]);
         if entry.methods == 0 {
             entry.methods = METHOD_GET;
         }
     }
-}
-
-#[derive(Clone, Copy)]
-struct ShapeMatch {
-    pos: usize,
-    kind: ShapeKind,
 }
 
 #[derive(Clone, Copy)]
@@ -367,37 +365,24 @@ enum ShapeKind {
     Ignore,
 }
 
-fn collect_shape_matches(bytes: &[u8]) -> Vec<ShapeMatch> {
-    SHAPE_AC
-        .find_iter(bytes)
-        .filter_map(|m| {
-            let kind = match m.pattern().as_usize() {
-                0 | 1 => ShapeKind::Method(METHOD_POST),
-                2 | 3 => ShapeKind::Method(METHOD_PUT),
-                4 | 5 => ShapeKind::Method(METHOD_DELETE),
-                6 | 7 => ShapeKind::Method(METHOD_PATCH),
-                8 | 9 => ShapeKind::Method(METHOD_GET),
-                10 => ShapeKind::Body,
-                11 => ShapeKind::Headers,
-                13 => ShapeKind::Json,
-                14 | 15 => ShapeKind::Auth,
-                _ => ShapeKind::Ignore,
-            };
-            (!matches!(kind, ShapeKind::Ignore)).then_some(ShapeMatch {
-                pos: m.start(),
-                kind,
-            })
-        })
-        .collect()
+fn shape_kind(pattern: usize) -> ShapeKind {
+    match pattern {
+        0 | 1 => ShapeKind::Method(METHOD_POST),
+        2 | 3 => ShapeKind::Method(METHOD_PUT),
+        4 | 5 => ShapeKind::Method(METHOD_DELETE),
+        6 | 7 => ShapeKind::Method(METHOD_PATCH),
+        8 | 9 => ShapeKind::Method(METHOD_GET),
+        10 => ShapeKind::Body,
+        11 => ShapeKind::Headers,
+        13 => ShapeKind::Json,
+        14 | 15 => ShapeKind::Auth,
+        _ => ShapeKind::Ignore,
+    }
 }
 
-fn apply_shape_matches(entry: &mut Shape, matches: &[ShapeMatch], ws: usize, we: usize) {
-    let mut i = matches.partition_point(|m| m.pos < ws);
-    while let Some(m) = matches.get(i) {
-        if m.pos >= we {
-            break;
-        }
-        match m.kind {
+fn apply_shape_window(entry: &mut Shape, bytes: &[u8]) {
+    for m in SHAPE_AC.find_iter(bytes) {
+        match shape_kind(m.pattern().as_usize()) {
             ShapeKind::Method(method) => entry.methods |= method,
             ShapeKind::Body => entry.has_body = true,
             ShapeKind::Headers => entry.has_headers = true,
@@ -405,11 +390,14 @@ fn apply_shape_matches(entry: &mut Shape, matches: &[ShapeMatch], ws: usize, we:
             ShapeKind::Auth => entry.auth = true,
             ShapeKind::Ignore => {}
         }
-        i += 1;
     }
 }
 
 pub fn scan_candidates(bytes: &[u8], candidates: &mut CandidateMap) {
+    if CANDIDATE_AC.find(bytes).is_none() {
+        return;
+    }
+
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {

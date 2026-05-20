@@ -139,6 +139,61 @@ pub fn write_chunk(url: &Url, chunk: &ChunkData) {
     write_json(&chunk_path_for(url), chunk);
 }
 
+pub fn read_bundle(url: &Url) -> Option<Vec<u8>> {
+    fs::read(bundle_path_for(url)).ok()
+}
+
+pub fn write_bundle(url: &Url, bytes: &[u8]) {
+    let path = bundle_path_for(url);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, bytes);
+}
+
+pub fn read_bundle_pack(seed: &[Url]) -> Option<Vec<(Url, Vec<u8>)>> {
+    let bytes = fs::read(bundle_pack_path_for(seed)?).ok()?;
+    parse_bundle_pack(&bytes)
+}
+
+pub fn write_bundle_pack(seed: &[Url], entries: &[(Url, Vec<u8>)]) {
+    let Some(path) = bundle_pack_path_for(seed) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(BUNDLE_PACK_MAGIC);
+    for (url, body) in entries {
+        let url = url.as_str().as_bytes();
+        out.extend_from_slice(&(url.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        out.extend_from_slice(url);
+        out.extend_from_slice(body);
+    }
+    let _ = fs::write(path, out);
+}
+
+pub fn read_page(url: &Url) -> Option<(Vec<u8>, Url)> {
+    let path = page_path_for(url);
+    let body = fs::read(&path).ok()?;
+    let final_url = fs::read_to_string(url_sidecar_path(&path))
+        .ok()
+        .and_then(|s| Url::parse(s.trim()).ok())
+        .unwrap_or_else(|| url.clone());
+    Some((body, final_url))
+}
+
+pub fn write_page(url: &Url, final_url: &Url, bytes: &[u8]) {
+    let path = page_path_for(url);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(&path, bytes);
+    let _ = fs::write(url_sidecar_path(&path), final_url.as_str());
+}
+
 fn chunk_path_for(url: &Url) -> PathBuf {
     let host = url.host_str().unwrap_or("unknown").replace('/', "_");
     let hash = hash_parts(std::iter::once(url.as_str()));
@@ -146,6 +201,72 @@ fn chunk_path_for(url: &Url) -> PathBuf {
         .join("chunks")
         .join(host)
         .join(format!("{hash:016x}.json"))
+}
+
+fn bundle_path_for(url: &Url) -> PathBuf {
+    let host = url.host_str().unwrap_or("unknown").replace('/', "_");
+    let hash = hash_parts(std::iter::once(url.as_str()));
+    dir()
+        .join("bundles")
+        .join(host)
+        .join(format!("{hash:016x}.bin"))
+}
+
+fn bundle_pack_path_for(seed: &[Url]) -> Option<PathBuf> {
+    let first = seed.first()?;
+    let host = first.host_str().unwrap_or("unknown").replace('/', "_");
+    let hash = fingerprint(seed);
+    Some(
+        dir()
+            .join("bundle-packs")
+            .join(host)
+            .join(format!("{hash}.bin")),
+    )
+}
+
+fn page_path_for(url: &Url) -> PathBuf {
+    let host = url.host_str().unwrap_or("unknown").replace('/', "_");
+    let hash = hash_parts(std::iter::once(url.as_str()));
+    dir()
+        .join("pages")
+        .join(host)
+        .join(format!("{hash:016x}.html"))
+}
+
+const BUNDLE_PACK_MAGIC: &[u8] = b"HIFI-BUNDLEPACK-1\n";
+
+fn parse_bundle_pack(bytes: &[u8]) -> Option<Vec<(Url, Vec<u8>)>> {
+    let mut pos = BUNDLE_PACK_MAGIC.len();
+    bytes.starts_with(BUNDLE_PACK_MAGIC).then_some(())?;
+    let mut entries = Vec::new();
+    while pos < bytes.len() {
+        let url_len = read_u32(bytes, &mut pos)? as usize;
+        let body_len = read_u64(bytes, &mut pos)? as usize;
+        let url_end = pos.checked_add(url_len)?;
+        let body_end = url_end.checked_add(body_len)?;
+        if body_end > bytes.len() {
+            return None;
+        }
+        let url = std::str::from_utf8(&bytes[pos..url_end]).ok()?;
+        let url = Url::parse(url).ok()?;
+        entries.push((url, bytes[url_end..body_end].to_vec()));
+        pos = body_end;
+    }
+    Some(entries)
+}
+
+fn read_u32(bytes: &[u8], pos: &mut usize) -> Option<u32> {
+    let end = pos.checked_add(4)?;
+    let value = u32::from_le_bytes(bytes.get(*pos..end)?.try_into().ok()?);
+    *pos = end;
+    Some(value)
+}
+
+fn read_u64(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+    let end = pos.checked_add(8)?;
+    let value = u64::from_le_bytes(bytes.get(*pos..end)?.try_into().ok()?);
+    *pos = end;
+    Some(value)
 }
 
 pub fn read(path: &Path, build_id: Option<&str>) -> Option<serde_json::Value> {
@@ -218,6 +339,12 @@ fn meta_path(path: &Path) -> PathBuf {
     meta.into()
 }
 
+fn url_sidecar_path(path: &Path) -> PathBuf {
+    let mut meta = path.as_os_str().to_os_string();
+    meta.push(".url");
+    meta.into()
+}
+
 fn dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".cache/hifi")
@@ -283,6 +410,74 @@ mod tests {
         );
         assert_eq!(cached.refs, refs);
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bundle_cache_round_trips_raw_bytes() {
+        let url = Url::parse(&format!(
+            "https://example.com/_next/static/chunks/test-{}.js",
+            TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+        .unwrap();
+        let path = bundle_path_for(&url);
+        let body = b"fetch('/api/raw-bundle')";
+        let _ = std::fs::remove_file(&path);
+
+        write_bundle(&url, body);
+
+        assert_eq!(read_bundle(&url).as_deref(), Some(body.as_slice()));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn page_cache_round_trips_body_and_final_url() {
+        let url = Url::parse(&format!(
+            "https://example.com/page-{}",
+            TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+        .unwrap();
+        let final_url = Url::parse("https://www.example.com/page").unwrap();
+        let path = page_path_for(&url);
+        let body = b"<script src=\"/_next/static/chunks/app.js\"></script>";
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(url_sidecar_path(&path));
+
+        write_page(&url, &final_url, body);
+        let (cached_body, cached_final_url) = read_page(&url).unwrap();
+
+        assert_eq!(cached_body, body);
+        assert_eq!(cached_final_url, final_url);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(url_sidecar_path(&path));
+    }
+
+    #[test]
+    fn bundle_pack_round_trips_entries() {
+        let a = Url::parse(&format!(
+            "https://example.com/_next/static/chunks/a-{}.js",
+            TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+        .unwrap();
+        let b = Url::parse("https://example.com/_next/static/chunks/b.js").unwrap();
+        let seed = vec![a.clone()];
+        let path = bundle_pack_path_for(&seed).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        write_bundle_pack(
+            &seed,
+            &[
+                (a.clone(), b"fetch('/api/a')".to_vec()),
+                (b.clone(), b"fetch('/api/b')".to_vec()),
+            ],
+        );
+        let entries = read_bundle_pack(&seed).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, a);
+        assert_eq!(entries[0].1, b"fetch('/api/a')");
+        assert_eq!(entries[1].0, b);
+        assert_eq!(entries[1].1, b"fetch('/api/b')");
         let _ = std::fs::remove_file(path);
     }
 

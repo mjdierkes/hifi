@@ -35,6 +35,12 @@ pub struct Output {
     pub cache_age_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_us: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<TimingStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<RunStats>,
 }
 
 impl Output {
@@ -46,9 +52,97 @@ impl Output {
         self.cache.clear();
         self.cache.push_str(cache);
         self.cache_age_secs = age_secs;
-        self.elapsed_ms = t0.map(|t| t.elapsed().as_millis());
+        let elapsed = t0.map(|t| t.elapsed());
+        self.elapsed_ms = elapsed.map(|e| e.as_millis());
+        self.elapsed_us = elapsed.map(|e| e.as_micros());
         self
     }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct TimingStats {
+    pub page_fetch_ms: u128,
+    pub page_fetch_us: u128,
+    pub html_scan_ms: u128,
+    pub html_scan_us: u128,
+    pub manifest_fetch_ms: u128,
+    pub manifest_fetch_us: u128,
+    pub manifest_scan_ms: u128,
+    pub manifest_scan_us: u128,
+    pub chunk_wall_ms: u128,
+    pub chunk_wall_us: u128,
+    pub chunk_fetch_ms: u128,
+    pub chunk_fetch_us: u128,
+    pub chunk_scan_ms: u128,
+    pub chunk_scan_us: u128,
+    pub chunk_ref_us: u128,
+    pub chunk_api_scan_us: u128,
+    pub chunk_candidate_scan_us: u128,
+    pub total_ms: u128,
+    pub total_us: u128,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct RunStats {
+    pub html_bytes: u64,
+    pub page_cache_hit: bool,
+    pub page_bytes_fetched: u64,
+    pub manifest_bytes: u64,
+    pub chunk_bytes_fetched: u64,
+    pub chunk_bytes_scanned: u64,
+    pub chunks_discovered: usize,
+    pub chunks_scanned: usize,
+    pub chunk_cache_hits: usize,
+    pub chunk_bundle_hits: usize,
+    pub chunk_bundle_pack_hits: usize,
+    pub chunk_memory_hits: usize,
+    pub manifest_scanned: usize,
+    pub manifest_errors: usize,
+    pub chunk_errors: usize,
+    pub scan_mib_per_sec: f64,
+    pub fetch_mib_per_sec: f64,
+}
+
+impl RunStats {
+    fn from_parts(
+        html_bytes: u64,
+        page_cache_hit: bool,
+        manifest: &ManifestStats,
+        chunks: &fetch::ChunkScanStats,
+        timings: &TimingStats,
+    ) -> Self {
+        let scanned_bytes = html_bytes + manifest.bytes + chunks.bytes_scanned;
+        let page_bytes_fetched = if page_cache_hit { 0 } else { html_bytes };
+        let fetched_bytes = page_bytes_fetched + manifest.bytes + chunks.bytes_fetched;
+        let scan_us = timings.html_scan_us + timings.manifest_scan_us + timings.chunk_scan_us;
+        let fetch_us = timings.page_fetch_us + timings.manifest_fetch_us + timings.chunk_wall_us;
+        Self {
+            html_bytes,
+            page_cache_hit,
+            page_bytes_fetched,
+            manifest_bytes: manifest.bytes,
+            chunk_bytes_fetched: chunks.bytes_fetched,
+            chunk_bytes_scanned: chunks.bytes_scanned,
+            chunks_discovered: chunks.discovered,
+            chunks_scanned: chunks.scanned,
+            chunk_cache_hits: chunks.cache_hits,
+            chunk_bundle_hits: chunks.bundle_hits,
+            chunk_bundle_pack_hits: chunks.bundle_pack_hits,
+            chunk_memory_hits: chunks.memory_hits,
+            manifest_scanned: manifest.scanned,
+            manifest_errors: manifest.errors,
+            chunk_errors: chunks.errors,
+            scan_mib_per_sec: mib_per_sec_from_us(scanned_bytes, scan_us),
+            fetch_mib_per_sec: mib_per_sec_from_us(fetched_bytes, fetch_us),
+        }
+    }
+}
+
+fn mib_per_sec_from_us(bytes: u64, us: u128) -> f64 {
+    if bytes == 0 || us == 0 {
+        return 0.0;
+    }
+    (bytes as f64 / 1_048_576.0) / (us as f64 / 1_000_000.0)
 }
 
 #[derive(Clone, Default)]
@@ -188,15 +282,37 @@ impl<'a> Processor<'a> {
         cached_as_json: bool,
         cache_ctx: CacheContext,
     ) -> Result<(Processed, bool)> {
-        let response = self.client.get(request_base.clone()).send().await?;
-        let final_base = response.url().clone();
-        remember_redirect(cache_ctx.redirects.as_ref(), original_base, &final_base);
-        let html = response.bytes().await?;
+        let (html, final_base, page_fetch_ms, page_fetch_us, page_cache_hit) =
+            if let Some((body, final_base)) = cache_path
+                .is_none()
+                .then(|| cache::read_page(request_base))
+                .flatten()
+            {
+                (bytes::Bytes::from(body), final_base, 0, 0, true)
+            } else {
+                let page_fetch_t0 = Instant::now();
+                let response = self.client.get(request_base.clone()).send().await?;
+                let final_base = response.url().clone();
+                remember_redirect(cache_ctx.redirects.as_ref(), original_base, &final_base);
+                let html = response.bytes().await?;
+                let page_fetch_elapsed = page_fetch_t0.elapsed();
+                cache::write_page(request_base, &final_base, &html);
+                (
+                    html,
+                    final_base,
+                    page_fetch_elapsed.as_millis(),
+                    page_fetch_elapsed.as_micros(),
+                    false,
+                )
+            };
+        let html_bytes = html.len() as u64;
+        let html_scan_t0 = Instant::now();
         let mut chunks = html::extract_chunks(&html, &final_base);
         let html_build_id = html::extract_build_id(&html);
         let build_id = html_build_id
             .clone()
             .or_else(|| Some(cache::fingerprint(&chunks)));
+        let html_parse_elapsed = html_scan_t0.elapsed();
 
         if let Some(path) = cache_path {
             if let (Some(bytes), Some(t0)) =
@@ -214,34 +330,83 @@ impl<'a> Processor<'a> {
             }
         }
 
-        let mut apis = ApiMap::default();
-        let mut candidates = CandidateMap::default();
-        scan::scan(&html, &mut apis);
-        scan::scan_candidates(&html, &mut candidates);
+        let html_scan_body = html.clone();
+        let html_scan_task = tokio::task::spawn_blocking(move || {
+            let mut apis = ApiMap::default();
+            let mut candidates = CandidateMap::default();
+            let html_scan_t0 = Instant::now();
+            scan::scan(&html_scan_body, &mut apis);
+            scan::scan_candidates(&html_scan_body, &mut candidates);
+            (apis, candidates, html_scan_t0.elapsed())
+        });
+        let mut manifest_apis = ApiMap::default();
+        let mut manifest_candidates = CandidateMap::default();
         let manifest_stats = scan_next_manifests(
             self.client,
             &final_base,
             html_build_id.as_deref(),
-            &mut apis,
-            &mut candidates,
+            &mut manifest_apis,
+            &mut manifest_candidates,
             &mut chunks,
         )
         .await;
+        let chunk_wall_t0 = Instant::now();
+        let mut apis = ApiMap::default();
+        let mut candidates = CandidateMap::default();
         let chunk_stats = fetch::scan_chunks(
             self.client.clone(),
             chunks.iter().cloned(),
             self.concurrency,
             cache_path.is_some(),
+            true,
             cache_ctx.chunks,
             &mut apis,
             &mut candidates,
         )
         .await;
+        let chunk_wall_elapsed = chunk_wall_t0.elapsed();
+        let (html_apis, html_candidates, html_scan_elapsed) = html_scan_task.await?;
+        scan::merge_into(&mut apis, html_apis);
+        scan::merge_candidates_into(&mut candidates, html_candidates);
+        scan::merge_into(&mut apis, manifest_apis);
+        scan::merge_candidates_into(&mut candidates, manifest_candidates);
+        let html_scan_ms = html_parse_elapsed.as_millis() + html_scan_elapsed.as_millis();
+        let html_scan_us = html_parse_elapsed.as_micros() + html_scan_elapsed.as_micros();
         for url in apis.keys() {
             candidates.remove(url);
         }
 
-        let _ = (manifest_stats, chunk_stats);
+        let total_elapsed = t0.map(|t| t.elapsed());
+        let total_ms = total_elapsed.map(|e| e.as_millis()).unwrap_or(0);
+        let total_us = total_elapsed.map(|e| e.as_micros()).unwrap_or(0);
+        let timings = TimingStats {
+            page_fetch_ms,
+            page_fetch_us,
+            html_scan_ms,
+            html_scan_us,
+            manifest_fetch_ms: manifest_stats.fetch_ms,
+            manifest_fetch_us: manifest_stats.fetch_us,
+            manifest_scan_ms: manifest_stats.scan_ms,
+            manifest_scan_us: manifest_stats.scan_us,
+            chunk_wall_ms: chunk_wall_elapsed.as_millis(),
+            chunk_wall_us: chunk_wall_elapsed.as_micros(),
+            chunk_fetch_ms: chunk_stats.fetch_ms,
+            chunk_fetch_us: chunk_stats.fetch_us,
+            chunk_scan_ms: chunk_stats.scan_ms,
+            chunk_scan_us: chunk_stats.scan_us,
+            chunk_ref_us: chunk_stats.ref_us,
+            chunk_api_scan_us: chunk_stats.api_scan_us,
+            chunk_candidate_scan_us: chunk_stats.candidate_scan_us,
+            total_ms,
+            total_us,
+        };
+        let stats = RunStats::from_parts(
+            html_bytes,
+            page_cache_hit,
+            &manifest_stats,
+            &chunk_stats,
+            &timings,
+        );
         Ok((
             Processed::Output(Output {
                 apis,
@@ -249,7 +414,10 @@ impl<'a> Processor<'a> {
                 build_id,
                 cache: "miss".into(),
                 cache_age_secs: None,
-                elapsed_ms: t0.map(|t| t.elapsed().as_millis()),
+                elapsed_ms: t0.map(|_| total_ms),
+                elapsed_us: t0.map(|_| total_us),
+                timings: Some(timings),
+                stats: Some(stats),
             }),
             false,
         ))
@@ -291,6 +459,11 @@ pub fn write_memory(memory: &MemoryCache, url: String, body: Body) {
 struct ManifestStats {
     scanned: usize,
     errors: usize,
+    bytes: u64,
+    fetch_ms: u128,
+    fetch_us: u128,
+    scan_ms: u128,
+    scan_us: u128,
 }
 
 async fn scan_next_manifests(
@@ -311,11 +484,18 @@ async fn scan_next_manifests(
             continue;
         };
         match fetch_manifest(client, manifest_url.clone()).await {
-            Some(body) => {
+            Some((body, fetch_elapsed)) => {
                 stats.scanned += 1;
+                stats.fetch_ms += fetch_elapsed.as_millis();
+                stats.fetch_us += fetch_elapsed.as_micros();
+                stats.bytes += body.len() as u64;
+                let scan_t0 = Instant::now();
                 scan::scan(&body, apis);
                 scan::scan_candidates(&body, candidates);
                 chunks.extend(html::extract_chunk_refs(&body, &manifest_url));
+                let scan_elapsed = scan_t0.elapsed();
+                stats.scan_ms += scan_elapsed.as_millis();
+                stats.scan_us += scan_elapsed.as_micros();
             }
             None => stats.errors += 1,
         }
@@ -323,8 +503,9 @@ async fn scan_next_manifests(
     stats
 }
 
-async fn fetch_manifest(client: &Client, url: Url) -> Option<bytes::Bytes> {
-    client
+async fn fetch_manifest(client: &Client, url: Url) -> Option<(bytes::Bytes, std::time::Duration)> {
+    let t0 = Instant::now();
+    let bytes = client
         .get(url)
         .send()
         .await
@@ -333,7 +514,8 @@ async fn fetch_manifest(client: &Client, url: Url) -> Option<bytes::Bytes> {
         .ok()?
         .bytes()
         .await
-        .ok()
+        .ok()?;
+    Some((bytes, t0.elapsed()))
 }
 
 fn redirected_base(redirects: Option<&RedirectMemory>, base: &Url) -> Option<Url> {
@@ -432,6 +614,9 @@ mod tests {
             cache: "miss".into(),
             cache_age_secs: Some(1),
             elapsed_ms: Some(1),
+            elapsed_us: Some(1000),
+            timings: Some(TimingStats::default()),
+            stats: Some(RunStats::default()),
         }
         .mark(None, "", None);
         let v = serde_json::to_value(&cached).unwrap();
@@ -439,6 +624,7 @@ mod tests {
         assert!(v.get("build_id").is_some());
         assert!(v.get("cache_age_secs").is_none());
         assert!(v.get("elapsed_ms").is_none());
+        assert!(v.get("elapsed_us").is_none());
     }
 
     #[test]
