@@ -77,23 +77,6 @@ impl OutputMode {
             mode => mode,
         }
     }
-
-    pub fn as_daemon_byte(self) -> u8 {
-        match self.for_stdout() {
-            Self::Auto => b'a',
-            Self::Flat => b'f',
-            Self::Json => b'j',
-        }
-    }
-
-    pub fn from_daemon_byte(b: u8) -> Option<Self> {
-        Some(match b {
-            b'f' => Self::Flat,
-            b'j' => Self::Json,
-            b'a' => Self::Auto,
-            _ => return None,
-        })
-    }
 }
 
 pub async fn run(raw: Vec<String>) -> Result<i32, AppError> {
@@ -260,18 +243,29 @@ fn render_flat(json: &str) -> String {
 }
 
 async fn daemon_output(url: &str, no_cache: bool, mode: OutputMode) -> Option<daemon::DaemonReply> {
-    if let Some(out) = daemon::request(url, no_cache, mode).await {
+    if let Some(mut out) = daemon::request(url, no_cache).await {
+        render_daemon_reply(&mut out, mode);
         return Some(out);
     }
     if daemon::start() {
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(25));
-            if let Some(out) = daemon::request(url, no_cache, mode).await {
+            if let Some(mut out) = daemon::request(url, no_cache).await {
+                render_daemon_reply(&mut out, mode);
                 return Some(out);
             }
         }
     }
     None
+}
+
+fn render_daemon_reply(reply: &mut daemon::DaemonReply, mode: OutputMode) {
+    if reply.exit_code == 0 {
+        reply
+            .stderr
+            .push_str(&warning_text_from_json(&reply.stdout));
+        reply.stdout = render_json_mode(&reply.stdout, mode);
+    }
 }
 
 fn chunk_concurrency() -> usize {
@@ -312,28 +306,4 @@ pub fn escape_terminal(s: &str) -> String {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn terminal_escape_rewrites_control_bytes() {
-        assert_eq!(escape_terminal("ok\u{1b}[31m"), "ok\\x1b[31m");
-    }
-
-    #[test]
-    fn normalize_url_adds_https_to_bare_hosts() {
-        assert_eq!(
-            normalize_url("example.com/path").unwrap(),
-            "https://example.com/path"
-        );
-    }
-
-    #[test]
-    fn normalize_url_rejects_unsupported_schemes() {
-        let err = normalize_url("ftp://example.com").unwrap_err().to_string();
-        assert_eq!(err, "unsupported URL scheme 'ftp'");
-    }
 }

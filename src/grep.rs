@@ -1,6 +1,6 @@
 use crate::app::{escape_terminal, normalize_url, AppError};
 use crate::runtime::net;
-use crate::scan::html;
+use crate::scan;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use url::Url;
@@ -43,7 +43,7 @@ pub async fn run(args: &[String], client: Client, concurrency: usize) -> Result<
     let response = net::get_limited(&client, base.clone(), net::allow_private_networks()).await?;
     let final_base = response.url().clone();
     let html = net::read_limited(response).await?;
-    let chunks = html::extract_chunks(&html, &final_base);
+    let chunks = scan::scan_document(&html, &final_base).refs;
 
     let result = grep_chunks(client, chunks.into_iter(), concurrency, &pattern, context).await;
     if result.failed > 0 {

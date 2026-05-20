@@ -94,13 +94,6 @@ pub async fn get_bytes_limited(
     read_limited(get_limited(client, url, allow_private).await?).await
 }
 
-pub async fn prewarm_connection(client: Client, url: Url, allow_private: bool) {
-    if validate_url(&url, allow_private).is_err() {
-        return;
-    }
-    let _ = client.head(url).send().await;
-}
-
 pub fn trace_response_version(label: &str, url: &Url, response: &Response) {
     if std::env::var_os("HIFI_TRACE_HTTP").is_some() {
         eprintln!(

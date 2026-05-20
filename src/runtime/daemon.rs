@@ -3,7 +3,6 @@ use super::processor::{
     memory_cache, read_memory, redirect_cache, spawn_refresh, write_memory, Body, CacheContext,
     MemoryCache, Processor, RedirectMemory, CACHE_FRESH_SECS, CACHE_STALE_SECS,
 };
-use crate::app::{render_json_mode, warning_text, warning_text_from_json, OutputMode};
 use reqwest::Client;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -88,35 +87,16 @@ pub fn start() -> bool {
         .is_some()
 }
 
-pub async fn request(url: &str, no_cache: bool, mode: OutputMode) -> Option<DaemonReply> {
+pub async fn request(url: &str, no_cache: bool) -> Option<DaemonReply> {
     let mut stream = UnixStream::connect(socket_path()).await.ok()?;
-    stream
-        .write_all(&[b'0' + no_cache as u8, mode.as_daemon_byte()])
-        .await
-        .ok()?;
+    stream.write_all(&[b'0' + no_cache as u8]).await.ok()?;
     stream.write_all(url.as_bytes()).await.ok()?;
     stream.shutdown().await.ok();
 
     let mut buf = Vec::with_capacity(4096);
     stream.read_to_end(&mut buf).await.ok()?;
     let body = String::from_utf8(buf).ok()?;
-    serde_json::from_str(&body).ok().or_else(|| {
-        if let Some(error) = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
-        {
-            return Some(DaemonReply {
-                exit_code: 2,
-                stdout: String::new(),
-                stderr: format!("hifi: {error}\n"),
-            });
-        }
-        Some(DaemonReply {
-            exit_code: 0,
-            stdout: body,
-            stderr: String::new(),
-        })
-    })
+    serde_json::from_str(&body).ok()
 }
 
 pub async fn serve(client: Client, concurrency: usize) -> Result {
@@ -201,12 +181,7 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
         .await;
     }
     let no_cache = req.first() == Some(&b'1');
-    let (mode, url_bytes) = req
-        .get(1)
-        .and_then(|b| OutputMode::from_daemon_byte(*b))
-        .map(|mode| (mode, req.get(2..).unwrap_or_default()))
-        .unwrap_or((OutputMode::Json, req.get(1..).unwrap_or_default()));
-    let url = std::str::from_utf8(url_bytes)?;
+    let url = std::str::from_utf8(req.get(1..).unwrap_or_default())?;
     if let Ok(parsed) = url::Url::parse(url) {
         if let Err(e) = super::net::validate_url(&parsed, super::net::allow_private_networks()) {
             return reply(
@@ -228,41 +203,27 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
                 if age >= CACHE_FRESH_SECS {
                     spawn_refresh(state.client.clone(), concurrency, url, state.cache());
                 }
-                let rendered = render_json_mode(body.as_ref(), mode);
-                let stderr = warning_text_from_json(body.as_ref());
                 return reply(
                     &mut stream,
                     DaemonReply {
                         exit_code: 0,
-                        stdout: rendered,
-                        stderr,
+                        stdout: body.to_string(),
+                        stderr: String::new(),
                     },
                 )
                 .await;
             }
         }
 
-        let Some(mut guard) = join_inflight(&state.inflight, url).await else {
-            return reply(
-                &mut stream,
-                DaemonReply {
-                    exit_code: 2,
-                    stdout: String::new(),
-                    stderr: "hifi: too many inflight requests\n".into(),
-                },
-            )
-            .await;
-        };
+        let mut guard = join_inflight(&state.inflight, url).await;
         if let Some(rx) = guard.waiter.take() {
             if let Ok(body) = rx.await {
-                let rendered = render_json_mode(body.as_ref(), mode);
-                let stderr = warning_text_from_json(body.as_ref());
                 return reply(
                     &mut stream,
                     DaemonReply {
                         exit_code: 0,
-                        stdout: rendered,
-                        stderr,
+                        stdout: body.to_string(),
+                        stderr: String::new(),
                     },
                 )
                 .await;
@@ -290,31 +251,28 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
             .await;
         }
     };
-    let stderr = warning_text(&out);
     let body = out.to_json_string()?;
     if !no_cache {
         let body: Body = Arc::from(body);
         write_memory(&state.memory, url.to_string(), body.clone());
         finish_inflight(&state.inflight, url, body.clone()).await;
         drop(inflight_guard);
-        let rendered = render_json_mode(body.as_ref(), mode);
         return reply(
             &mut stream,
             DaemonReply {
                 exit_code: 0,
-                stdout: rendered,
-                stderr,
+                stdout: body.to_string(),
+                stderr: String::new(),
             },
         )
         .await;
     }
-    let rendered = render_json_mode(&body, mode);
     reply(
         &mut stream,
         DaemonReply {
             exit_code: 0,
-            stdout: rendered,
-            stderr,
+            stdout: body,
+            stderr: String::new(),
         },
     )
     .await
@@ -345,25 +303,25 @@ impl Drop for InflightGuard {
     }
 }
 
-async fn join_inflight(inflight: &Inflight, url: &str) -> Option<InflightGuard> {
+async fn join_inflight(inflight: &Inflight, url: &str) -> InflightGuard {
     let mut in_flight = inflight.lock().await;
     if let Some(waiters) = in_flight.get_mut(url) {
         let (tx, rx) = oneshot::channel();
         waiters.push(tx);
-        Some(InflightGuard {
+        InflightGuard {
             inflight: inflight.clone(),
             url: url.to_string(),
             waiter: Some(rx),
             owner: false,
-        })
+        }
     } else {
         in_flight.insert(url.to_string(), Vec::new());
-        Some(InflightGuard {
+        InflightGuard {
             inflight: inflight.clone(),
             url: url.to_string(),
             waiter: None,
             owner: true,
-        })
+        }
     }
 }
 

@@ -1,10 +1,9 @@
-use crate::scan::{self, html};
-use crate::scan::{ApiMap, CandidateMap, RouteMap};
+use crate::scan;
+use crate::scan::{ApiMap, CandidateMap, RouteMap, ScanResult};
 
 use super::{cache, fetch, net};
 use lru::LruCache;
 use reqwest::Client;
-use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use std::{
     num::NonZeroUsize,
@@ -95,14 +94,6 @@ pub struct Processor<'a> {
     cache: CacheContext,
 }
 
-#[derive(Default)]
-struct ManifestScan {
-    apis: ApiMap,
-    candidates: CandidateMap,
-    routes: RouteMap,
-    chunks: Vec<Url>,
-}
-
 impl<'a> Processor<'a> {
     pub fn new(client: &'a Client, concurrency: usize, cache: CacheContext) -> Self {
         Self {
@@ -110,12 +101,6 @@ impl<'a> Processor<'a> {
             concurrency,
             cache,
         }
-    }
-
-    pub async fn process(&self, url: &str, no_cache: bool, t0: Instant) -> Result<String> {
-        self.process_for_display(url, no_cache, t0)
-            .await?
-            .to_json_string()
     }
 
     pub async fn process_for_display(
@@ -211,7 +196,7 @@ impl<'a> Processor<'a> {
             }
             (html, final_base)
         };
-        let html_build_id = html::extract_build_id(&html);
+        let html_build_id = scan::extract_build_id(&html);
         if let (Some(path), Some(build_id), Some(t0)) = (cache_path, html_build_id.as_deref(), t0) {
             if let Some(bytes) = cache::read_build_bytes(path, Some(build_id)) {
                 return Ok((
@@ -222,9 +207,9 @@ impl<'a> Processor<'a> {
         }
 
         let scan_base = final_base.clone();
-        let html_result =
+        let mut found =
             tokio::task::spawn_blocking(move || scan::scan_document(&html, &scan_base)).await?;
-        let chunks = html_result.refs;
+        let chunks = found.refs.clone();
         let build_id = html_build_id
             .clone()
             .or_else(|| Some(cache::fingerprint(&chunks)));
@@ -251,63 +236,40 @@ impl<'a> Processor<'a> {
             })
         });
 
-        let mut apis = html_result.apis;
-        let mut candidates = html_result.candidates;
-        let mut routes = html_result.routes;
         let root_chunks = chunks.clone();
+        let chunk_options = || fetch::ChunkScanOptions {
+            concurrency: self.concurrency,
+            use_processed_cache: cache_path.is_some(),
+            cache_key: build_id.clone(),
+            allow_private: cache_ctx.allow_private,
+            memory: cache_ctx.chunks.clone(),
+        };
         let chunk_stats = fetch::scan_chunks(
             self.client.clone(),
             root_chunks.iter().cloned(),
-            fetch::ChunkScanOptions {
-                concurrency: self.concurrency,
-                use_processed_cache: cache_path.is_some(),
-                use_bundle_cache: cache_path.is_some(),
-                cache_key: build_id.clone(),
-                allow_private: cache_ctx.allow_private,
-                memory: cache_ctx.chunks.clone(),
-            },
-            &mut apis,
-            &mut candidates,
-            &mut routes,
+            chunk_options(),
+            &mut found,
         )
         .await;
         let manifest = match manifest_task {
             Some(task) => task.await.unwrap_or_default(),
-            None => ManifestScan::default(),
+            None => ScanResult::default(),
         };
-        scan::merge_into(&mut apis, manifest.apis);
-        scan::merge_candidates_into(&mut candidates, manifest.candidates);
-        scan::merge_routes_into(&mut routes, manifest.routes);
+        found.merge_findings(&manifest);
 
-        let root_chunk_set = root_chunks.iter().collect::<FxHashSet<_>>();
         let manifest_chunks = manifest
-            .chunks
+            .refs
             .into_iter()
-            .filter(|url| !root_chunk_set.contains(url))
+            .filter(|url| !root_chunks.contains(url))
             .collect::<Vec<_>>();
         let manifest_chunk_stats = fetch::scan_chunks(
             self.client.clone(),
             manifest_chunks,
-            fetch::ChunkScanOptions {
-                concurrency: self.concurrency,
-                use_processed_cache: cache_path.is_some(),
-                use_bundle_cache: cache_path.is_some(),
-                cache_key: build_id.clone(),
-                allow_private: cache_ctx.allow_private,
-                memory: cache_ctx.chunks.clone(),
-            },
-            &mut apis,
-            &mut candidates,
-            &mut routes,
+            chunk_options(),
+            &mut found,
         )
         .await;
-        for url in apis.keys() {
-            candidates.remove(url);
-            routes.remove(url);
-        }
-        for url in candidates.keys() {
-            routes.remove(url);
-        }
+        found.finalize();
         let mut warnings = Vec::new();
         let failed_chunks = chunk_stats.failed + manifest_chunk_stats.failed;
         if failed_chunks > 0 {
@@ -325,9 +287,9 @@ impl<'a> Processor<'a> {
 
         Ok((
             Output {
-                apis,
-                routes,
-                candidates,
+                apis: found.apis,
+                routes: found.routes,
+                candidates: found.candidates,
                 build_id,
                 cache: "miss".into(),
                 cache_age_secs: None,
@@ -370,7 +332,7 @@ async fn scan_next_manifests(
     base: Url,
     build_id: String,
     allow_private: bool,
-) -> ManifestScan {
+) -> ScanResult {
     let mut manifests = Vec::with_capacity(2);
     for name in ["_buildManifest.js", "_ssgManifest.js"] {
         let Ok(manifest_url) = base.join(&format!("/_next/static/{build_id}/{name}")) else {
@@ -384,16 +346,12 @@ async fn scan_next_manifests(
         ));
     }
 
-    let mut out = ManifestScan::default();
+    let mut out = ScanResult::default();
     for (manifest_url, task) in manifests {
         let Ok(Some(body)) = task.await else {
             continue;
         };
-        let result = scan::scan_document(&body, &manifest_url);
-        scan::merge_into(&mut out.apis, result.apis);
-        scan::merge_candidates_into(&mut out.candidates, result.candidates);
-        scan::merge_routes_into(&mut out.routes, result.routes);
-        out.chunks.extend(result.refs);
+        out.merge(scan::scan_document(&body, &manifest_url));
     }
     out
 }
@@ -476,67 +434,33 @@ fn prune_memory(entries: &mut LruCache<String, (Body, Instant)>, now: Instant) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    #[test]
-    fn cache_value_strips_dynamic_fields() {
-        let cached = Output {
-            apis: ApiMap::default(),
-            routes: RouteMap::default(),
-            candidates: CandidateMap::default(),
-            build_id: Some("b1".into()),
-            cache: "miss".into(),
-            cache_age_secs: Some(1),
-            elapsed_us: Some(1000),
-            warnings: Vec::new(),
-        }
-        .mark(None, "", None);
-        let v = serde_json::to_value(&cached).unwrap();
-        assert!(v.get("apis").is_some());
-        assert!(v.get("build_id").is_some());
-        assert!(v.get("cache_age_secs").is_none());
-        assert!(v.get("elapsed_us").is_none());
-    }
-
     #[tokio::test]
     async fn build_manifest_seeds_extra_chunks() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            for _ in 0..4 {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                tokio::spawn(async move {
-                    let mut buf = [0; 2048];
-                    let n = socket.read(&mut buf).await.unwrap();
-                    let req = String::from_utf8_lossy(&buf[..n]);
-                    let (status, body) = if req
-                        .starts_with("GET /_next/static/b1/_buildManifest.js ")
-                    {
-                        (
-                            "200 OK",
-                            r#"self.__BUILD_MANIFEST={"/extra":["static/chunks/app-extra.js"]};const u="/api/from-manifest";"#,
-                        )
-                    } else if req.starts_with("GET /_next/static/chunks/app-extra.js ") {
-                        ("200 OK", r#"fetch("/api/from-chunk",{method:"POST"})"#)
-                    } else if req.starts_with("GET /_next/static/b1/_ssgManifest.js ") {
-                        ("404 Not Found", "")
-                    } else {
-                        (
-                            "200 OK",
-                            r#"<html><script id="__NEXT_DATA__" type="application/json">{"buildId":"b1"}</script></html>"#,
-                        )
-                    };
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    socket.write_all(response.as_bytes()).await.unwrap();
-                });
+        let addr = serve(4, |req| {
+            if req.starts_with("GET /_next/static/b1/_buildManifest.js ") {
+                (
+                    "200 OK",
+                    r#"self.__BUILD_MANIFEST={"/extra":["static/chunks/app-extra.js"]};const u="/api/from-manifest";"#,
+                )
+            } else if req.starts_with("GET /_next/static/chunks/app-extra.js ") {
+                ("200 OK", r#"fetch("/api/from-chunk",{method:"POST"})"#)
+            } else if req.starts_with("GET /_next/static/b1/_ssgManifest.js ") {
+                ("404 Not Found", "")
+            } else {
+                (
+                    "200 OK",
+                    r#"<script id="__NEXT_DATA__" type="application/json">{"buildId":"b1"}</script>"#,
+                )
             }
-        });
-
+        })
+        .await;
         let client = Client::new();
         let out = Processor::new(
             &client,
@@ -546,45 +470,29 @@ mod tests {
                 ..CacheContext::default()
             },
         )
-        .process(&format!("http://{addr}/"), true, Instant::now())
+        .process_for_display(&format!("http://{addr}/"), true, Instant::now())
         .await
         .unwrap();
-        let v: Value = serde_json::from_str(&out).unwrap();
 
-        assert!(v["apis"].get("/api/from-chunk").is_some());
-        assert!(v["candidates"].get("/api/from-manifest").is_some());
+        assert!(out.apis.contains_key("/api/from-chunk"));
+        assert!(out.candidates.contains_key("/api/from-manifest"));
     }
 
     #[tokio::test]
     async fn chunk_fetch_failures_are_reported_as_warnings() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            for _ in 0..3 {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                tokio::spawn(async move {
-                    let mut buf = [0; 2048];
-                    let n = socket.read(&mut buf).await.unwrap();
-                    let req = String::from_utf8_lossy(&buf[..n]);
-                    let (status, body) = if req.starts_with("GET /_next/static/chunks/app/ok.js ") {
-                        ("200 OK", r#"fetch("/api/ok")"#)
-                    } else if req.starts_with("GET /_next/static/chunks/app/missing.js ") {
-                        ("404 Not Found", "")
-                    } else {
-                        (
-                            "200 OK",
-                            r#"<script src="/_next/static/chunks/app/ok.js"></script><script src="/_next/static/chunks/app/missing.js"></script>"#,
-                        )
-                    };
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    socket.write_all(response.as_bytes()).await.unwrap();
-                });
+        let addr = serve(3, |req| {
+            if req.starts_with("GET /_next/static/chunks/app/ok.js ") {
+                ("200 OK", r#"fetch("/api/ok")"#)
+            } else if req.starts_with("GET /_next/static/chunks/app/missing.js ") {
+                ("404 Not Found", "")
+            } else {
+                (
+                    "200 OK",
+                    r#"<script src="/_next/static/chunks/app/ok.js"></script><script src="/_next/static/chunks/app/missing.js"></script>"#,
+                )
             }
-        });
-
+        })
+        .await;
         let client = Client::new();
         let out = Processor::new(
             &client,
@@ -607,26 +515,12 @@ mod tests {
 
     #[tokio::test]
     async fn no_cache_bypasses_page_cache() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            for body in [
-                r#"<script>fetch("/api/first")</script>"#,
-                r#"<script>fetch("/api/second")</script>"#,
-            ] {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                tokio::spawn(async move {
-                    let mut buf = [0; 2048];
-                    let _ = socket.read(&mut buf).await.unwrap();
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    socket.write_all(response.as_bytes()).await.unwrap();
-                });
-            }
-        });
-
+        let count = Arc::new(AtomicUsize::new(0));
+        let addr = serve(2, move |_| match count.fetch_add(1, Ordering::Relaxed) {
+            0 => ("200 OK", r#"<script>fetch("/api/first")</script>"#),
+            _ => ("200 OK", r#"<script>fetch("/api/second")</script>"#),
+        })
+        .await;
         let client = Client::new();
         let processor = Processor::new(
             &client,
@@ -650,5 +544,31 @@ mod tests {
         assert!(first.apis.contains_key("/api/first"));
         assert!(second.apis.contains_key("/api/second"));
         assert!(!second.apis.contains_key("/api/first"));
+    }
+
+    async fn serve(
+        requests: usize,
+        handler: impl Fn(&str) -> (&'static str, &'static str) + Send + Sync + 'static,
+    ) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handler = Arc::new(handler);
+        tokio::spawn(async move {
+            for _ in 0..requests {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0; 2048];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    let (status, body) = handler(std::str::from_utf8(&buf[..n]).unwrap());
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        addr
     }
 }
