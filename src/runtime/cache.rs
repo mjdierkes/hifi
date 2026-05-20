@@ -1,4 +1,4 @@
-use crate::scan::{ApiMap, CandidateMap};
+use crate::scan::{ApiMap, CandidateMap, RouteMap};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -34,6 +34,9 @@ pub fn path_for(base: &Url) -> PathBuf {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ChunkData {
     pub apis: ApiMap,
+    #[serde(default, skip_serializing_if = "RouteMap::is_empty")]
+    pub routes: RouteMap,
+    #[serde(default, skip_serializing_if = "CandidateMap::is_empty")]
     pub candidates: CandidateMap,
     pub refs: Vec<Url>,
 }
@@ -369,6 +372,7 @@ mod tests {
             &url,
             &ChunkData {
                 apis: apis.clone(),
+                routes: RouteMap::default(),
                 candidates: CandidateMap::default(),
                 refs: refs.clone(),
             },
@@ -401,6 +405,7 @@ mod tests {
             &url,
             &ChunkData {
                 apis: v1,
+                routes: RouteMap::default(),
                 candidates: CandidateMap::default(),
                 refs: Vec::new(),
             },
@@ -410,6 +415,7 @@ mod tests {
             &url,
             &ChunkData {
                 apis: v2,
+                routes: RouteMap::default(),
                 candidates: CandidateMap::default(),
                 refs: Vec::new(),
             },

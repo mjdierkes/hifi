@@ -1,4 +1,4 @@
-use crate::scan::{self, ApiMap, CandidateMap};
+use crate::scan::{self, ApiMap, CandidateMap, RouteMap};
 
 use super::cache::{self, ChunkData};
 use super::net;
@@ -71,6 +71,7 @@ pub async fn scan_chunks(
     opts: ChunkScanOptions,
     apis: &mut ApiMap,
     candidates: &mut CandidateMap,
+    routes: &mut RouteMap,
 ) -> ChunkScanStats {
     let mut stats = ChunkScanStats::default();
     let mut visited: FxHashSet<Arc<Url>> = FxHashSet::default();
@@ -126,6 +127,7 @@ pub async fn scan_chunks(
                         let chunk = result.chunk;
                         scan::merge_refs_into(apis, chunk.apis.iter());
                         scan::merge_candidate_refs_into(candidates, chunk.candidates.iter());
+                        scan::merge_route_refs_into(routes, chunk.routes.iter());
                         enqueue_refs(&chunk.refs, &mut visited, &mut queue, &mut stats);
                     }
                     Err(()) => stats.failed += 1,
@@ -166,6 +168,7 @@ pub async fn scan_chunks(
                 let chunk = result.chunk;
                 scan::merge_refs_into(apis, chunk.apis.iter());
                 scan::merge_candidate_refs_into(candidates, chunk.candidates.iter());
+                scan::merge_route_refs_into(routes, chunk.routes.iter());
                 enqueue_refs(&chunk.refs, &mut visited, &mut queue, &mut stats);
             }
             Err(()) => stats.failed += 1,
@@ -295,6 +298,7 @@ async fn scan_body(
         .map_err(|_| ())?;
     let chunk = Arc::new(ChunkData {
         apis: result.apis,
+        routes: result.routes,
         candidates: result.candidates,
         refs: result.refs,
     });
@@ -422,6 +426,7 @@ async fn read_scan_limited(
     Ok(ScannedBody {
         data: ChunkData {
             apis: result.apis,
+            routes: result.routes,
             candidates: result.candidates,
             refs: result.refs,
         },
@@ -494,6 +499,7 @@ mod tests {
             },
             &mut first,
             &mut CandidateMap::default(),
+            &mut RouteMap::default(),
         )
         .await;
         assert_eq!(first_stats.discovered, 2);
@@ -514,6 +520,7 @@ mod tests {
             },
             &mut second,
             &mut CandidateMap::default(),
+            &mut RouteMap::default(),
         )
         .await;
         assert_eq!(second_stats.discovered, 2);
@@ -572,6 +579,7 @@ mod tests {
             },
             &mut apis,
             &mut CandidateMap::default(),
+            &mut RouteMap::default(),
         )
         .await;
 

@@ -1,5 +1,5 @@
 use crate::scan::{self, html};
-use crate::scan::{ApiMap, CandidateMap};
+use crate::scan::{ApiMap, CandidateMap, RouteMap};
 
 use super::{cache, fetch, net};
 use lru::LruCache;
@@ -39,6 +39,8 @@ pub enum RuntimeError {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Output {
     pub apis: ApiMap,
+    #[serde(default, skip_serializing_if = "RouteMap::is_empty")]
+    pub routes: RouteMap,
     #[serde(default, skip_serializing_if = "CandidateMap::is_empty")]
     pub candidates: CandidateMap,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,6 +99,7 @@ pub struct Processor<'a> {
 struct ManifestScan {
     apis: ApiMap,
     candidates: CandidateMap,
+    routes: RouteMap,
     chunks: Vec<Url>,
 }
 
@@ -250,6 +253,7 @@ impl<'a> Processor<'a> {
 
         let mut apis = html_result.apis;
         let mut candidates = html_result.candidates;
+        let mut routes = html_result.routes;
         let root_chunks = chunks.clone();
         let chunk_stats = fetch::scan_chunks(
             self.client.clone(),
@@ -264,6 +268,7 @@ impl<'a> Processor<'a> {
             },
             &mut apis,
             &mut candidates,
+            &mut routes,
         )
         .await;
         let manifest = match manifest_task {
@@ -272,6 +277,7 @@ impl<'a> Processor<'a> {
         };
         scan::merge_into(&mut apis, manifest.apis);
         scan::merge_candidates_into(&mut candidates, manifest.candidates);
+        scan::merge_routes_into(&mut routes, manifest.routes);
 
         let root_chunk_set = root_chunks.iter().collect::<FxHashSet<_>>();
         let manifest_chunks = manifest
@@ -292,10 +298,15 @@ impl<'a> Processor<'a> {
             },
             &mut apis,
             &mut candidates,
+            &mut routes,
         )
         .await;
         for url in apis.keys() {
             candidates.remove(url);
+            routes.remove(url);
+        }
+        for url in candidates.keys() {
+            routes.remove(url);
         }
         let mut warnings = Vec::new();
         let failed_chunks = chunk_stats.failed + manifest_chunk_stats.failed;
@@ -315,6 +326,7 @@ impl<'a> Processor<'a> {
         Ok((
             Output {
                 apis,
+                routes,
                 candidates,
                 build_id,
                 cache: "miss".into(),
@@ -380,6 +392,7 @@ async fn scan_next_manifests(
         let result = scan::scan_document(&body, &manifest_url);
         scan::merge_into(&mut out.apis, result.apis);
         scan::merge_candidates_into(&mut out.candidates, result.candidates);
+        scan::merge_routes_into(&mut out.routes, result.routes);
         out.chunks.extend(result.refs);
     }
     out
@@ -471,6 +484,7 @@ mod tests {
     fn cache_value_strips_dynamic_fields() {
         let cached = Output {
             apis: ApiMap::default(),
+            routes: RouteMap::default(),
             candidates: CandidateMap::default(),
             build_id: Some("b1".into()),
             cache: "miss".into(),

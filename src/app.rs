@@ -240,6 +240,11 @@ fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
     for k in keys {
         writeln!(out, "?\t{}\t", escape_terminal(k))?;
     }
+    let mut keys: Vec<&String> = v.routes.keys().collect();
+    keys.sort_unstable();
+    for k in keys {
+        writeln!(out, "route\t{}\t", escape_terminal(k))?;
+    }
     Ok(())
 }
 

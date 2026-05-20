@@ -17,6 +17,37 @@ fn finds_fetch_url_and_shape() {
 }
 
 #[test]
+fn finds_spaced_lowercase_methods_and_query_params() {
+    let apis = scanned(
+        br#"fetch("/api/users?team=red&page=1", { method: "post", body: new URLSearchParams() })"#,
+    );
+
+    let shape = &apis["/api/users?team=red&page=1"];
+    assert_eq!(shape.methods_csv(), "POST");
+    assert_eq!(shape.flags_csv(), "body,urlencoded,query");
+}
+
+#[test]
+fn finds_endpoint_and_object_config_urls() {
+    let apis = scanned(
+        br#"axios({ url: "/api/object", method: "PUT" }); client({endpoint:'/api/endpoint',method:'DELETE'});"#,
+    );
+
+    assert_eq!(apis["/api/object"].methods_csv(), "PUT");
+    assert_eq!(apis["/api/endpoint"].methods_csv(), "DELETE");
+}
+
+#[test]
+fn finds_head_and_options_methods() {
+    let apis = scanned(
+        br#"fetch("/api/ping", { method: "HEAD" }); fetch("/api/cors", { method: "OPTIONS" });"#,
+    );
+
+    assert_eq!(apis["/api/ping"].methods_csv(), "HEAD");
+    assert_eq!(apis["/api/cors"].methods_csv(), "OPTIONS");
+}
+
+#[test]
 fn finds_useswr_calls() {
     let apis = scanned(br#"useSWR("/api/profile", fetcher)"#);
     assert!(apis.contains_key("/api/profile"));
@@ -89,6 +120,8 @@ fn fused_scan_collects_apis_candidates_and_chunk_refs() {
         br#"
             fetch("/api/users", {method:"POST", headers:{"Content-Type":"application/json"}});
             const route=`/api/team/${id}`;
+            router.push("/dashboard");
+            const href="/team/${slug}";
             self.__next_f.push([1,/_next/data/b1/raw.json]);
             e.u=function(e){return"static/chunks/app/dashboard-deadbeef.js"};
         "#,
@@ -99,10 +132,32 @@ fn fused_scan_collects_apis_candidates_and_chunk_refs() {
     assert_eq!(result.apis["/api/users"].flags_csv(), "headers,json");
     assert!(result.candidates.contains_key("/api/team/{dynamic}"));
     assert!(result.candidates.contains_key("/_next/data/b1/raw.json"));
+    assert!(result.routes.contains_key("/dashboard"));
+    assert!(result.routes.contains_key("/team/{dynamic}"));
     assert!(result
         .refs
         .iter()
         .any(|url| url.as_str().ends_with("app/dashboard-deadbeef.js")));
+}
+
+#[test]
+fn finds_client_routes_without_mixing_api_candidates() {
+    let base = Url::parse("https://example.com/_next/static/chunks/app/main.js").unwrap();
+    let result = scan_document(
+        br#"
+            const a={href:"/pricing",pathname:'/blog/${slug}'};
+            router.replace(`/settings/${tab}`);
+            const api="/api/users";
+            const asset="/images/logo.png";
+        "#,
+        &base,
+    );
+
+    assert!(result.routes.contains_key("/pricing"));
+    assert!(result.routes.contains_key("/blog/{dynamic}"));
+    assert!(result.routes.contains_key("/settings/{dynamic}"));
+    assert!(!result.routes.contains_key("/api/users"));
+    assert!(!result.routes.contains_key("/images/logo.png"));
 }
 
 #[test]
@@ -164,6 +219,7 @@ fn comparable(result: ScanResult) -> Value {
     serde_json::json!({
         "apis": result.apis,
         "candidates": result.candidates,
+        "routes": result.routes,
         "refs": refs,
     })
 }
