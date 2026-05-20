@@ -5,6 +5,7 @@ use url::Url;
 
 pub fn extract_chunks(html: &[u8], base: &Url) -> Vec<Url> {
     let mut out = Vec::new();
+    let mut seen_src = FxHashSet::default();
     let mut seen = FxHashSet::default();
     let mut offset = 0;
     while let Some(rel) = memmem::find(&html[offset..], b"/_next/") {
@@ -16,6 +17,10 @@ pub fn extract_chunks(html: &[u8], base: &Url) -> Vec<Url> {
             .unwrap_or(html.len());
         let src = &html[start..end];
         if memmem::find(src, b".js").is_some() && !is_skipped_chunk(src) {
+            if !seen_src.insert(src.to_vec()) {
+                offset = end;
+                continue;
+            }
             if let Ok(src) = std::str::from_utf8(src) {
                 let Ok(u) = base.join(src) else {
                     offset = end;

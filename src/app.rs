@@ -18,15 +18,19 @@ use url::Url;
 const MAX_CHUNK_CONCURRENCY: usize = 32;
 const CACHE_FRESH_SECS: u64 = 300;
 const CACHE_STALE_SECS: u64 = 3600;
+const MEMORY_CACHE_MAX_ENTRIES: usize = 256;
 
 type Body = Arc<str>;
 type MemoryCache = Arc<RwLock<FxHashMap<String, (Body, Instant)>>>;
+type RedirectMemory = Arc<RwLock<FxHashMap<String, Url>>>;
 type Inflight = Arc<Mutex<FxHashMap<String, Vec<oneshot::Sender<Body>>>>>;
 
 #[derive(Clone)]
 struct DaemonState {
     client: Client,
     memory: MemoryCache,
+    chunks: fetch::ChunkMemoryCache,
+    redirects: RedirectMemory,
     inflight: Inflight,
 }
 
@@ -35,6 +39,8 @@ impl DaemonState {
         Self {
             client,
             memory: Arc::new(RwLock::new(FxHashMap::default())),
+            chunks: Arc::new(RwLock::new(FxHashMap::default())),
+            redirects: Arc::new(RwLock::new(FxHashMap::default())),
             inflight: Arc::new(Mutex::new(FxHashMap::default())),
         }
     }
@@ -77,7 +83,7 @@ pub async fn run(raw: Vec<String>) -> Result<(), Box<dyn Error>> {
     let t0 = Instant::now();
     let concurrency = chunk_concurrency();
     let client = make_client(concurrency)?;
-    let out = process(&client, &url, no_cache, t0, concurrency, None).await?;
+    let out = process(&client, &url, no_cache, t0, concurrency, None, None, None).await?;
     println!("{}", serde_json::to_string(&out)?);
     Ok(())
 }
@@ -167,7 +173,14 @@ async fn handle_conn(
         if let Some((body, age)) = read_memory(&state.memory, url) {
             if age < CACHE_STALE_SECS {
                 if age >= CACHE_FRESH_SECS {
-                    spawn_refresh(&state.client, url, concurrency, Some(state.memory.clone()));
+                    spawn_refresh(
+                        &state.client,
+                        url,
+                        concurrency,
+                        Some(state.memory.clone()),
+                        Some(state.chunks.clone()),
+                        Some(state.redirects.clone()),
+                    );
                 }
                 return reply(&mut stream, body.as_ref()).await;
             }
@@ -187,6 +200,8 @@ async fn handle_conn(
         t0,
         concurrency,
         Some(state.memory.clone()),
+        Some(state.chunks.clone()),
+        Some(state.redirects.clone()),
     )
     .await
     {
@@ -233,9 +248,16 @@ async fn process(
     t0: Instant,
     concurrency: usize,
     memory: Option<MemoryCache>,
+    chunks_memory: Option<fetch::ChunkMemoryCache>,
+    redirects: Option<RedirectMemory>,
 ) -> Result<Value, Box<dyn Error>> {
     let base = Url::parse(url)?;
     let cache_path = cache::path_for(&base);
+    let request_base = if no_cache {
+        base.clone()
+    } else {
+        redirected_base(redirects.as_ref(), &base).unwrap_or_else(|| base.clone())
+    };
 
     if !no_cache {
         if let Some((v, age)) = cache::read_any(&cache_path) {
@@ -243,7 +265,14 @@ async fn process(
                 let status = if age < CACHE_FRESH_SECS {
                     "fresh"
                 } else {
-                    spawn_refresh(client, url, concurrency, memory.clone());
+                    spawn_refresh(
+                        client,
+                        url,
+                        concurrency,
+                        memory.clone(),
+                        chunks_memory.clone(),
+                        redirects.clone(),
+                    );
                     "stale"
                 };
                 return Ok(annotate(v, t0, status, age));
@@ -255,9 +284,12 @@ async fn process(
         client,
         url,
         &base,
+        &request_base,
         (!no_cache).then_some(cache_path.as_path()),
         Some(t0),
         concurrency,
+        chunks_memory,
+        (!no_cache).then_some(redirects).flatten(),
     )
     .await?;
 
@@ -276,17 +308,87 @@ fn read_memory(memory: &MemoryCache, url: &str) -> Option<(Body, u64)> {
         .map(|(body, t)| (body, t.elapsed().as_secs()))
 }
 
-fn spawn_refresh(client: &Client, url: &str, concurrency: usize, memory: Option<MemoryCache>) {
+fn redirected_base(redirects: Option<&RedirectMemory>, base: &Url) -> Option<Url> {
+    let target = redirects?.read().ok()?.get(&origin_key(base)?).cloned()?;
+    let mut out = target;
+    out.set_path(base.path());
+    out.set_query(base.query());
+    out.set_fragment(base.fragment());
+    Some(out)
+}
+
+fn remember_redirect(redirects: Option<&RedirectMemory>, from: &Url, to: &Url) {
+    let (Some(from_key), Some(to_key)) = (origin_key(from), origin_key(to)) else {
+        return;
+    };
+    if from_key == to_key {
+        return;
+    }
+    let Some(to_origin) = origin_url(to) else {
+        return;
+    };
+    if let Some(redirects) = redirects {
+        if let Ok(mut entries) = redirects.write() {
+            entries.insert(from_key, to_origin);
+        }
+    }
+}
+
+fn origin_key(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    match url.port() {
+        Some(port) => Some(format!("{}://{}:{}", url.scheme(), host, port)),
+        None => Some(format!("{}://{}", url.scheme(), host)),
+    }
+}
+
+fn origin_url(url: &Url) -> Option<Url> {
+    Url::parse(&format!("{}/", origin_key(url)?)).ok()
+}
+
+fn spawn_refresh(
+    client: &Client,
+    url: &str,
+    concurrency: usize,
+    memory: Option<MemoryCache>,
+    chunks_memory: Option<fetch::ChunkMemoryCache>,
+    redirects: Option<RedirectMemory>,
+) {
     let client = client.clone();
     let url = url.to_string();
     tokio::spawn(async move {
-        let _ = refresh(&client, &url, concurrency, memory).await;
+        let _ = refresh(&client, &url, concurrency, memory, chunks_memory, redirects).await;
     });
 }
 
 fn write_memory(memory: &MemoryCache, url: String, body: Body) {
     if let Ok(mut entries) = memory.write() {
-        entries.insert(url, (body, Instant::now()));
+        let now = Instant::now();
+        entries.insert(url, (body, now));
+        prune_memory(&mut entries, now);
+    }
+}
+
+fn prune_memory(entries: &mut FxHashMap<String, (Body, Instant)>, now: Instant) {
+    entries.retain(|_, (_, written)| {
+        now.saturating_duration_since(*written).as_secs() < CACHE_STALE_SECS
+    });
+
+    if entries.len() <= MEMORY_CACHE_MAX_ENTRIES {
+        return;
+    }
+
+    let mut by_age: Vec<_> = entries
+        .iter()
+        .map(|(url, (_, written))| (url.clone(), now.saturating_duration_since(*written)))
+        .collect();
+    by_age.sort_unstable_by_key(|(_, age)| std::cmp::Reverse(*age));
+
+    for (url, _) in by_age
+        .into_iter()
+        .take(entries.len() - MEMORY_CACHE_MAX_ENTRIES)
+    {
+        entries.remove(&url);
     }
 }
 
@@ -296,13 +398,13 @@ fn write_caches(
     url: &str,
     memory: Option<MemoryCache>,
 ) -> Result<(), Box<dyn Error>> {
-    cache::write(cache_path, out);
+    let bytes = cache::write(cache_path, out);
     if let Some(memory) = memory {
-        write_memory(
-            &memory,
-            url.to_string(),
-            Arc::from(serde_json::to_string(out)?),
-        );
+        let body = match bytes {
+            Some(bytes) => Arc::from(String::from_utf8(bytes)?),
+            None => Arc::from(serde_json::to_string(out)?),
+        };
+        write_memory(&memory, url.to_string(), body);
     }
     Ok(())
 }
@@ -328,16 +430,22 @@ async fn refresh(
     url: &str,
     concurrency: usize,
     memory: Option<MemoryCache>,
+    chunks_memory: Option<fetch::ChunkMemoryCache>,
+    redirects: Option<RedirectMemory>,
 ) -> Result<(), Box<dyn Error>> {
     let base = Url::parse(url)?;
+    let request_base = redirected_base(redirects.as_ref(), &base).unwrap_or_else(|| base.clone());
     let cache_path = cache::path_for(&base);
     let (out, _) = collect(
         client,
         url,
         &base,
+        &request_base,
         Some(cache_path.as_path()),
         None,
         concurrency,
+        chunks_memory,
+        redirects,
     )
     .await?;
     write_caches(&cache_path, &out, url, memory)
@@ -346,13 +454,19 @@ async fn refresh(
 async fn collect(
     client: &Client,
     url: &str,
-    base: &Url,
+    original_base: &Url,
+    request_base: &Url,
     cache_path: Option<&Path>,
     t0: Option<Instant>,
     concurrency: usize,
+    chunks_memory: Option<fetch::ChunkMemoryCache>,
+    redirects: Option<RedirectMemory>,
 ) -> Result<(Value, bool), Box<dyn Error>> {
-    let html = client.get(base.clone()).send().await?.bytes().await?;
-    let chunks = html::extract_chunks(&html, base);
+    let response = client.get(request_base.clone()).send().await?;
+    let final_base = response.url().clone();
+    remember_redirect(redirects.as_ref(), original_base, &final_base);
+    let html = response.bytes().await?;
+    let chunks = html::extract_chunks(&html, &final_base);
     let build_id = html::extract_build_id(&html).or_else(|| Some(cache::fingerprint(&chunks)));
 
     if let Some(mut v) = cache_path.and_then(|p| cache::read(p, build_id.as_deref())) {
@@ -366,10 +480,12 @@ async fn collect(
     let mut apis = ApiMap::default();
     scan::scan(&html, &mut apis);
 
-    let (chunks_scanned, chunk_fetch_errors) = fetch::scan_chunks(
+    let chunk_stats = fetch::scan_chunks(
         client.clone(),
         chunks.iter().cloned(),
         concurrency,
+        cache_path.is_some(),
+        chunks_memory,
         &mut apis,
     )
     .await;
@@ -378,8 +494,10 @@ async fn collect(
         "url": url,
         "build_id": build_id,
         "chunks_discovered": chunks.len(),
-        "chunks_scanned": chunks_scanned,
-        "chunk_fetch_errors": chunk_fetch_errors,
+        "chunks_scanned": chunk_stats.scanned,
+        "chunk_cache_hits": chunk_stats.cache_hits,
+        "chunk_memory_hits": chunk_stats.memory_hits,
+        "chunk_fetch_errors": chunk_stats.errors,
         "apis": apis,
         "cache": "miss",
     });
@@ -410,8 +528,10 @@ async fn grep_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
     let concurrency = chunk_concurrency();
     let client = make_client(concurrency)?;
     let base = Url::parse(&url)?;
-    let html = client.get(base.clone()).send().await?.bytes().await?;
-    let chunks = html::extract_chunks(&html, &base);
+    let response = client.get(base.clone()).send().await?;
+    let final_base = response.url().clone();
+    let html = response.bytes().await?;
+    let chunks = html::extract_chunks(&html, &final_base);
 
     let hits = fetch::grep_chunks(client, chunks.into_iter(), concurrency, &pattern, context).await;
     eprintln!("{} hits", hits.len());

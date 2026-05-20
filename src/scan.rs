@@ -1,7 +1,7 @@
 use crate::literals::{BAD_EXTS, CALL_LITERALS, SHAPE_LITERALS};
 use aho_corasick::AhoCorasick;
 use rustc_hash::FxHashMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 static CALL_AC: LazyLock<AhoCorasick> =
@@ -25,13 +25,19 @@ const METHODS: [(u8, &str); 5] = [
     (METHOD_PATCH, "PATCH"),
 ];
 
-#[derive(Default, Clone, Serialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Shape {
-    #[serde(serialize_with = "serialize_methods")]
+    #[serde(
+        serialize_with = "serialize_methods",
+        deserialize_with = "deserialize_methods"
+    )]
     methods: u8,
     has_body: bool,
     has_headers: bool,
-    #[serde(serialize_with = "serialize_content_types")]
+    #[serde(
+        serialize_with = "serialize_content_types",
+        deserialize_with = "deserialize_content_types"
+    )]
     content_types: u8,
     auth: bool,
 }
@@ -49,8 +55,35 @@ fn serialize_content_types<S: serde::Serializer>(bits: &u8, s: S) -> Result<S::O
     content_types[..(bits & CONTENT_JSON != 0) as usize].serialize(s)
 }
 
+fn deserialize_methods<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+    let methods = Vec::<String>::deserialize(d)?;
+    let mut bits = 0;
+    for method in methods {
+        bits |= match method.as_str() {
+            "GET" => METHOD_GET,
+            "POST" => METHOD_POST,
+            "PUT" => METHOD_PUT,
+            "DELETE" => METHOD_DELETE,
+            "PATCH" => METHOD_PATCH,
+            _ => 0,
+        };
+    }
+    Ok(bits)
+}
+
+fn deserialize_content_types<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+    let content_types = Vec::<String>::deserialize(d)?;
+    let mut bits = 0;
+    for content_type in content_types {
+        if content_type == "application/json" {
+            bits |= CONTENT_JSON;
+        }
+    }
+    Ok(bits)
+}
+
 impl Shape {
-    fn merge(&mut self, other: Shape) {
+    fn merge_ref(&mut self, other: &Shape) {
         self.methods |= other.methods;
         self.has_body |= other.has_body;
         self.has_headers |= other.has_headers;
@@ -101,7 +134,16 @@ pub fn scan(bytes: &[u8], apis: &mut ApiMap) {
 
 pub fn merge_into(dst: &mut ApiMap, src: ApiMap) {
     for (url, shape) in src {
-        dst.entry(url).or_default().merge(shape);
+        dst.entry(url).or_default().merge_ref(&shape);
+    }
+}
+
+pub fn merge_refs_into<'a>(
+    dst: &mut ApiMap,
+    src: impl IntoIterator<Item = (&'a String, &'a Shape)>,
+) {
+    for (url, shape) in src {
+        dst.entry(url.clone()).or_default().merge_ref(shape);
     }
 }
 

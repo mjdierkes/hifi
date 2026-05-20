@@ -1,11 +1,16 @@
+use crate::scan::ApiMap;
 use url::Url;
 
 pub fn fingerprint(chunks: &[Url]) -> String {
     let mut paths: Vec<&str> = chunks.iter().map(|u| u.path()).collect();
     paths.sort();
 
+    format!("{:016x}", hash_parts(paths.into_iter()))
+}
+
+fn hash_parts<'a>(parts: impl Iterator<Item = &'a str>) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
-    for p in paths {
+    for p in parts {
         for b in p.as_bytes() {
             h ^= *b as u64;
             h = h.wrapping_mul(0x100000001b3);
@@ -13,12 +18,35 @@ pub fn fingerprint(chunks: &[Url]) -> String {
         h ^= b'\n' as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    format!("{h:016x}")
+    h
 }
 
 pub fn path_for(base: &Url) -> std::path::PathBuf {
     let host = base.host_str().unwrap_or("unknown").replace('/', "_");
     dir().join(format!("{host}.json"))
+}
+
+pub fn read_chunk(url: &Url) -> Option<ApiMap> {
+    serde_json::from_slice(&std::fs::read(chunk_path_for(url)).ok()?).ok()
+}
+
+pub fn write_chunk(url: &Url, apis: &ApiMap) {
+    let path = chunk_path_for(url);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(bytes) = serde_json::to_vec(apis) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+fn chunk_path_for(url: &Url) -> std::path::PathBuf {
+    let host = url.host_str().unwrap_or("unknown").replace('/', "_");
+    let hash = hash_parts(std::iter::once(url.as_str()));
+    dir()
+        .join("chunks")
+        .join(host)
+        .join(format!("{hash:016x}.json"))
 }
 
 pub fn read(path: &std::path::Path, build_id: Option<&str>) -> Option<serde_json::Value> {
@@ -43,14 +71,14 @@ pub fn read_any(path: &std::path::Path) -> Option<(serde_json::Value, u64)> {
     Some((v, age))
 }
 
-pub fn write(path: &std::path::Path, value: &serde_json::Value) {
+pub fn write(path: &std::path::Path, value: &serde_json::Value) -> Option<Vec<u8>> {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(s) = serde_json::to_vec(value) {
-        let _ = std::fs::write(path, s);
-    }
+    let bytes = serde_json::to_vec(value).ok()?;
+    let _ = std::fs::write(path, &bytes);
     write_meta(path, value);
+    Some(bytes)
 }
 
 fn read_build_id(path: &std::path::Path) -> Option<String> {
@@ -93,6 +121,26 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(meta_path(&path));
+    }
+
+    #[test]
+    fn chunk_cache_round_trips_api_map() {
+        let url = Url::parse("https://example.com/_next/static/chunks/app-abc.js").unwrap();
+        let path = chunk_path_for(&url);
+        let _ = std::fs::remove_file(&path);
+
+        let mut apis = ApiMap::default();
+        crate::scan::scan(br#"fetch("/api/users", {method:"POST"})"#, &mut apis);
+
+        write_chunk(&url, &apis);
+        let cached = read_chunk(&url).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&cached).unwrap(),
+            serde_json::to_value(&apis).unwrap()
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     fn test_path() -> std::path::PathBuf {
