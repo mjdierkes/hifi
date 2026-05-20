@@ -68,9 +68,7 @@ fn discovers_nested_chunk_refs_in_chunk_body() {
         .iter()
         .any(|u| u.ends_with("app/dashboard-deadbeef.js")));
     assert!(urls.iter().any(|u| u.ends_with("app/settings-cafebabe.js")));
-    assert!(urls
-        .iter()
-        .any(|u| *u == "https://cdn.example.com/_next/static/chunks/app/users-f00d.js"));
+    assert!(urls.contains(&"https://cdn.example.com/_next/static/chunks/app/users-f00d.js"));
 }
 
 #[test]

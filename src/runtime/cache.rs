@@ -1,8 +1,12 @@
 use crate::scan::{ApiMap, CandidateMap};
 use rustc_hash::FxHashMap;
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, MapAccess, Visitor},
+    ser::SerializeStruct,
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use std::{
-    fs,
+    fmt, fs,
     hash::Hash,
     path::{Path, PathBuf},
     time::SystemTime,
@@ -34,11 +38,97 @@ pub fn path_for(base: &Url) -> PathBuf {
     dir().join(format!("{host}.json"))
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct ChunkData {
     pub apis: ApiMap,
     pub candidates: CandidateMap,
     pub refs: Vec<Url>,
+}
+
+impl Serialize for ChunkData {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let refs: Vec<&str> = self.refs.iter().map(Url::as_str).collect();
+        let mut st = serializer.serialize_struct("ChunkData", 3)?;
+        st.serialize_field("apis", &self.apis)?;
+        st.serialize_field("candidates", &self.candidates)?;
+        st.serialize_field("refs", &refs)?;
+        st.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ChunkData {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        enum Field {
+            Apis,
+            Candidates,
+            Refs,
+            Ignore,
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct FieldVisitor;
+
+                impl Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str("chunk field")
+                    }
+
+                    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                        Ok(match value {
+                            "apis" => Field::Apis,
+                            "candidates" => Field::Candidates,
+                            "refs" => Field::Refs,
+                            _ => Field::Ignore,
+                        })
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct ChunkVisitor;
+
+        impl<'de> Visitor<'de> for ChunkVisitor {
+            type Value = ChunkData;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("chunk data object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut apis = ApiMap::default();
+                let mut candidates = CandidateMap::default();
+                let mut refs = Vec::new();
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::Apis => apis = map.next_value()?,
+                        Field::Candidates => candidates = map.next_value()?,
+                        Field::Refs => {
+                            let raw: Vec<String> = map.next_value()?;
+                            refs = raw
+                                .into_iter()
+                                .filter_map(|s| Url::parse(&s).ok())
+                                .collect();
+                        }
+                        Field::Ignore => {
+                            let _ = map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ChunkData {
+                    apis,
+                    candidates,
+                    refs,
+                })
+            }
+        }
+
+        deserializer.deserialize_struct("ChunkData", &["apis", "candidates", "refs"], ChunkVisitor)
+    }
 }
 
 pub fn read_chunk(url: &Url) -> Option<ChunkData> {
@@ -130,7 +220,12 @@ fn dir() -> PathBuf {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static TEST_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn build_id_sidecar_skips_mismatched_cache_body() {
@@ -189,6 +284,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("hifi-cache-test-{nanos}.json"))
+        let id = TEST_PATH_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("hifi-cache-test-{nanos}-{id}.json"))
     }
 }

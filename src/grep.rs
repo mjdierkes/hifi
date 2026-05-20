@@ -1,30 +1,38 @@
+use crate::app::normalize_url;
 use crate::scan::html;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use std::error::Error;
 use url::Url;
 
+type Hit = (String, usize, String);
+
 pub async fn run(
     args: &[String],
     client: Client,
     concurrency: usize,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<i32, Box<dyn Error>> {
     let mut url = None;
     let mut pattern = None;
-    let mut context: usize = 60;
+    let mut context: usize = 2;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         match a.as_str() {
             "-C" | "--context" => {
-                context = iter.next().and_then(|v| v.parse().ok()).unwrap_or(context);
+                let v = iter.next().ok_or("'-C' needs a number")?;
+                context = v.parse().map_err(|_| format!("'-C {v}' is not a number"))?;
             }
-            _ if !a.starts_with("--") && url.is_none() => url = Some(a.clone()),
-            _ if !a.starts_with("--") && pattern.is_none() => pattern = Some(a.clone()),
-            _ => {}
+            s if s.starts_with("--") || s.starts_with('-') => {
+                return Err(format!("unknown flag '{s}' (try --help)").into());
+            }
+            _ if url.is_none() => url = Some(a.clone()),
+            _ if pattern.is_none() => pattern = Some(a.clone()),
+            _ => return Err(format!("unexpected argument '{a}'").into()),
         }
     }
     let url = url.ok_or("usage: hifi grep <url> <pattern> [-C N]")?;
     let pattern = pattern.ok_or("usage: hifi grep <url> <pattern> [-C N]")?;
+    let url = normalize_url(&url);
 
     let base = Url::parse(&url)?;
     let response = client.get(base.clone()).send().await?;
@@ -34,10 +42,10 @@ pub async fn run(
 
     let hits = grep_chunks(client, chunks.into_iter(), concurrency, &pattern, context).await;
     eprintln!("{} hits", hits.len());
-    for (url, offset, snippet) in hits {
-        println!("{url}@{offset}\t{snippet}");
+    for (url, line, snippet) in &hits {
+        println!("{url}:{line}\t{snippet}");
     }
-    Ok(())
+    Ok(if hits.is_empty() { 1 } else { 0 })
 }
 
 async fn grep_chunks(
@@ -46,7 +54,7 @@ async fn grep_chunks(
     concurrency: usize,
     pattern: &str,
     context: usize,
-) -> Vec<(String, usize, String)> {
+) -> Vec<Hit> {
     let pat = std::sync::Arc::new(pattern.to_string());
     let mut searched = stream::iter(chunks)
         .map(|url| grep_one(client.clone(), url, pat.clone(), context))
@@ -64,7 +72,7 @@ async fn grep_one(
     url: Url,
     pattern: std::sync::Arc<String>,
     context: usize,
-) -> Vec<(String, usize, String)> {
+) -> Vec<Hit> {
     let Ok(resp) = client.get(url.clone()).send().await else {
         return Vec::new();
     };
@@ -81,11 +89,21 @@ async fn grep_one(
     if pat_bytes.is_empty() {
         return hits;
     }
+
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(memchr::memchr_iter(b'\n', bytes).map(|i| i + 1))
+        .collect();
+
     for abs in memchr::memmem::find_iter(bytes, pat_bytes) {
-        let lo = abs.saturating_sub(context);
-        let hi = (abs + pat_bytes.len() + context).min(bytes.len());
-        let snippet = String::from_utf8_lossy(&bytes[lo..hi]).replace('\n', " ");
-        hits.push((url.to_string(), abs, snippet));
+        let line_idx = line_starts.partition_point(|&s| s <= abs).saturating_sub(1);
+        let lo_line = line_idx.saturating_sub(context);
+        let hi_line = (line_idx + context + 1).min(line_starts.len());
+        let lo = line_starts[lo_line];
+        let hi = line_starts.get(hi_line).copied().unwrap_or(bytes.len());
+        let snippet = String::from_utf8_lossy(&bytes[lo..hi])
+            .trim_end_matches('\n')
+            .replace('\n', " ");
+        hits.push((url.to_string(), line_idx + 1, snippet));
     }
     hits
 }

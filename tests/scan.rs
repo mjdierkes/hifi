@@ -58,12 +58,26 @@ fn finds_api_candidate_literals_outside_calls() {
 fn finds_api_candidate_template_fragments() {
     let mut candidates = CandidateMap::default();
     scan_candidates(
-        br#"fetch(`/api/users/${id}`); fetch(`${base}/api/admin`)"#,
+        br#"fetch(`/api/users/${id}`); fetch(`${base}/api/admin`); fetch(`/api/${team}/settings`)"#,
         &mut candidates,
     );
 
-    assert!(candidates.contains_key("/api/users/"));
+    assert!(candidates.contains_key("/api/users/{dynamic}"));
+    assert!(!candidates.contains_key("/api/users/"));
     assert!(candidates.contains_key("/api/admin"));
+    assert!(candidates.contains_key("/api/{dynamic}/settings"));
+}
+
+#[test]
+fn finds_unquoted_api_candidates() {
+    let mut candidates = CandidateMap::default();
+    scan_candidates(
+        br#"self.__next_f.push([1,/api/raw,0,/_next/data/b1/raw.json])"#,
+        &mut candidates,
+    );
+
+    assert!(candidates.contains_key("/api/raw"));
+    assert!(candidates.contains_key("/_next/data/b1/raw.json"));
 }
 
 fn scanned(bytes: &[u8]) -> ApiMap {

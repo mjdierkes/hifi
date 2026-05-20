@@ -45,7 +45,11 @@ impl<'a> Processor<'a> {
     }
 
     pub async fn process(&self, url: &str, no_cache: bool, t0: Instant) -> Result<String> {
-        let active_cache = (!no_cache).then(|| self.cache.clone()).unwrap_or_default();
+        let active_cache = if no_cache {
+            CacheContext::default()
+        } else {
+            self.cache.clone()
+        };
         let (base, cache_path, request_base) = request_parts(url, &active_cache)?;
 
         if let Some((json, age)) = (!no_cache)
@@ -59,7 +63,7 @@ impl<'a> Processor<'a> {
                 self.refresh_later(url, active_cache.clone());
                 "stale"
             };
-            return Ok(annotate_json(&json, t0, status, Some(age))?);
+            return annotate_json(&json, t0, status, Some(age));
         }
 
         let (out, cache_hit) = self
@@ -107,7 +111,7 @@ impl<'a> Processor<'a> {
 
     async fn collect(
         &self,
-        url: &str,
+        _url: &str,
         original_base: &Url,
         request_base: &Url,
         cache_path: Option<&Path>,
@@ -170,23 +174,18 @@ impl<'a> Processor<'a> {
             candidates.remove(url);
         }
 
+        let _ = (manifest_stats, chunk_stats, build_id);
         let mut out = json!({
-            "url": url,
-            "build_id": build_id,
-            "manifests_scanned": manifest_stats.scanned,
-            "manifest_fetch_errors": manifest_stats.errors,
-            "chunks_discovered": chunk_stats.discovered,
-            "initial_chunks_discovered": chunks.len(),
-            "chunks_scanned": chunk_stats.scanned,
-            "chunk_cache_hits": chunk_stats.cache_hits,
-            "chunk_memory_hits": chunk_stats.memory_hits,
-            "chunk_fetch_errors": chunk_stats.errors,
             "apis": apis,
-            "candidates": candidates,
-            "cache": "miss",
         });
-        if let (Some(obj), Some(t0)) = (out.as_object_mut(), t0) {
-            insert_elapsed(obj, t0);
+        if let Some(obj) = out.as_object_mut() {
+            if !candidates.is_empty() {
+                obj.insert("candidates".into(), json!(candidates));
+            }
+            obj.insert("cache".into(), json!("miss"));
+            if let Some(t0) = t0 {
+                insert_elapsed(obj, t0);
+            }
         }
         Ok((Collected::Value(out), false))
     }
@@ -370,10 +369,8 @@ fn annotate_json(bytes: &[u8], t0: Instant, status: &str, age_secs: Option<u64>)
     let elapsed = t0.elapsed();
     let sep = if body.ends_with('{') { "" } else { "," };
     let mut out = format!(
-        "{body}{sep}\"elapsed_ms\":{},\"elapsed_us\":{},\"elapsed_ns\":{},\"cache\":\"{status}\"}}",
+        "{body}{sep}\"elapsed_ms\":{},\"cache\":\"{status}\"}}",
         elapsed.as_millis(),
-        elapsed.as_micros(),
-        elapsed.as_nanos()
     );
     if let Some(age_secs) = age_secs {
         out.insert_str(out.len() - 1, &format!(",\"cache_age_secs\":{age_secs}"));
@@ -384,13 +381,7 @@ fn annotate_json(bytes: &[u8], t0: Instant, status: &str, age_secs: Option<u64>)
 fn cache_value(out: &Value) -> Value {
     let mut cached = out.clone();
     if let Some(obj) = cached.as_object_mut() {
-        for key in [
-            "cache",
-            "cache_age_secs",
-            "elapsed_ms",
-            "elapsed_us",
-            "elapsed_ns",
-        ] {
+        for key in ["cache", "cache_age_secs", "elapsed_ms"] {
             obj.remove(key);
         }
     }
@@ -398,10 +389,7 @@ fn cache_value(out: &Value) -> Value {
 }
 
 fn insert_elapsed(obj: &mut serde_json::Map<String, Value>, t0: Instant) {
-    let elapsed = t0.elapsed();
-    obj.insert("elapsed_ms".into(), json!(elapsed.as_millis()));
-    obj.insert("elapsed_us".into(), json!(elapsed.as_micros()));
-    obj.insert("elapsed_ns".into(), json!(elapsed.as_nanos()));
+    obj.insert("elapsed_ms".into(), json!(t0.elapsed().as_millis()));
 }
 
 #[cfg(test)]
@@ -413,16 +401,13 @@ mod tests {
     #[test]
     fn cache_value_strips_dynamic_fields() {
         let cached = cache_value(&json!({
-            "url": "https://example.com",
             "apis": {},
             "cache": "miss",
             "cache_age_secs": 1,
             "elapsed_ms": 1,
-            "elapsed_us": 2,
-            "elapsed_ns": 3
         }));
         let obj = cached.as_object().unwrap();
-        assert!(obj.contains_key("url"));
+        assert!(obj.contains_key("apis"));
         assert!(!obj.contains_key("cache"));
         assert!(!obj.contains_key("elapsed_ms"));
     }
@@ -439,7 +424,7 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["cache"], "hit");
         assert!(v.get("cache_age_secs").is_none());
-        assert!(v.get("elapsed_ns").is_some());
+        assert!(v.get("elapsed_ms").is_some());
     }
 
     #[tokio::test]
@@ -488,6 +473,5 @@ mod tests {
 
         assert!(v["apis"].get("/api/from-chunk").is_some());
         assert!(v["candidates"].get("/api/from-manifest").is_some());
-        assert_eq!(v["manifests_scanned"], 1);
     }
 }

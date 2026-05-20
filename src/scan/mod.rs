@@ -1,7 +1,12 @@
 use self::literals::{BAD_EXTS, CALL_LITERALS, SHAPE_LITERALS};
 use aho_corasick::AhoCorasick;
 use rustc_hash::FxHashMap;
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, MapAccess, Visitor},
+    ser::SerializeStruct,
+    Deserialize, Deserializer, Serialize, Serializer,
+};
+use std::fmt;
 use std::sync::LazyLock;
 
 static CALL_AC: LazyLock<AhoCorasick> =
@@ -30,24 +35,16 @@ const METHODS: [(u8, &str); 5] = [
 ];
 const CONTENT_TYPES: [(u8, &str); 1] = [(CONTENT_JSON, "application/json")];
 
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone)]
 pub struct Shape {
-    #[serde(
-        serialize_with = "serialize_methods",
-        deserialize_with = "deserialize_methods"
-    )]
     methods: u8,
     has_body: bool,
     has_headers: bool,
-    #[serde(
-        serialize_with = "serialize_content_types",
-        deserialize_with = "deserialize_content_types"
-    )]
     content_types: u8,
     auth: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct Candidate {
     source: String,
     confidence: String,
@@ -62,14 +59,6 @@ impl Default for Candidate {
     }
 }
 
-fn serialize_methods<S: serde::Serializer>(bits: &u8, s: S) -> Result<S::Ok, S::Error> {
-    serialize_flags(bits, &METHODS, s)
-}
-
-fn serialize_content_types<S: serde::Serializer>(bits: &u8, s: S) -> Result<S::Ok, S::Error> {
-    serialize_flags(bits, &CONTENT_TYPES, s)
-}
-
 fn serialize_flags<S: serde::Serializer>(
     bits: &u8,
     flags: &[(u8, &str)],
@@ -82,25 +71,201 @@ fn serialize_flags<S: serde::Serializer>(
         .serialize(s)
 }
 
-fn deserialize_methods<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
-    deserialize_flags(d, &METHODS)
+impl Serialize for Shape {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut len = 1;
+        len += self.has_body as usize;
+        len += self.has_headers as usize;
+        len += (self.content_types != 0) as usize;
+        len += self.auth as usize;
+
+        let mut st = serializer.serialize_struct("Shape", len)?;
+        st.serialize_field("methods", &Flags(self.methods, &METHODS))?;
+        if self.has_body {
+            st.serialize_field("has_body", &self.has_body)?;
+        }
+        if self.has_headers {
+            st.serialize_field("has_headers", &self.has_headers)?;
+        }
+        if self.content_types != 0 {
+            st.serialize_field("content_types", &Flags(self.content_types, &CONTENT_TYPES))?;
+        }
+        if self.auth {
+            st.serialize_field("auth", &self.auth)?;
+        }
+        st.end()
+    }
 }
 
-fn deserialize_content_types<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
-    deserialize_flags(d, &CONTENT_TYPES)
+struct Flags<'a>(u8, &'a [(u8, &'a str)]);
+
+impl Serialize for Flags<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_flags(&self.0, self.1, serializer)
+    }
 }
 
-fn deserialize_flags<'de, D: serde::Deserializer<'de>>(
-    d: D,
-    flags: &[(u8, &str)],
-) -> Result<u8, D::Error> {
+impl<'de> Deserialize<'de> for Shape {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        enum Field {
+            Methods,
+            HasBody,
+            HasHeaders,
+            ContentTypes,
+            Auth,
+            Ignore,
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct FieldVisitor;
+
+                impl Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str("shape field")
+                    }
+
+                    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                        Ok(match value {
+                            "methods" => Field::Methods,
+                            "has_body" => Field::HasBody,
+                            "has_headers" => Field::HasHeaders,
+                            "content_types" => Field::ContentTypes,
+                            "auth" => Field::Auth,
+                            _ => Field::Ignore,
+                        })
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct ShapeVisitor;
+
+        impl<'de> Visitor<'de> for ShapeVisitor {
+            type Value = Shape;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("API shape object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut shape = Shape::default();
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::Methods => {
+                            shape.methods = deserialize_flags_value(map.next_value()?, &METHODS)
+                        }
+                        Field::HasBody => shape.has_body = map.next_value()?,
+                        Field::HasHeaders => shape.has_headers = map.next_value()?,
+                        Field::ContentTypes => {
+                            shape.content_types =
+                                deserialize_flags_value(map.next_value()?, &CONTENT_TYPES);
+                        }
+                        Field::Auth => shape.auth = map.next_value()?,
+                        Field::Ignore => {
+                            let _ = map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(shape)
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "Shape",
+            &[
+                "methods",
+                "has_body",
+                "has_headers",
+                "content_types",
+                "auth",
+            ],
+            ShapeVisitor,
+        )
+    }
+}
+
+fn deserialize_flags_value(values: Vec<String>, flags: &[(u8, &str)]) -> u8 {
     let mut bits = 0;
-    for value in Vec::<String>::deserialize(d)? {
+    for value in values {
         if let Some((bit, _)) = flags.iter().find(|(_, name)| *name == value) {
             bits |= *bit;
         }
     }
-    Ok(bits)
+    bits
+}
+
+impl Serialize for Candidate {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut st = serializer.serialize_struct("Candidate", 2)?;
+        st.serialize_field("source", &self.source)?;
+        st.serialize_field("confidence", &self.confidence)?;
+        st.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Candidate {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        enum Field {
+            Source,
+            Confidence,
+            Ignore,
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct FieldVisitor;
+
+                impl Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str("candidate field")
+                    }
+
+                    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                        Ok(match value {
+                            "source" => Field::Source,
+                            "confidence" => Field::Confidence,
+                            _ => Field::Ignore,
+                        })
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct CandidateVisitor;
+
+        impl<'de> Visitor<'de> for CandidateVisitor {
+            type Value = Candidate;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("candidate object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut candidate = Candidate::default();
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::Source => candidate.source = map.next_value()?,
+                        Field::Confidence => candidate.confidence = map.next_value()?,
+                        Field::Ignore => {
+                            let _ = map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(candidate)
+            }
+        }
+
+        deserializer.deserialize_struct("Candidate", &["source", "confidence"], CandidateVisitor)
+    }
 }
 
 impl Shape {
@@ -171,18 +336,22 @@ pub fn scan_candidates(bytes: &[u8], candidates: &mut CandidateMap) {
                         && end + 1 < bytes.len()
                         && bytes[end + 1] == b'{'
                     {
-                        scan_candidate_text(&bytes[start..end], candidates);
                         end = skip_template_expr(bytes, end + 2);
                         continue;
                     }
                     end += 1;
                 }
-                scan_candidate_text(&bytes[start..end], candidates);
+                if quote == b'`' {
+                    scan_template_candidate_text(&bytes[start..end], candidates);
+                } else {
+                    scan_candidate_text(&bytes[start..end], candidates);
+                }
                 i = end.saturating_add(1);
             }
             _ => i += 1,
         }
     }
+    scan_unquoted_candidate_text(bytes, candidates);
 }
 
 pub fn merge_candidates_into(dst: &mut CandidateMap, src: CandidateMap) {
@@ -294,16 +463,76 @@ fn scan_candidate_text(bytes: &[u8], candidates: &mut CandidateMap) {
     }
 }
 
+fn scan_unquoted_candidate_text(bytes: &[u8], candidates: &mut CandidateMap) {
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'"' | b'\'' | b'`') {
+            scan_candidate_text(&bytes[start..i], candidates);
+            i = skip_quoted(bytes, i);
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    scan_candidate_text(&bytes[start..], candidates);
+}
+
+fn skip_quoted(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if quote == b'`' && bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            i = skip_template_expr(bytes, i + 2);
+            continue;
+        }
+        if bytes[i] == quote {
+            return i + 1;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+fn scan_template_candidate_text(bytes: &[u8], candidates: &mut CandidateMap) {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            normalized.extend_from_slice(b"{dynamic}");
+            i = skip_template_expr(bytes, i + 2);
+        } else {
+            normalized.push(bytes[i]);
+            i += 1;
+        }
+    }
+    scan_candidate_text(&normalized, candidates);
+}
+
 fn extract_candidate_at(bytes: &[u8], pos: usize) -> Option<String> {
     let start = walk_candidate_start(bytes, pos);
-    let end = bytes[pos..]
-        .iter()
-        .position(|b| is_candidate_delim(*b))
-        .map(|n| pos + n)
-        .unwrap_or(bytes.len());
+    let end = candidate_end(bytes, pos);
     let raw = std::str::from_utf8(&bytes[start..end]).ok()?;
     let url = raw.trim_matches('\\');
     is_api_candidate(url).then(|| url.to_owned())
+}
+
+fn candidate_end(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"{dynamic}") {
+            i += b"{dynamic}".len();
+            continue;
+        }
+        if is_candidate_delim(bytes[i]) {
+            break;
+        }
+        i += 1;
+    }
+    i
 }
 
 fn walk_candidate_start(bytes: &[u8], pos: usize) -> usize {
