@@ -7,8 +7,8 @@ edition = "2021"
 reqwest = { version = "0.12", features = ["rustls-tls", "http2", "gzip", "brotli"], default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 aho-corasick = "1"
+bytes = "1"
 serde_json = "1"
-futures = "0.3"
 url = "2"
 serde = { version = "1.0.228", features = ["derive"] }
 
