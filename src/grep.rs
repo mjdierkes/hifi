@@ -1,6 +1,6 @@
 use crate::app::{escape_terminal, normalize_url, AppError};
+use crate::discover::{self, AssetRef, DocumentKind};
 use crate::runtime::net;
-use crate::scan;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use url::Url;
@@ -43,12 +43,12 @@ pub async fn run(args: &[String], client: Client, concurrency: usize) -> Result<
     let response = net::get_limited(&client, base.clone(), net::allow_private_networks()).await?;
     let final_base = response.url().clone();
     let html = net::read_limited(response).await?;
-    let chunks = scan::scan_document(&html, &final_base).refs;
+    let assets = discover::scan_document(&html, &final_base, DocumentKind::Html).assets;
 
-    let result = grep_chunks(client, chunks.into_iter(), concurrency, &pattern, context).await;
+    let result = grep_assets(client, assets.into_iter(), concurrency, &pattern, context).await;
     if result.failed > 0 {
         eprintln!(
-            "hifi: warning: failed to read {} chunks; results may be incomplete",
+            "hifi: warning: failed to read {} assets; results may be incomplete",
             result.failed
         );
     }
@@ -63,16 +63,16 @@ pub async fn run(args: &[String], client: Client, concurrency: usize) -> Result<
     Ok(if result.hits.is_empty() { 1 } else { 0 })
 }
 
-async fn grep_chunks(
+async fn grep_assets(
     client: Client,
-    chunks: impl Iterator<Item = Url>,
+    assets: impl Iterator<Item = AssetRef>,
     concurrency: usize,
     pattern: &str,
     context: usize,
 ) -> GrepResult {
     let pat = std::sync::Arc::new(pattern.to_string());
-    let mut searched = stream::iter(chunks)
-        .map(|url| grep_one(client.clone(), url, pat.clone(), context))
+    let mut searched = stream::iter(assets)
+        .map(|asset| grep_one(client.clone(), asset, pat.clone(), context))
         .buffer_unordered(concurrency);
 
     let mut result = GrepResult::default();
@@ -87,11 +87,11 @@ async fn grep_chunks(
 
 async fn grep_one(
     client: Client,
-    url: Url,
+    asset: AssetRef,
     pattern: std::sync::Arc<String>,
     context: usize,
 ) -> Result<Vec<Hit>, ()> {
-    let body = net::get_bytes_limited(&client, url.clone(), net::allow_private_networks())
+    let body = net::get_bytes_limited(&client, asset.url.clone(), net::allow_private_networks())
         .await
         .map_err(|_| ())?;
 
@@ -115,7 +115,7 @@ async fn grep_one(
         let snippet = String::from_utf8_lossy(&bytes[lo..hi])
             .trim_end_matches('\n')
             .replace('\n', " ");
-        hits.push((url.to_string(), line_idx + 1, snippet));
+        hits.push((asset.url.to_string(), line_idx + 1, snippet));
     }
     Ok(hits)
 }

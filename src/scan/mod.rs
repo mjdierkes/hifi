@@ -1,12 +1,11 @@
 use self::literals::{
     BAD_EXTS, CALL_LITERALS, ROUTE_BAD_EXTS, ROUTE_CALL_LITERALS, ROUTE_START_LITERALS,
-    ROUTE_VALUE_LITERALS, SKIPPED_CHUNK_FRAGMENTS,
+    ROUTE_VALUE_LITERALS,
 };
 use aho_corasick::{AhoCorasick, MatchKind};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
-use url::Url;
 
 mod literals;
 
@@ -40,7 +39,7 @@ const CONTENT_TYPES: [(u8, &str); 4] = [
     (CONTENT_URLENCODED, "application/x-www-form-urlencoded"),
     (CONTENT_TEXT, "text/plain"),
 ];
-const CANDIDATE_LITERALS: &[&str] = &["/api", "/graphql", "/trpc", "/_next/data"];
+const CANDIDATE_LITERALS: &[&str] = &["/api", "/graphql", "/trpc"];
 const SHAPE_WINDOW: usize = 400;
 
 static DOCUMENT_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
@@ -49,16 +48,13 @@ static DOCUMENT_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
             + CANDIDATE_LITERALS.len()
             + ROUTE_CALL_LITERALS.len()
             + ROUTE_VALUE_LITERALS.len()
-            + ROUTE_START_LITERALS.len()
-            + 2,
+            + ROUTE_START_LITERALS.len(),
     );
     patterns.extend_from_slice(CALL_LITERALS);
     patterns.extend_from_slice(CANDIDATE_LITERALS);
     patterns.extend_from_slice(ROUTE_CALL_LITERALS);
     patterns.extend_from_slice(ROUTE_VALUE_LITERALS);
     patterns.extend_from_slice(ROUTE_START_LITERALS);
-    patterns.push("/_next/");
-    patterns.push("static/chunks/");
     AhoCorasick::builder()
         .match_kind(MatchKind::LeftmostLongest)
         .build(patterns)
@@ -72,15 +68,11 @@ pub struct ScanResult {
     pub routes: RouteMap,
     #[serde(default, skip_serializing_if = "CandidateMap::is_empty")]
     pub candidates: CandidateMap,
-    pub refs: Vec<Url>,
 }
 
 impl ScanResult {
     pub fn merge(&mut self, other: ScanResult) {
         self.merge_findings(&other);
-        self.refs.extend(other.refs);
-        self.refs.sort_unstable();
-        self.refs.dedup();
     }
 
     pub fn merge_findings(&mut self, other: &ScanResult) {
@@ -113,6 +105,8 @@ pub struct Shape {
     auth: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     query_params: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    body_params: Vec<String>,
 }
 
 impl Shape {
@@ -149,6 +143,9 @@ impl Shape {
         if !self.query_params.is_empty() {
             flags.push("query");
         }
+        if !self.body_params.is_empty() {
+            flags.push("body-shape");
+        }
         flags.join(",")
     }
 
@@ -161,12 +158,14 @@ impl Shape {
         for key in &other.query_params {
             push_unique_sorted(&mut self.query_params, key);
         }
+        for key in &other.body_params {
+            push_unique_sorted(&mut self.body_params, key);
+        }
     }
 }
 
-pub fn scan_document(bytes: &[u8], base: &Url) -> ScanResult {
+pub fn scan_endpoints(bytes: &[u8]) -> ScanResult {
     let mut out = ScanResult::default();
-    let mut seen_refs = FxHashSet::default();
     let call_end = CALL_LITERALS.len();
     let candidate_end = call_end + CANDIDATE_LITERALS.len();
     let route_call_end = candidate_end + ROUTE_CALL_LITERALS.len();
@@ -183,6 +182,7 @@ pub fn scan_document(bytes: &[u8], base: &Url) -> ScanResult {
                         shape.methods = METHOD_GET;
                     }
                     apply_query_params(&mut shape, &url);
+                    let url = normalize_api_url(&url);
                     out.apis.entry(url).or_default().merge(&shape);
                 }
             }
@@ -190,7 +190,7 @@ pub fn scan_document(bytes: &[u8], base: &Url) -> ScanResult {
             push_candidate(bytes, m.start(), &mut out);
         } else if pat < route_call_end {
             if let Some(url) = extract_url_arg(bytes, m.end()).filter(|url| is_client_route(url)) {
-                out.routes.entry(url.to_owned()).or_default();
+                out.routes.entry(url).or_default();
             }
         } else if pat < route_value_end {
             if is_identifier_boundary_before(bytes, m.start()) {
@@ -203,42 +203,25 @@ pub fn scan_document(bytes: &[u8], base: &Url) -> ScanResult {
         } else if pat < route_start_end {
             let slash = m.end().saturating_sub(1);
             if !push_candidate(bytes, slash, &mut out) {
-                if bytes[slash..].starts_with(b"/_next/") {
-                    push_chunk_at(bytes, slash, base, false, &mut seen_refs, &mut out.refs);
-                } else if let Some(url) = extract_route_at(bytes, slash) {
+                if let Some(url) = extract_route_at(bytes, slash) {
                     out.routes.entry(url).or_default();
                 }
             }
-        } else if pat == route_start_end {
-            push_chunk_at(bytes, m.start(), base, false, &mut seen_refs, &mut out.refs);
-        } else if m.start() < 7 || &bytes[m.start() - 7..m.start()] != b"/_next/" {
-            push_chunk_at(bytes, m.start(), base, true, &mut seen_refs, &mut out.refs);
         }
     }
     out
 }
 
-pub fn extract_build_id(html: &[u8]) -> Option<String> {
-    let needle = br#""buildId":""#;
-    if let Some(i) = memchr::memmem::find(html, needle) {
-        let rest = &html[i + needle.len()..];
-        if let Some(end) = memchr::memchr(b'"', rest) {
-            return std::str::from_utf8(&rest[..end]).ok().map(str::to_string);
-        }
-    }
-    let marker = b"/_next/static/";
-    let rest = &html[memchr::memmem::find(html, marker)? + marker.len()..];
-    let candidate = &rest[..memchr::memchr(b'/', rest)?];
-    (!matches!(candidate, b"chunks" | b"css" | b"media" | b"development"))
-        .then(|| std::str::from_utf8(candidate).ok().map(str::to_string))?
-}
-
 fn scan_call(bytes: &[u8], start: usize, after: usize, anchor: &str) -> Option<(String, Shape)> {
-    let url = extract_url_arg(bytes, after)?.to_owned();
+    let url = extract_url_arg(bytes, after)?;
     let lo = statement_start(bytes, start);
     let hi = statement_end(bytes, after);
     let mut shape = shape_from_window(&bytes[lo..hi]);
-    shape.methods |= method_hint(anchor);
+    let hint = method_hint(anchor);
+    shape.methods |= hint;
+    if method_allows_body(hint) {
+        apply_second_arg_body_shape(bytes, after, &mut shape);
+    }
     Some((url, shape))
 }
 
@@ -303,9 +286,9 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     memchr::memmem::find(haystack, needle).is_some()
 }
 
-fn extract_url_arg(bytes: &[u8], start: usize) -> Option<&str> {
+fn extract_url_arg(bytes: &[u8], start: usize) -> Option<String> {
     if start > 0 && matches!(bytes[start - 1], b'"' | b'\'' | b'`') {
-        return extract_quoted(bytes, start, bytes[start - 1]).and_then(|(url, _)| url);
+        return extract_quoted_url(bytes, start, bytes[start - 1]);
     }
     let mut i = skip_ws(bytes, start);
     let quote = *bytes.get(i)?;
@@ -316,35 +299,176 @@ fn extract_url_arg(bytes: &[u8], start: usize) -> Option<&str> {
     if quote == b'`' && bytes.get(i..i + 2) == Some(b"${") {
         i = skip_template_expr(bytes, i + 2);
     }
-    extract_quoted(bytes, i, quote).and_then(|(url, _)| url)
+    extract_quoted_url(bytes, i, quote)
 }
 
-fn extract_quoted(bytes: &[u8], start: usize, quote: u8) -> Option<(Option<&str>, usize)> {
+fn extract_quoted_url(bytes: &[u8], start: usize, quote: u8) -> Option<String> {
+    let mut normalized = None;
     let mut i = start;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            normalized
+                .get_or_insert_with(|| bytes[start..i].to_vec())
+                .push(bytes[i + 1]);
+            i += 2;
+        } else if quote == b'`' && bytes.get(i..i + 2) == Some(b"${") {
+            normalized
+                .get_or_insert_with(|| bytes[start..i].to_vec())
+                .extend_from_slice(b"{dynamic}");
+            i = skip_template_expr(bytes, i + 2);
+        } else if bytes[i] == quote {
+            return quoted_url_from_parts(bytes, start, i, normalized);
+        } else {
+            if let Some(out) = normalized.as_mut() {
+                out.push(bytes[i]);
+            }
+            i += 1;
+        }
+    }
+    quoted_url_from_parts(bytes, start, bytes.len(), normalized)
+}
+
+fn quoted_url_from_parts(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    normalized: Option<Vec<u8>>,
+) -> Option<String> {
+    if let Some(out) = normalized {
+        return String::from_utf8(out)
+            .ok()
+            .map(|s| s.trim_matches('\\').to_string());
+    }
+    std::str::from_utf8(&bytes[start..end])
+        .ok()
+        .map(|s| s.trim_matches('\\').to_string())
+}
+
+fn apply_second_arg_body_shape(bytes: &[u8], start: usize, shape: &mut Shape) {
+    let Some(first_end) = quoted_arg_end(bytes, start) else {
+        return;
+    };
+    let mut i = skip_ws(bytes, first_end);
+    if bytes.get(i) != Some(&b',') {
+        return;
+    }
+    i = skip_ws(bytes, i + 1);
+    if matches!(bytes.get(i), None | Some(b')')) {
+        return;
+    }
+    shape.has_body = true;
+    if let Some(keys) = object_keys(bytes, i) {
+        shape.content_types |= CONTENT_JSON;
+        for key in keys {
+            push_unique_sorted(&mut shape.body_params, &key);
+        }
+    }
+}
+
+fn quoted_arg_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = skip_ws(bytes, start);
+    let quote = *bytes.get(i)?;
+    if !matches!(quote, b'"' | b'\'' | b'`') {
+        return None;
+    }
+    i += 1;
     while i < bytes.len() {
         if bytes[i] == b'\\' && i + 1 < bytes.len() {
             i += 2;
         } else if quote == b'`' && bytes.get(i..i + 2) == Some(b"${") {
-            return Some((
-                std::str::from_utf8(&bytes[start..i]).ok().map(|s| {
-                    if s.is_empty() {
-                        "{dynamic}"
-                    } else {
-                        s
-                    }
-                }),
-                i,
-            ));
+            i = skip_template_expr(bytes, i + 2);
         } else if bytes[i] == quote {
-            return Some((std::str::from_utf8(&bytes[start..i]).ok(), i + 1));
+            return Some(i + 1);
         } else {
             i += 1;
         }
     }
-    Some((std::str::from_utf8(&bytes[start..]).ok(), bytes.len()))
+    Some(bytes.len())
 }
 
-fn extract_value_after_anchor(bytes: &[u8], mut i: usize) -> Option<&str> {
+fn object_keys(bytes: &[u8], start: usize) -> Option<Vec<String>> {
+    if bytes.get(start) != Some(&b'{') {
+        return None;
+    }
+    let mut keys = Vec::new();
+    let mut i = start + 1;
+    let mut depth = 1usize;
+    let mut read_key = true;
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            b'{' | b'[' | b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' | b')' => {
+                depth -= 1;
+                i += 1;
+                read_key = depth == 1;
+            }
+            b'"' | b'\'' | b'`' => {
+                if depth == 1 && read_key {
+                    let quote = bytes[i];
+                    if let Some(end) = quoted_end(bytes, i + 1, quote) {
+                        let key = std::str::from_utf8(&bytes[i + 1..end]).ok()?.to_string();
+                        let after = skip_ws(bytes, end + 1);
+                        if bytes.get(after) == Some(&b':') {
+                            keys.push(key);
+                            read_key = false;
+                        }
+                        i = end + 1;
+                    } else {
+                        return Some(keys);
+                    }
+                } else {
+                    i = quoted_end(bytes, i + 1, bytes[i])
+                        .map(|end| end + 1)
+                        .unwrap_or(bytes.len());
+                }
+            }
+            b',' if depth == 1 => {
+                read_key = true;
+                i += 1;
+            }
+            b':' if depth == 1 => {
+                read_key = false;
+                i += 1;
+            }
+            b if depth == 1 && read_key && (b == b'_' || b == b'$' || b.is_ascii_alphabetic()) => {
+                let key_start = i;
+                i += 1;
+                while bytes
+                    .get(i)
+                    .is_some_and(|b| *b == b'_' || *b == b'$' || b.is_ascii_alphanumeric())
+                {
+                    i += 1;
+                }
+                let key = std::str::from_utf8(&bytes[key_start..i]).ok()?.to_string();
+                let after = skip_ws(bytes, i);
+                if matches!(bytes.get(after), Some(b':' | b',' | b'}')) {
+                    keys.push(key);
+                    read_key = !matches!(bytes.get(after), Some(b':'));
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Some(keys)
+}
+
+fn quoted_end(bytes: &[u8], mut i: usize, quote: u8) -> Option<usize> {
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+        } else if bytes[i] == quote {
+            return Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn extract_value_after_anchor(bytes: &[u8], mut i: usize) -> Option<String> {
     i = skip_ws(bytes, i);
     if matches!(bytes.get(i), Some(b'"' | b'\'' | b'`')) {
         let quote = bytes[i];
@@ -372,7 +496,7 @@ fn push_candidate(bytes: &[u8], pos: usize, out: &mut ScanResult) -> bool {
 fn extract_candidate_at(bytes: &[u8], pos: usize) -> Option<String> {
     let start = walk_token_start(bytes, pos);
     let url = token_string(bytes, start)?;
-    is_api_candidate(&url).then_some(url)
+    is_api_candidate(&url).then(|| normalize_api_url(&url))
 }
 
 fn extract_route_at(bytes: &[u8], pos: usize) -> Option<String> {
@@ -496,14 +620,17 @@ fn method_hint(anchor: &str) -> u8 {
     }
 }
 
+fn method_allows_body(method: u8) -> bool {
+    method & (METHOD_POST | METHOD_PUT | METHOD_PATCH) != 0
+}
+
 fn is_api_candidate(s: &str) -> bool {
     is_url_like(s)
         && (s.starts_with("/api")
             || s.starts_with("/graphql")
             || s.starts_with("/trpc")
-            || s.starts_with("/_next/data")
             || ((s.starts_with("http://") || s.starts_with("https://"))
-                && ["/api/", "/graphql", "/trpc", "/_next/data/"]
+                && ["/api/", "/graphql", "/trpc"]
                     .iter()
                     .any(|needle| s.contains(needle))))
 }
@@ -514,6 +641,7 @@ fn is_client_route(s: &str) -> bool {
         && !s.starts_with("/graphql")
         && !s.starts_with("/trpc")
         && !s.starts_with("/_next")
+        && !s.starts_with("/_nuxt")
 }
 
 fn is_route_like(s: &str) -> bool {
@@ -530,8 +658,33 @@ fn is_url_like(s: &str) -> bool {
     (2..=512).contains(&bytes.len())
         && (s.starts_with('/') || s.starts_with("http://") || s.starts_with("https://"))
         && s != "/"
+        && !has_bare_dynamic_suffix(s)
         && !bad_ext(bytes, BAD_EXTS, false)
         && bytes.iter().any(u8::is_ascii_alphanumeric)
+}
+
+fn normalize_api_url(s: &str) -> String {
+    let without_fragment = s.split('#').next().unwrap_or(s);
+    let Some((path, query)) = without_fragment.split_once('?') else {
+        return without_fragment.to_owned();
+    };
+
+    let has_query_keys = query
+        .split('&')
+        .filter_map(|pair| pair.split('=').next().map(str::trim))
+        .any(|key| !key.is_empty() && key.len() <= 128);
+    if has_query_keys {
+        path.to_owned()
+    } else {
+        without_fragment.to_owned()
+    }
+}
+
+fn has_bare_dynamic_suffix(s: &str) -> bool {
+    let Some(pos) = s.find("{dynamic}") else {
+        return false;
+    };
+    pos > 0 && s.as_bytes()[pos - 1].is_ascii_alphanumeric()
 }
 
 fn bad_ext(s: &[u8], exts: &[&str], strip_fragment: bool) -> bool {
@@ -572,57 +725,4 @@ fn push_unique_sorted(dst: &mut Vec<String>, value: &str) {
         dst.push(value.to_owned());
         dst.sort_unstable();
     }
-}
-
-fn push_chunk_at(
-    bytes: &[u8],
-    pos: usize,
-    base: &Url,
-    nested: bool,
-    seen: &mut FxHashSet<Url>,
-    out: &mut Vec<Url>,
-) {
-    let start = if nested {
-        pos
-    } else {
-        walk_token_start(bytes, pos)
-    };
-    let end = pos + chunk_url_len(&bytes[pos..], nested);
-    let src = &bytes[start..end];
-    if is_skipped_chunk(src)
-        || (nested && !src.ends_with(b".js"))
-        || (!nested && memchr::memmem::find(src, b".js").is_none())
-    {
-        return;
-    }
-    let Ok(src) = std::str::from_utf8(src) else {
-        return;
-    };
-    let url = if nested {
-        base.join(&format!("/_next/{src}"))
-    } else {
-        base.join(src)
-    };
-    if let Ok(url) = url {
-        if seen.insert(url.clone()) {
-            out.push(url);
-        }
-    }
-}
-
-fn chunk_url_len(bytes: &[u8], backtick: bool) -> usize {
-    bytes
-        .iter()
-        .position(|b| {
-            b.is_ascii_whitespace()
-                || matches!(b, b'"' | b'\'' | b'<' | b'>' | b')' | b',' | b';')
-                || (backtick && *b == b'`')
-        })
-        .unwrap_or(bytes.len())
-}
-
-fn is_skipped_chunk(src: &[u8]) -> bool {
-    SKIPPED_CHUNK_FRAGMENTS
-        .iter()
-        .any(|f| memchr::memmem::find(src, f.as_bytes()).is_some())
 }

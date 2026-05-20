@@ -1,6 +1,7 @@
-use crate::scan::{self, ScanResult};
+use crate::discover::{self, AssetRef, AssetSource, DocumentScan};
+use crate::scan::ScanResult;
 
-use super::cache::{self, ChunkData};
+use super::cache::{self, AssetData};
 use super::net;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use lru::LruCache;
@@ -15,68 +16,67 @@ use std::{
 };
 use url::Url;
 
-const CHUNK_MEMORY_CACHE_MAX_ENTRIES: usize = 1024;
-const MAX_TOTAL_CHUNKS: usize = 2048;
-static FIRST_CHUNK_RESPONSE_TRACED: AtomicBool = AtomicBool::new(false);
+const ASSET_MEMORY_CACHE_MAX_ENTRIES: usize = 1024;
+const MAX_TOTAL_ASSETS: usize = 2048;
+static FIRST_ASSET_RESPONSE_TRACED: AtomicBool = AtomicBool::new(false);
 
-pub type ChunkMemoryCache = Arc<RwLock<LruCache<String, (Arc<ChunkData>, Instant)>>>;
+pub type AssetMemoryCache = Arc<RwLock<LruCache<String, (Arc<AssetData>, Instant)>>>;
 
-pub fn chunk_memory_cache() -> ChunkMemoryCache {
+pub fn asset_memory_cache() -> AssetMemoryCache {
     Arc::new(RwLock::new(LruCache::new(
-        NonZeroUsize::new(CHUNK_MEMORY_CACHE_MAX_ENTRIES).expect("nonzero cache size"),
+        NonZeroUsize::new(ASSET_MEMORY_CACHE_MAX_ENTRIES).expect("nonzero cache size"),
     )))
 }
 
-pub struct ChunkScanOptions {
+pub struct AssetScanOptions {
     pub concurrency: usize,
     pub use_processed_cache: bool,
     pub cache_key: Option<String>,
     pub allow_private: bool,
-    pub memory: Option<ChunkMemoryCache>,
+    pub memory: Option<AssetMemoryCache>,
 }
 
 #[derive(Default)]
-pub struct ChunkScanStats {
+pub struct AssetScanStats {
     pub discovered: usize,
     pub memory_hits: usize,
     pub failed: usize,
     pub capped: bool,
+    pub failed_urls: Vec<Url>,
 }
 
-struct ScannedChunk {
-    chunk: Arc<ChunkData>,
+struct ScannedAsset {
+    asset: Arc<AssetData>,
     memory_hit: bool,
 }
 
 enum FetchedBody {
-    Body(ScanResult, cache::ChunkValidators),
+    Body(DocumentScan, cache::AssetValidators),
     NotModified,
 }
 
-pub async fn scan_chunks(
+pub async fn scan_assets(
     client: Client,
-    initial: impl IntoIterator<Item = Url>,
-    opts: ChunkScanOptions,
+    initial: impl IntoIterator<Item = AssetRef>,
+    opts: AssetScanOptions,
     out: &mut ScanResult,
-) -> ChunkScanStats {
-    let mut stats = ChunkScanStats::default();
-    let mut visited = initial
-        .into_iter()
-        .take(MAX_TOTAL_CHUNKS)
-        .collect::<rustc_hash::FxHashSet<_>>();
-    stats.capped = visited.len() == MAX_TOTAL_CHUNKS;
-    let mut queue = visited.iter().cloned().collect::<VecDeque<_>>();
+) -> AssetScanStats {
+    let mut stats = AssetScanStats::default();
+    let mut visited = rustc_hash::FxHashSet::default();
+    let mut queue = VecDeque::new();
+    enqueue_assets(initial, &mut visited, &mut queue, &mut stats);
+
     let mut fetched = FuturesUnordered::new();
     let concurrency = opts.concurrency.max(1);
 
     loop {
         while fetched.len() < concurrency {
-            let Some(url) = queue.pop_front() else {
+            let Some(asset) = queue.pop_front() else {
                 break;
             };
             fetched.push(fetch_scan(
                 client.clone(),
-                url,
+                asset,
                 opts.use_processed_cache,
                 opts.cache_key.as_deref(),
                 opts.allow_private,
@@ -92,10 +92,18 @@ pub async fn scan_chunks(
                 if result.memory_hit {
                     stats.memory_hits += 1;
                 }
-                out.merge_findings(&result.chunk);
-                enqueue_refs(&result.chunk.refs, &mut visited, &mut queue, &mut stats);
+                out.merge_findings(&result.asset.findings);
+                enqueue_assets(
+                    result.asset.assets.iter().cloned(),
+                    &mut visited,
+                    &mut queue,
+                    &mut stats,
+                );
             }
-            Err(()) => stats.failed += 1,
+            Err(asset) => {
+                stats.failed += 1;
+                stats.failed_urls.push(asset.url);
+            }
         }
     }
 
@@ -103,104 +111,112 @@ pub async fn scan_chunks(
     stats
 }
 
-fn enqueue_refs(
-    refs: &[Url],
+fn enqueue_assets(
+    assets: impl IntoIterator<Item = AssetRef>,
     visited: &mut rustc_hash::FxHashSet<Url>,
-    queue: &mut VecDeque<Url>,
-    stats: &mut ChunkScanStats,
+    queue: &mut VecDeque<AssetRef>,
+    stats: &mut AssetScanStats,
 ) {
-    for url in refs {
-        if visited.len() >= MAX_TOTAL_CHUNKS {
-            if !visited.contains(url) {
+    for asset in assets {
+        if visited.len() >= MAX_TOTAL_ASSETS {
+            if !visited.contains(&asset.url) {
                 stats.capped = true;
             }
-        } else if visited.insert(url.clone()) {
-            queue.push_back(url.clone());
+        } else if visited.insert(asset.url.clone()) {
+            queue.push_back(asset);
         }
     }
 }
 
 async fn fetch_scan(
     client: Client,
-    url: Url,
+    asset: AssetRef,
     use_cache: bool,
     cache_key: Option<&str>,
     allow_private: bool,
-    memory: Option<ChunkMemoryCache>,
-) -> Result<ScannedChunk, ()> {
+    memory: Option<AssetMemoryCache>,
+) -> Result<ScannedAsset, AssetRef> {
     let mut cached = None;
     if use_cache {
-        if let Some(chunk) = read_memory_chunk(memory.as_ref(), &url, cache_key) {
-            return Ok(ScannedChunk {
-                chunk,
+        if let Some(asset_data) = read_memory_asset(memory.as_ref(), &asset.url, cache_key) {
+            return Ok(ScannedAsset {
+                asset: asset_data,
                 memory_hit: true,
             });
         }
-        if let Some(chunk) = cache::read_chunk_cached(&url, cache_key) {
-            if chunk.age_secs < super::processor::CACHE_FRESH_SECS {
-                let chunk = Arc::new(chunk.data);
-                write_memory_chunk(memory.as_ref(), &url, cache_key, chunk.clone());
-                return Ok(ScannedChunk {
-                    chunk,
+        if let Some(asset_data) = cache::read_asset_cached(&asset.url, cache_key) {
+            if asset_data.age_secs < super::processor::CACHE_FRESH_SECS {
+                let asset_data = Arc::new(asset_data.data);
+                write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
+                return Ok(ScannedAsset {
+                    asset: asset_data,
                     memory_hit: false,
                 });
             }
-            cached = Some(chunk);
+            cached = Some(asset_data);
         }
     }
 
-    let validators = cached.as_ref().map(|chunk| &chunk.validators);
-    match fetch_chunk_body(&client, url.clone(), allow_private, validators).await? {
+    let validators = cached.as_ref().map(|asset_data| &asset_data.validators);
+    match fetch_asset_body(&client, asset.clone(), allow_private, validators)
+        .await
+        .map_err(|_| asset.clone())?
+    {
         FetchedBody::NotModified => {
-            let cached = cached.ok_or(())?;
-            cache::write_chunk_with_validators(&url, &cached.data, cache_key, &cached.validators);
-            let chunk = Arc::new(cached.data);
-            write_memory_chunk(memory.as_ref(), &url, cache_key, chunk.clone());
-            Ok(ScannedChunk {
-                chunk,
+            let cached = cached.ok_or_else(|| asset.clone())?;
+            cache::write_asset_with_validators(
+                &asset.url,
+                &cached.data,
+                cache_key,
+                &cached.validators,
+            );
+            let asset_data = Arc::new(cached.data);
+            write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
+            Ok(ScannedAsset {
+                asset: asset_data,
                 memory_hit: false,
             })
         }
         FetchedBody::Body(scan, validators) => {
-            let chunk = Arc::new(scan);
+            let asset_data = Arc::new(scan);
             if use_cache {
-                cache::write_chunk_with_validators(&url, &chunk, cache_key, &validators);
-                write_memory_chunk(memory.as_ref(), &url, cache_key, chunk.clone());
+                cache::write_asset_with_validators(&asset.url, &asset_data, cache_key, &validators);
+                write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
             }
-            Ok(ScannedChunk {
-                chunk,
+            Ok(ScannedAsset {
+                asset: asset_data,
                 memory_hit: false,
             })
         }
     }
 }
 
-fn read_memory_chunk(
-    memory: Option<&ChunkMemoryCache>,
+fn read_memory_asset(
+    memory: Option<&AssetMemoryCache>,
     url: &Url,
     cache_key: Option<&str>,
-) -> Option<Arc<ChunkData>> {
+) -> Option<Arc<AssetData>> {
     let memory = memory?;
     let key = memory_key(url, cache_key);
     let mut entries = memory.write().ok()?;
-    let (chunk, written) = entries.get(&key).cloned()?;
+    let (asset, written) = entries.get(&key).cloned()?;
     if written.elapsed().as_secs() < super::processor::CACHE_FRESH_SECS {
-        Some(chunk)
+        Some(asset)
     } else {
         entries.pop(&key);
         None
     }
 }
 
-fn write_memory_chunk(
-    memory: Option<&ChunkMemoryCache>,
+fn write_memory_asset(
+    memory: Option<&AssetMemoryCache>,
     url: &Url,
     cache_key: Option<&str>,
-    chunk: Arc<ChunkData>,
+    asset: Arc<AssetData>,
 ) {
     if let Some(memory) = memory {
         if let Ok(mut entries) = memory.write() {
-            entries.put(memory_key(url, cache_key), (chunk, Instant::now()));
+            entries.put(memory_key(url, cache_key), (asset, Instant::now()));
         }
     }
 }
@@ -211,14 +227,14 @@ fn memory_key(url: &Url, cache_key: Option<&str>) -> String {
         .unwrap_or_else(|| url.as_str().to_string())
 }
 
-async fn fetch_chunk_body(
+async fn fetch_asset_body(
     client: &Client,
-    url: Url,
+    asset: AssetRef,
     allow_private: bool,
-    validators: Option<&cache::ChunkValidators>,
+    validators: Option<&cache::AssetValidators>,
 ) -> Result<FetchedBody, ()> {
-    net::validate_url(&url, allow_private).map_err(|_| ())?;
-    let mut request = client.get(url.clone());
+    net::validate_url(&asset.url, allow_private).map_err(|_| ())?;
+    let mut request = client.get(asset.url.clone());
     if let Some(validators) = validators {
         if let Some(etag) = &validators.etag {
             request = request.header(IF_NONE_MATCH, etag);
@@ -229,25 +245,35 @@ async fn fetch_chunk_body(
     }
 
     let response = request.send().await.map_err(|_| ())?;
-    if !FIRST_CHUNK_RESPONSE_TRACED.swap(true, Ordering::Relaxed) {
-        net::trace_response_version("chunk", &url, &response);
+    if !FIRST_ASSET_RESPONSE_TRACED.swap(true, Ordering::Relaxed) {
+        net::trace_response_version("asset", &asset.url, &response);
     }
-    if response.status() == StatusCode::NOT_MODIFIED {
+    let status = response.status();
+    if status == StatusCode::NOT_MODIFIED {
         return Ok(FetchedBody::NotModified);
     }
+    if !status.is_success() {
+        if asset.source == AssetSource::NextManifest {
+            return Ok(FetchedBody::Body(
+                DocumentScan::default(),
+                cache::AssetValidators::default(),
+            ));
+        }
+        return Err(());
+    }
 
-    let response = response.error_for_status().map_err(|_| ())?;
-    let validators = chunk_validators(response.headers());
+    let validators = asset_validators(response.headers());
     let body = net::read_limited(response).await.map_err(|_| ())?;
-    let scan_url = url.clone();
-    let scan = tokio::task::spawn_blocking(move || scan::scan_document(&body, &scan_url))
+    let scan_url = asset.url.clone();
+    let kind = asset.document_kind();
+    let scan = tokio::task::spawn_blocking(move || discover::scan_document(&body, &scan_url, kind))
         .await
         .map_err(|_| ())?;
     Ok(FetchedBody::Body(scan, validators))
 }
 
-fn chunk_validators(headers: &HeaderMap) -> cache::ChunkValidators {
-    cache::ChunkValidators {
+fn asset_validators(headers: &HeaderMap) -> cache::AssetValidators {
+    cache::AssetValidators {
         etag: header_value(headers, ETAG),
         last_modified: header_value(headers, LAST_MODIFIED),
     }
@@ -263,12 +289,13 @@ fn header_value(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discover::AssetKind;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     #[tokio::test]
-    async fn memory_cached_chunks_keep_recursive_refs() {
+    async fn memory_cached_assets_keep_recursive_refs() {
         let addr = serve(2, |req| {
             if req.starts_with("GET /_next/static/chunks/b.js ") {
                 r#"fetch("/api/b")"#
@@ -279,14 +306,14 @@ mod tests {
         .await;
 
         let client = Client::new();
-        let memory = chunk_memory_cache();
-        let initial = Url::parse(&format!("http://{addr}/_next/static/chunks/a.js")).unwrap();
+        let memory = asset_memory_cache();
+        let initial = script_asset(format!("http://{addr}/_next/static/chunks/a.js"));
 
         let mut first = ScanResult::default();
-        let first_stats = scan_chunks(
+        let first_stats = scan_assets(
             client.clone(),
             [initial.clone()],
-            ChunkScanOptions {
+            AssetScanOptions {
                 concurrency: 1,
                 use_processed_cache: true,
                 cache_key: Some("b1".into()),
@@ -301,10 +328,10 @@ mod tests {
         assert!(first.apis.contains_key("/api/b"));
 
         let mut second = ScanResult::default();
-        let second_stats = scan_chunks(
+        let second_stats = scan_assets(
             client,
             [initial],
-            ChunkScanOptions {
+            AssetScanOptions {
                 concurrency: 1,
                 use_processed_cache: true,
                 cache_key: Some("b1".into()),
@@ -340,12 +367,12 @@ mod tests {
         .await;
 
         let client = Client::new();
-        let initial = Url::parse(&format!("http://{addr}/_next/static/chunks/a.js")).unwrap();
+        let initial = script_asset(format!("http://{addr}/_next/static/chunks/a.js"));
         let mut found = ScanResult::default();
-        let stats = scan_chunks(
+        let stats = scan_assets(
             client,
             [initial],
-            ChunkScanOptions {
+            AssetScanOptions {
                 concurrency: 2,
                 use_processed_cache: false,
                 cache_key: None,
@@ -358,6 +385,14 @@ mod tests {
 
         assert_eq!(stats.discovered, 6);
         assert!(found.apis.contains_key("/api/f"));
+    }
+
+    fn script_asset(url: String) -> AssetRef {
+        AssetRef {
+            url: Url::parse(&url).unwrap(),
+            kind: AssetKind::Script,
+            source: AssetSource::Literal,
+        }
     }
 
     async fn serve(

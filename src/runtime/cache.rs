@@ -1,4 +1,4 @@
-use crate::scan::ScanResult;
+use crate::discover::{AssetRef, DocumentScan};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -7,8 +7,8 @@ use std::{
 };
 use url::Url;
 
-pub fn fingerprint(chunks: &[Url]) -> String {
-    let mut paths: Vec<&str> = chunks.iter().map(|u| u.path()).collect();
+pub fn fingerprint_assets(assets: &[AssetRef]) -> String {
+    let mut paths: Vec<&str> = assets.iter().map(|asset| asset.url.path()).collect();
     paths.sort();
 
     format!("{:016x}", hash_parts(paths.into_iter()))
@@ -31,48 +31,48 @@ pub fn path_for(base: &Url) -> PathBuf {
     hashed_path("processed", base, "json")
 }
 
-pub type ChunkData = ScanResult;
+pub type AssetData = DocumentScan;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
-pub struct ChunkValidators {
+pub struct AssetValidators {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_modified: Option<String>,
 }
 
-impl ChunkValidators {
+impl AssetValidators {
     pub fn is_empty(&self) -> bool {
         self.etag.is_none() && self.last_modified.is_none()
     }
 }
 
-pub struct CachedChunk {
-    pub data: ChunkData,
+pub struct CachedAsset {
+    pub data: AssetData,
     pub age_secs: u64,
-    pub validators: ChunkValidators,
+    pub validators: AssetValidators,
 }
 
-pub fn read_chunk_cached(url: &Url, cache_key: Option<&str>) -> Option<CachedChunk> {
-    let path = chunk_path_for(url, cache_key);
+pub fn read_asset_cached(url: &Url, cache_key: Option<&str>) -> Option<CachedAsset> {
+    let path = asset_path_for(url, cache_key);
     let (bytes, age_secs) = read_fresh(&path, super::processor::CACHE_STALE_SECS)?;
     let data = serde_json::from_slice(&bytes).ok()?;
-    Some(CachedChunk {
+    Some(CachedAsset {
         data,
         age_secs,
-        validators: read_chunk_validators(&path).unwrap_or_default(),
+        validators: read_asset_validators(&path).unwrap_or_default(),
     })
 }
 
-pub fn write_chunk_with_validators(
+pub fn write_asset_with_validators(
     url: &Url,
-    chunk: &ChunkData,
+    asset: &AssetData,
     cache_key: Option<&str>,
-    validators: &ChunkValidators,
+    validators: &AssetValidators,
 ) {
-    let path = chunk_path_for(url, cache_key);
-    write_json(&path, chunk);
-    write_chunk_validators(&path, validators);
+    let path = asset_path_for(url, cache_key);
+    write_json(&path, asset);
+    write_asset_validators(&path, validators);
 }
 
 pub fn read_page(url: &Url) -> Option<(Vec<u8>, Url)> {
@@ -91,8 +91,8 @@ pub fn write_page(url: &Url, final_url: &Url, bytes: &[u8]) {
     write_bytes(&sidecar_path(&path, ".url"), final_url.as_str().as_bytes());
 }
 
-fn chunk_path_for(url: &Url, cache_key: Option<&str>) -> PathBuf {
-    keyed_hashed_path("chunks", url, cache_key, "json")
+fn asset_path_for(url: &Url, cache_key: Option<&str>) -> PathBuf {
+    keyed_hashed_path("assets", url, cache_key, "json")
 }
 
 fn page_path_for(url: &Url) -> PathBuf {
@@ -119,9 +119,9 @@ fn host(url: &Url) -> String {
     url.host_str().unwrap_or("unknown").replace('/', "_")
 }
 
-pub fn read_build_bytes(path: &Path, build_id: Option<&str>) -> Option<Vec<u8>> {
-    let expected = build_id?;
-    (read_build_id(path)? == expected).then(|| fs::read(path).ok())?
+pub fn read_revision_bytes(path: &Path, revision: Option<&str>) -> Option<Vec<u8>> {
+    let expected = revision?;
+    (read_revision(path)? == expected).then(|| fs::read(path).ok())?
 }
 
 pub fn read_any_bytes(path: &Path) -> Option<(Vec<u8>, u64)> {
@@ -138,10 +138,10 @@ fn read_fresh(path: &Path, max_age_secs: u64) -> Option<(Vec<u8>, u64)> {
     Some((fs::read(path).ok()?, age))
 }
 
-pub fn write_with_build_id<T: Serialize>(path: &Path, value: &T, build_id: Option<&str>) {
+pub fn write_with_revision<T: Serialize>(path: &Path, value: &T, revision: Option<&str>) {
     write_json(path, value);
-    if let Some(build_id) = build_id {
-        write_bytes(&sidecar_path(path, ".build"), build_id.as_bytes());
+    if let Some(revision) = revision {
+        write_bytes(&sidecar_path(path, ".revision"), revision.as_bytes());
     }
 }
 
@@ -158,19 +158,19 @@ fn write_bytes(path: &Path, bytes: &[u8]) {
     let _ = write_private_file(path, bytes);
 }
 
-fn read_build_id(path: &Path) -> Option<String> {
-    let meta_path = sidecar_path(path, ".build");
+fn read_revision(path: &Path) -> Option<String> {
+    let meta_path = sidecar_path(path, ".revision");
     let bytes = fs::read(meta_path).ok()?;
     let id = std::str::from_utf8(&bytes).ok()?.trim_end();
     (!id.is_empty()).then(|| id.to_string())
 }
 
-fn read_chunk_validators(path: &Path) -> Option<ChunkValidators> {
+fn read_asset_validators(path: &Path) -> Option<AssetValidators> {
     let bytes = fs::read(sidecar_path(path, ".http")).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-fn write_chunk_validators(path: &Path, validators: &ChunkValidators) {
+fn write_asset_validators(path: &Path, validators: &AssetValidators) {
     let path = sidecar_path(path, ".http");
     if validators.is_empty() {
         let _ = fs::remove_file(path);
@@ -234,54 +234,47 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::{CandidateMap, RouteMap};
+    use crate::discover::{AssetKind, AssetSource, DocumentKind};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn chunk_cache_is_scoped_by_cache_key() {
+    fn asset_cache_is_scoped_by_cache_key() {
         let url = Url::parse(&format!(
             "https://example.com/_next/static/chunks/shared-{}.js",
             TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
         ))
         .unwrap();
-        let v1 = crate::scan::scan_document(br#"fetch("/api/v1")"#, &url).apis;
-        let v2 = crate::scan::scan_document(br#"fetch("/api/v2")"#, &url).apis;
+        let v1 = crate::discover::scan_document(br#"fetch("/api/v1")"#, &url, DocumentKind::Script);
+        let v2 = crate::discover::scan_document(br#"fetch("/api/v2")"#, &url, DocumentKind::Script);
 
-        write_chunk_with_validators(
-            &url,
-            &ChunkData {
-                apis: v1,
-                routes: RouteMap::default(),
-                candidates: CandidateMap::default(),
-                refs: Vec::new(),
-            },
-            Some("build-1"),
-            &ChunkValidators::default(),
-        );
-        write_chunk_with_validators(
-            &url,
-            &ChunkData {
-                apis: v2,
-                routes: RouteMap::default(),
-                candidates: CandidateMap::default(),
-                refs: Vec::new(),
-            },
-            Some("build-2"),
-            &ChunkValidators::default(),
-        );
+        write_asset_with_validators(&url, &v1, Some("build-1"), &AssetValidators::default());
+        write_asset_with_validators(&url, &v2, Some("build-2"), &AssetValidators::default());
 
-        assert!(read_chunk_cached(&url, Some("build-1"))
+        assert!(read_asset_cached(&url, Some("build-1"))
             .unwrap()
             .data
+            .findings
             .apis
             .contains_key("/api/v1"));
-        assert!(read_chunk_cached(&url, Some("build-2"))
+        assert!(read_asset_cached(&url, Some("build-2"))
             .unwrap()
             .data
+            .findings
             .apis
             .contains_key("/api/v2"));
+    }
+
+    #[test]
+    fn fingerprint_uses_asset_urls() {
+        let assets = vec![AssetRef {
+            url: Url::parse("https://example.com/assets/app.js").unwrap(),
+            kind: AssetKind::Script,
+            source: AssetSource::HtmlScript,
+        }];
+
+        assert_eq!(fingerprint_assets(&assets).len(), 16);
     }
 
     #[test]

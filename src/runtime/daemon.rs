@@ -46,7 +46,7 @@ pub struct DaemonReply {
 struct State {
     client: Client,
     memory: MemoryCache,
-    chunks: fetch::ChunkMemoryCache,
+    assets: fetch::AssetMemoryCache,
     redirects: RedirectMemory,
     inflight: Inflight,
 }
@@ -56,7 +56,7 @@ impl State {
         Self {
             client,
             memory: memory_cache(),
-            chunks: fetch::chunk_memory_cache(),
+            assets: fetch::asset_memory_cache(),
             redirects: redirect_cache(),
             inflight: Arc::new(Mutex::new(FxHashMap::default())),
         }
@@ -65,7 +65,7 @@ impl State {
     fn cache(&self) -> CacheContext {
         CacheContext {
             memory: Some(self.memory.clone()),
-            chunks: Some(self.chunks.clone()),
+            assets: Some(self.assets.clone()),
             redirects: Some(self.redirects.clone()),
             allow_private: super::net::allow_private_networks(),
         }

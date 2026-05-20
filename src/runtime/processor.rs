@@ -1,5 +1,5 @@
-use crate::scan;
-use crate::scan::{ApiMap, CandidateMap, RouteMap, ScanResult};
+use crate::discover::{self, DocumentKind};
+use crate::scan::{ApiMap, CandidateMap, RouteMap};
 
 use super::{cache, fetch, net};
 use lru::LruCache;
@@ -43,7 +43,7 @@ pub struct Output {
     #[serde(default, skip_serializing_if = "CandidateMap::is_empty")]
     pub candidates: CandidateMap,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub build_id: Option<String>,
+    pub revision: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cache: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,7 +71,7 @@ impl Output {
 #[derive(Clone, Default)]
 pub struct CacheContext {
     pub memory: Option<MemoryCache>,
-    pub chunks: Option<fetch::ChunkMemoryCache>,
+    pub assets: Option<fetch::AssetMemoryCache>,
     pub redirects: Option<RedirectMemory>,
     pub allow_private: bool,
 }
@@ -196,9 +196,20 @@ impl<'a> Processor<'a> {
             }
             (html, final_base)
         };
-        let html_build_id = scan::extract_build_id(&html);
-        if let (Some(path), Some(build_id), Some(t0)) = (cache_path, html_build_id.as_deref(), t0) {
-            if let Some(bytes) = cache::read_build_bytes(path, Some(build_id)) {
+        let scan_base = final_base.clone();
+        let root_scan = tokio::task::spawn_blocking(move || {
+            discover::scan_document(&html, &scan_base, DocumentKind::Html)
+        })
+        .await?;
+        let mut found = root_scan.findings;
+        let mut initial_assets = root_scan.assets;
+        let revision = root_scan
+            .revision
+            .clone()
+            .or_else(|| Some(cache::fingerprint_assets(&initial_assets)));
+
+        if let (Some(path), Some(revision), Some(t0)) = (cache_path, revision.as_deref(), t0) {
+            if let Some(bytes) = cache::read_revision_bytes(path, Some(revision)) {
                 return Ok((
                     serde_json::from_slice::<Output>(&bytes)?.mark(Some(t0), "hit", None),
                     true,
@@ -206,82 +217,32 @@ impl<'a> Processor<'a> {
             }
         }
 
-        let scan_base = final_base.clone();
-        let mut found =
-            tokio::task::spawn_blocking(move || scan::scan_document(&html, &scan_base)).await?;
-        let chunks = found.refs.clone();
-        let build_id = html_build_id
-            .clone()
-            .or_else(|| Some(cache::fingerprint(&chunks)));
-
-        if html_build_id.is_none() {
-            if let Some(path) = cache_path {
-                if let (Some(bytes), Some(t0)) =
-                    (cache::read_build_bytes(path, build_id.as_deref()), t0)
-                {
-                    return Ok((
-                        serde_json::from_slice::<Output>(&bytes)?.mark(Some(t0), "hit", None),
-                        true,
-                    ));
-                }
-            }
-        }
-
-        let manifest_task = html_build_id.clone().map(|build_id| {
-            let client = self.client.clone();
-            let base = final_base.clone();
-            let allow_private = cache_ctx.allow_private;
-            tokio::spawn(async move {
-                scan_next_manifests(&client, base, build_id, allow_private).await
-            })
-        });
-
-        let root_chunks = chunks.clone();
-        let chunk_options = || fetch::ChunkScanOptions {
+        let asset_options = || fetch::AssetScanOptions {
             concurrency: self.concurrency,
             use_processed_cache: cache_path.is_some(),
-            cache_key: build_id.clone(),
+            cache_key: revision.clone(),
             allow_private: cache_ctx.allow_private,
-            memory: cache_ctx.chunks.clone(),
+            memory: cache_ctx.assets.clone(),
         };
-        let chunk_stats = fetch::scan_chunks(
+        let asset_stats = fetch::scan_assets(
             self.client.clone(),
-            root_chunks.iter().cloned(),
-            chunk_options(),
-            &mut found,
-        )
-        .await;
-        let manifest = match manifest_task {
-            Some(task) => task.await.unwrap_or_default(),
-            None => ScanResult::default(),
-        };
-        found.merge_findings(&manifest);
-
-        let manifest_chunks = manifest
-            .refs
-            .into_iter()
-            .filter(|url| !root_chunks.contains(url))
-            .collect::<Vec<_>>();
-        let manifest_chunk_stats = fetch::scan_chunks(
-            self.client.clone(),
-            manifest_chunks,
-            chunk_options(),
+            initial_assets.drain(..),
+            asset_options(),
             &mut found,
         )
         .await;
         found.finalize();
         let mut warnings = Vec::new();
-        let failed_chunks = chunk_stats.failed + manifest_chunk_stats.failed;
-        if failed_chunks > 0 {
+        if asset_stats.failed > 0 {
             warnings.push(format!(
-                "failed to read {} chunks; results may be incomplete",
-                failed_chunks
+                "failed to read {} assets; results may be incomplete",
+                asset_stats.failed
             ));
         }
-        if chunk_stats.capped || manifest_chunk_stats.capped {
+        if asset_stats.capped {
             warnings.push(format!(
-                "stopped after {} discovered chunks; results may be incomplete",
-                chunk_stats.discovered + manifest_chunk_stats.discovered
+                "stopped after {} discovered assets; results may be incomplete",
+                asset_stats.discovered
             ));
         }
 
@@ -290,7 +251,7 @@ impl<'a> Processor<'a> {
                 apis: found.apis,
                 routes: found.routes,
                 candidates: found.candidates,
-                build_id,
+                revision,
                 cache: "miss".into(),
                 cache_age_secs: None,
                 elapsed_us: t0.map(|t| t.elapsed().as_micros()),
@@ -325,41 +286,6 @@ pub fn write_memory(memory: &MemoryCache, url: String, body: Body) {
         entries.put(url, (body, now));
         prune_memory(&mut entries, now);
     }
-}
-
-async fn scan_next_manifests(
-    client: &Client,
-    base: Url,
-    build_id: String,
-    allow_private: bool,
-) -> ScanResult {
-    let mut manifests = Vec::with_capacity(2);
-    for name in ["_buildManifest.js", "_ssgManifest.js"] {
-        let Ok(manifest_url) = base.join(&format!("/_next/static/{build_id}/{name}")) else {
-            continue;
-        };
-        let client = client.clone();
-        let fetch_url = manifest_url.clone();
-        manifests.push((
-            manifest_url,
-            tokio::spawn(async move { fetch_manifest(&client, fetch_url, allow_private).await }),
-        ));
-    }
-
-    let mut out = ScanResult::default();
-    for (manifest_url, task) in manifests {
-        let Ok(Some(body)) = task.await else {
-            continue;
-        };
-        out.merge(scan::scan_document(&body, &manifest_url));
-    }
-    out
-}
-
-async fn fetch_manifest(client: &Client, url: Url, allow_private: bool) -> Option<bytes::Bytes> {
-    net::get_bytes_limited(client, url, allow_private)
-        .await
-        .ok()
 }
 
 fn redirected_base(redirects: Option<&RedirectMemory>, base: &Url) -> Option<Url> {
@@ -410,7 +336,7 @@ fn write_caches(
     memory: Option<MemoryCache>,
 ) -> Result<()> {
     let cached = out.clone().mark(None, "", None);
-    cache::write_with_build_id(cache_path, &cached, out.build_id.as_deref());
+    cache::write_with_revision(cache_path, &cached, out.revision.as_deref());
     if let Some(memory) = memory {
         let body = Arc::from(out.to_json_string()?);
         write_memory(&memory, url.to_string(), body);
@@ -479,7 +405,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chunk_fetch_failures_are_reported_as_warnings() {
+    async fn generic_html_script_assets_are_scanned() {
+        let addr = serve(2, |req| {
+            if req.starts_with("GET /assets/app.js ") {
+                ("200 OK", r#"fetch("/api/from-generic-script")"#)
+            } else {
+                (
+                    "200 OK",
+                    r#"<script type="module" src="/assets/app.js"></script>"#,
+                )
+            }
+        })
+        .await;
+        let client = Client::new();
+        let out = Processor::new(
+            &client,
+            2,
+            CacheContext {
+                allow_private: true,
+                ..CacheContext::default()
+            },
+        )
+        .process_for_display(&format!("http://{addr}/"), true, Instant::now())
+        .await
+        .unwrap();
+
+        assert!(out.apis.contains_key("/api/from-generic-script"));
+    }
+
+    #[tokio::test]
+    async fn asset_fetch_failures_are_reported_as_warnings() {
         let addr = serve(3, |req| {
             if req.starts_with("GET /_next/static/chunks/app/ok.js ") {
                 ("200 OK", r#"fetch("/api/ok")"#)
@@ -509,7 +464,7 @@ mod tests {
         assert!(out.apis.contains_key("/api/ok"));
         assert_eq!(
             out.warnings,
-            vec!["failed to read 1 chunks; results may be incomplete"]
+            vec!["failed to read 1 assets; results may be incomplete"]
         );
     }
 
