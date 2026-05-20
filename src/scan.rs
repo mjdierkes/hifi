@@ -1,4 +1,4 @@
-use crate::literals::{BAD_EXTS, CALL_LITERALS, SHAPE_LITERALS};
+use crate::literals::{BAD_EXTS, CALL_LITERALS, METHOD_HINTS, SHAPE_LITERALS};
 use aho_corasick::AhoCorasick;
 use rustc_hash::FxHashMap;
 use serde::ser::{SerializeSeq, SerializeStruct, Serializer};
@@ -110,6 +110,19 @@ pub fn scan(bytes: &[u8], apis: &mut ApiMap) {
         let window = &bytes[ws..we];
 
         let entry = apis.entry(url.to_owned()).or_default();
+
+        // Method hint from the anchor itself (e.g. .post( → POST)
+        if let Some(Some(hint)) = METHOD_HINTS.get(m.pattern().as_usize()) {
+            entry.methods |= match *hint {
+                "GET" => METHOD_GET,
+                "POST" => METHOD_POST,
+                "PUT" => METHOD_PUT,
+                "DELETE" => METHOD_DELETE,
+                "PATCH" => METHOD_PATCH,
+                _ => 0,
+            };
+        }
+
         for sm in SHAPE_AC.find_iter(window) {
             match sm.pattern().as_usize() {
                 0 | 1 => entry.methods |= METHOD_POST,
@@ -150,7 +163,24 @@ fn extract_url_arg(bytes: &[u8], start: usize) -> Option<&str> {
         return None;
     }
 
-    let s = i + 1;
+    let mut s = i + 1;
+
+    // Template literal starting with `${expr}` — skip the expression so we
+    // can capture the literal suffix after it (e.g. `${base}/foo` → "/foo").
+    if quote == b'`' && s + 1 < bytes.len() && bytes[s] == b'$' && bytes[s + 1] == b'{' {
+        let mut j = s + 2;
+        let mut depth = 1;
+        while j < bytes.len() && depth > 0 {
+            match bytes[j] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        s = j;
+    }
+
     let mut e = s;
     while e < bytes.len() && bytes[e] != quote {
         if bytes[e] == b'\\' && e + 1 < bytes.len() {

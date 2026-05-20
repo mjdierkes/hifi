@@ -50,9 +50,14 @@ fn make_client(chunk_concurrency: usize) -> reqwest::Result<Client> {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(|s| s.as_str()) == Some("grep") {
+        return grep_cmd(&raw[1..]).await;
+    }
+
     let mut url = None;
     let (mut no_cache, mut no_daemon) = (false, false);
-    for arg in std::env::args().skip(1) {
+    for arg in raw {
         match arg.as_str() {
             "serve" => return serve().await,
             "--no-cache" => no_cache = true,
@@ -61,7 +66,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             _ => {}
         }
     }
-    let url = url.ok_or("usage: hifi <url> | hifi serve")?;
+    let url = url.ok_or("usage: hifi <url> | hifi serve | hifi grep <url> <pattern>")?;
 
     if !no_daemon {
         if let Some(json) = try_daemon(&url, no_cache).await {
@@ -372,4 +377,39 @@ async fn collect(
         insert_elapsed(obj, t0);
     }
     Ok((out, false))
+}
+
+async fn grep_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let mut url = None;
+    let mut pattern = None;
+    let mut context: usize = 60;
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "-C" | "--context" => {
+                context = iter
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(context);
+            }
+            _ if !a.starts_with("--") && url.is_none() => url = Some(a.clone()),
+            _ if !a.starts_with("--") && pattern.is_none() => pattern = Some(a.clone()),
+            _ => {}
+        }
+    }
+    let url = url.ok_or("usage: hifi grep <url> <pattern> [-C N]")?;
+    let pattern = pattern.ok_or("usage: hifi grep <url> <pattern> [-C N]")?;
+
+    let concurrency = chunk_concurrency();
+    let client = make_client(concurrency)?;
+    let base = Url::parse(&url)?;
+    let html = client.get(base.clone()).send().await?.bytes().await?;
+    let chunks = html::extract_chunks(&html, &base);
+
+    let hits = fetch::grep_chunks(client, chunks.into_iter(), concurrency, &pattern, context).await;
+    eprintln!("{} hits", hits.len());
+    for h in hits {
+        println!("{}@{}\t{}", h.url, h.offset, h.snippet);
+    }
+    Ok(())
 }
