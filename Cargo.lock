@@ -338,6 +338,7 @@ dependencies = [
  "aho-corasick",
  "bytes",
  "futures-util",
+ "libc",
  "lru",
  "memchr",
  "reqwest",

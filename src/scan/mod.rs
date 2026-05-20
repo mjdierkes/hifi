@@ -48,6 +48,7 @@ const METHODS: [(u8, &str); 5] = [
 const CONTENT_TYPES: [(u8, &str); 1] = [(CONTENT_JSON, "application/json")];
 const CANDIDATE_LITERALS: &[&str] = &["/api", "/graphql", "/trpc", "/_next/data"];
 const SHAPE_WINDOW: usize = 400;
+const STREAM_RETAIN: usize = 8192;
 
 #[derive(Default)]
 pub struct ScanResult {
@@ -112,83 +113,159 @@ struct PendingApi {
     expires_at: usize,
 }
 
-pub fn scan_document(bytes: &[u8], base: &Url) -> ScanResult {
-    let mut out = ScanResult::default();
-    let mut seen_refs = FxHashSet::default();
-    let mut recent_shapes: VecDeque<(usize, ShapeKind)> = VecDeque::new();
-    let mut pending: Vec<PendingApi> = Vec::new();
+struct DocumentScanState {
+    base: Url,
+    out: ScanResult,
+    seen_refs: FxHashSet<Url>,
+    recent_shapes: VecDeque<(usize, ShapeKind)>,
+    pending: Vec<PendingApi>,
+}
 
-    for m in DOCUMENT_AC.find_iter(bytes) {
-        let pos = m.start();
-        flush_pending(&mut pending, &mut out.apis, pos);
-        prune_recent_shapes(&mut recent_shapes, pos);
+impl DocumentScanState {
+    fn new(base: Url) -> Self {
+        Self {
+            base,
+            out: ScanResult::default(),
+            seen_refs: FxHashSet::default(),
+            recent_shapes: VecDeque::new(),
+            pending: Vec::new(),
+        }
+    }
 
+    fn scan_prefix(&mut self, bytes: &[u8], base_offset: usize, process_end: usize) {
+        for m in DOCUMENT_AC.find_iter(bytes) {
+            if m.start() >= process_end {
+                break;
+            }
+            let pos = base_offset + m.start();
+            flush_pending(&mut self.pending, &mut self.out.apis, pos);
+            prune_recent_shapes(&mut self.recent_shapes, pos);
+            self.handle_match(bytes, base_offset, m);
+        }
+
+        let end = base_offset + process_end;
+        flush_pending(&mut self.pending, &mut self.out.apis, end);
+        prune_recent_shapes(&mut self.recent_shapes, end);
+    }
+
+    fn handle_match(&mut self, bytes: &[u8], base_offset: usize, m: aho_corasick::Match) {
         let pattern = m.pattern().as_usize();
         if pattern < CALL_LITERALS.len() {
             let after = m.end();
             let Some(url) = extract_url_arg(bytes, after) else {
-                continue;
+                return;
             };
             if !is_url_like(url) {
-                continue;
+                return;
             }
 
             let mut shape = Shape::default();
             shape.methods |= method_hint(CALL_LITERALS[pattern]);
-            for (_, kind) in &recent_shapes {
+            for (_, kind) in &self.recent_shapes {
                 apply_shape_kind(&mut shape, *kind);
             }
-            pending.push(PendingApi {
+            self.pending.push(PendingApi {
                 url: url.to_owned(),
                 shape,
-                expires_at: after.saturating_add(SHAPE_WINDOW),
+                expires_at: base_offset + after + SHAPE_WINDOW,
             });
-            continue;
+            return;
         }
 
         let shape_start = CALL_LITERALS.len();
         let shape_end = shape_start + SHAPE_LITERALS.len();
         if pattern < shape_end {
+            let pos = base_offset + m.start();
             let kind = shape_kind(pattern - shape_start);
-            recent_shapes.push_back((pos, kind));
-            for pending in &mut pending {
+            self.recent_shapes.push_back((pos, kind));
+            for pending in &mut self.pending {
                 if pos <= pending.expires_at {
                     apply_shape_kind(&mut pending.shape, kind);
                 }
             }
-            continue;
+            return;
         }
 
         let candidate_start = shape_end;
         let candidate_end = candidate_start + CANDIDATE_LITERALS.len();
         if pattern < candidate_end {
-            if let Some(url) = extract_candidate_at(bytes, pos) {
-                out.candidates.entry(url).or_default();
+            if let Some(url) = extract_candidate_at(bytes, m.start()) {
+                self.out.candidates.entry(url).or_default();
             }
-            continue;
+            return;
         }
 
         if pattern == candidate_end {
-            let start = walk_chunk_url_start(bytes, pos);
-            let end = pos + chunk_url_len(&bytes[pos..], false);
+            let start = walk_chunk_url_start(bytes, m.start());
+            let end = m.start() + chunk_url_len(&bytes[m.start()..], false);
             push_chunk_ref(
                 &bytes[start..end],
-                base,
+                &self.base,
                 false,
-                &mut seen_refs,
-                &mut out.refs,
+                &mut self.seen_refs,
+                &mut self.out.refs,
             );
         } else {
-            if pos >= 7 && &bytes[pos - 7..pos] == b"/_next/" {
-                continue;
+            if m.start() >= 7 && &bytes[m.start() - 7..m.start()] == b"/_next/" {
+                return;
             }
-            let end = pos + chunk_url_len(&bytes[pos..], true);
-            push_chunk_ref(&bytes[pos..end], base, true, &mut seen_refs, &mut out.refs);
+            let end = m.start() + chunk_url_len(&bytes[m.start()..], true);
+            push_chunk_ref(
+                &bytes[m.start()..end],
+                &self.base,
+                true,
+                &mut self.seen_refs,
+                &mut self.out.refs,
+            );
         }
     }
 
-    flush_pending(&mut pending, &mut out.apis, usize::MAX);
-    out
+    fn finish(mut self) -> ScanResult {
+        flush_pending(&mut self.pending, &mut self.out.apis, usize::MAX);
+        self.out
+    }
+}
+
+pub struct StreamingDocumentScanner {
+    state: DocumentScanState,
+    buf: Vec<u8>,
+    base_offset: usize,
+}
+
+impl StreamingDocumentScanner {
+    pub fn new(base: Url) -> Self {
+        Self {
+            state: DocumentScanState::new(base),
+            buf: Vec::with_capacity(STREAM_RETAIN * 2),
+            base_offset: 0,
+        }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        if self.buf.len() <= STREAM_RETAIN {
+            return;
+        }
+
+        let process_end = self.buf.len() - STREAM_RETAIN;
+        self.state
+            .scan_prefix(&self.buf, self.base_offset, process_end);
+        self.buf.drain(..process_end);
+        self.base_offset += process_end;
+    }
+
+    pub fn finish(mut self) -> ScanResult {
+        let process_end = self.buf.len();
+        self.state
+            .scan_prefix(&self.buf, self.base_offset, process_end);
+        self.state.finish()
+    }
+}
+
+pub fn scan_document(bytes: &[u8], base: &Url) -> ScanResult {
+    let mut state = DocumentScanState::new(base.clone());
+    state.scan_prefix(bytes, 0, bytes.len());
+    state.finish()
 }
 
 fn flush_pending(pending: &mut Vec<PendingApi>, apis: &mut ApiMap, pos: usize) {

@@ -2,11 +2,11 @@ use crate::scan::{self, ApiMap, CandidateMap};
 
 use super::cache::{self, ChunkData};
 use super::net;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::stream::{self, FuturesUnordered, StreamExt};
 use lru::LruCache;
 use reqwest::header::{HeaderMap, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Response, StatusCode};
 use rustc_hash::FxHashSet;
 use std::{
     collections::VecDeque,
@@ -15,6 +15,7 @@ use std::{
     sync::{Arc, RwLock},
     time::Instant,
 };
+use tokio::sync::mpsc;
 use url::Url;
 
 const CHUNK_MEMORY_CACHE_MAX_ENTRIES: usize = 1024;
@@ -54,8 +55,14 @@ struct ScannedChunk {
 }
 
 enum FetchedBody {
-    Body(Bytes, cache::ChunkValidators),
+    Body(ScannedBody),
     NotModified,
+}
+
+struct ScannedBody {
+    data: ChunkData,
+    raw_body: Option<Bytes>,
+    validators: cache::ChunkValidators,
 }
 
 pub async fn scan_chunks(
@@ -137,6 +144,7 @@ pub async fn scan_chunks(
                 client.clone(),
                 url,
                 opts.use_processed_cache,
+                opts.use_bundle_cache && !opts.use_processed_cache,
                 opts.cache_key.as_deref(),
                 opts.allow_private,
                 opts.memory.clone(),
@@ -204,6 +212,7 @@ async fn fetch_scan(
     client: Client,
     url: Arc<Url>,
     use_processed_cache: bool,
+    keep_raw_body: bool,
     cache_key: Option<&str>,
     allow_private: bool,
     memory: Option<ChunkMemoryCache>,
@@ -234,7 +243,15 @@ async fn fetch_scan(
     }
 
     let validators = cached.as_ref().map(|chunk| &chunk.validators);
-    match fetch_chunk_body(&client, url.clone(), allow_private, validators).await? {
+    match fetch_chunk_body(
+        &client,
+        url.clone(),
+        allow_private,
+        validators,
+        keep_raw_body,
+    )
+    .await?
+    {
         FetchedBody::NotModified => {
             let cached = cached.ok_or(())?;
             cache::write_chunk_with_validators(&url, &cached.data, cache_key, &cached.validators);
@@ -247,16 +264,18 @@ async fn fetch_scan(
                 raw_body: None,
             })
         }
-        FetchedBody::Body(body, validators) => {
-            scan_body(
-                body,
+        FetchedBody::Body(scanned) => {
+            let chunk = Arc::new(scanned.data);
+            if use_processed_cache {
+                cache::write_chunk_with_validators(&url, &chunk, cache_key, &scanned.validators);
+                write_memory_chunk(memory.as_ref(), &url, cache_key, chunk.clone());
+            }
+            Ok(ScannedChunk {
                 url,
-                use_processed_cache,
-                cache_key,
-                memory,
-                validators,
-            )
-            .await
+                chunk,
+                memory_hit: false,
+                raw_body: scanned.raw_body,
+            })
         }
     }
 }
@@ -334,6 +353,7 @@ async fn fetch_chunk_body(
     url: Arc<Url>,
     allow_private: bool,
     validators: Option<&cache::ChunkValidators>,
+    keep_raw_body: bool,
 ) -> Result<FetchedBody, ()> {
     net::validate_url(&url, allow_private).map_err(|_| ())?;
     let mut request = client.get(url.as_ref().clone());
@@ -356,8 +376,58 @@ async fn fetch_chunk_body(
 
     let response = response.error_for_status().map_err(|_| ())?;
     let validators = chunk_validators(response.headers());
-    let body = net::read_limited(response).await.map_err(|_| ())?;
-    Ok(FetchedBody::Body(body, validators))
+    let scanned = read_scan_limited(response, url, keep_raw_body, validators).await?;
+    Ok(FetchedBody::Body(scanned))
+}
+
+async fn read_scan_limited(
+    response: Response,
+    base: Arc<Url>,
+    keep_raw_body: bool,
+    validators: cache::ChunkValidators,
+) -> Result<ScannedBody, ()> {
+    let content_length = response.content_length();
+    if content_length.is_some_and(|len| len > net::MAX_RESPONSE_BYTES) {
+        return Err(());
+    }
+
+    let (tx, mut rx) = mpsc::channel::<Bytes>(2);
+    let scan_base = base.as_ref().clone();
+    let scan_task = tokio::task::spawn_blocking(move || {
+        let mut scanner = scan::StreamingDocumentScanner::new(scan_base);
+        while let Some(chunk) = rx.blocking_recv() {
+            scanner.push(&chunk);
+        }
+        scanner.finish()
+    });
+
+    let mut body =
+        keep_raw_body.then(|| BytesMut::with_capacity(content_length.unwrap_or(0) as usize));
+    let mut total = 0_u64;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ())?;
+        total = total.saturating_add(chunk.len() as u64);
+        if total > net::MAX_RESPONSE_BYTES {
+            return Err(());
+        }
+        if let Some(body) = &mut body {
+            body.extend_from_slice(&chunk);
+        }
+        tx.send(chunk).await.map_err(|_| ())?;
+    }
+    drop(tx);
+
+    let result = scan_task.await.map_err(|_| ())?;
+    Ok(ScannedBody {
+        data: ChunkData {
+            apis: result.apis,
+            candidates: result.candidates,
+            refs: result.refs,
+        },
+        raw_body: body.map(BytesMut::freeze),
+        validators,
+    })
 }
 
 fn chunk_validators(headers: &HeaderMap) -> cache::ChunkValidators {

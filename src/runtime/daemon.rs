@@ -147,8 +147,20 @@ fn socket_path() -> PathBuf {
 }
 
 fn private_runtime_dir() -> PathBuf {
-    let uid = std::env::var("UID").unwrap_or_else(|_| std::process::id().to_string());
+    let uid = user_id();
     std::env::temp_dir().join(format!("hifi-{uid}"))
+}
+
+#[cfg(unix)]
+fn user_id() -> String {
+    unsafe { libc::getuid() }.to_string()
+}
+
+#[cfg(not(unix))]
+fn user_id() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| std::process::id().to_string())
 }
 
 #[cfg(unix)]

@@ -11,6 +11,7 @@ bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 memchr = "2"
 lru = "0.16"
+libc = "0.2"
 rustc-hash = "2"
 serde_json = "1"
 thiserror = "2"

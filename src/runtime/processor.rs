@@ -4,6 +4,7 @@ use crate::scan::{ApiMap, CandidateMap};
 use super::{cache, fetch, net};
 use lru::LruCache;
 use reqwest::Client;
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use std::{
     num::NonZeroUsize,
@@ -90,6 +91,13 @@ pub struct Processor<'a> {
     client: &'a Client,
     concurrency: usize,
     cache: CacheContext,
+}
+
+#[derive(Default)]
+struct ManifestScan {
+    apis: ApiMap,
+    candidates: CandidateMap,
+    chunks: Vec<Url>,
 }
 
 impl<'a> Processor<'a> {
@@ -213,7 +221,7 @@ impl<'a> Processor<'a> {
         let scan_base = final_base.clone();
         let html_result =
             tokio::task::spawn_blocking(move || scan::scan_document(&html, &scan_base)).await?;
-        let mut chunks = html_result.refs;
+        let chunks = html_result.refs;
         let build_id = html_build_id
             .clone()
             .or_else(|| Some(cache::fingerprint(&chunks)));
@@ -231,31 +239,21 @@ impl<'a> Processor<'a> {
             }
         }
 
-        let _prewarm_task = chunks.first().cloned().map(|url| {
-            tokio::spawn(net::prewarm_connection(
-                self.client.clone(),
-                url,
-                cache_ctx.allow_private,
-            ))
+        let manifest_task = html_build_id.clone().map(|build_id| {
+            let client = self.client.clone();
+            let base = final_base.clone();
+            let allow_private = cache_ctx.allow_private;
+            tokio::spawn(async move {
+                scan_next_manifests(&client, base, build_id, allow_private).await
+            })
         });
 
-        let mut manifest_apis = ApiMap::default();
-        let mut manifest_candidates = CandidateMap::default();
-        scan_next_manifests(
-            self.client,
-            &final_base,
-            html_build_id.as_deref(),
-            cache_ctx.allow_private,
-            &mut manifest_apis,
-            &mut manifest_candidates,
-            &mut chunks,
-        )
-        .await;
         let mut apis = html_result.apis;
         let mut candidates = html_result.candidates;
+        let root_chunks = chunks.clone();
         let chunk_stats = fetch::scan_chunks(
             self.client.clone(),
-            chunks.iter().cloned(),
+            root_chunks.iter().cloned(),
             fetch::ChunkScanOptions {
                 concurrency: self.concurrency,
                 use_processed_cache: cache_path.is_some(),
@@ -268,22 +266,49 @@ impl<'a> Processor<'a> {
             &mut candidates,
         )
         .await;
-        scan::merge_into(&mut apis, manifest_apis);
-        scan::merge_candidates_into(&mut candidates, manifest_candidates);
+        let manifest = match manifest_task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => ManifestScan::default(),
+        };
+        scan::merge_into(&mut apis, manifest.apis);
+        scan::merge_candidates_into(&mut candidates, manifest.candidates);
+
+        let root_chunk_set = root_chunks.iter().collect::<FxHashSet<_>>();
+        let manifest_chunks = manifest
+            .chunks
+            .into_iter()
+            .filter(|url| !root_chunk_set.contains(url))
+            .collect::<Vec<_>>();
+        let manifest_chunk_stats = fetch::scan_chunks(
+            self.client.clone(),
+            manifest_chunks,
+            fetch::ChunkScanOptions {
+                concurrency: self.concurrency,
+                use_processed_cache: cache_path.is_some(),
+                use_bundle_cache: cache_path.is_some(),
+                cache_key: build_id.clone(),
+                allow_private: cache_ctx.allow_private,
+                memory: cache_ctx.chunks.clone(),
+            },
+            &mut apis,
+            &mut candidates,
+        )
+        .await;
         for url in apis.keys() {
             candidates.remove(url);
         }
         let mut warnings = Vec::new();
-        if chunk_stats.failed > 0 {
+        let failed_chunks = chunk_stats.failed + manifest_chunk_stats.failed;
+        if failed_chunks > 0 {
             warnings.push(format!(
                 "failed to read {} chunks; results may be incomplete",
-                chunk_stats.failed
+                failed_chunks
             ));
         }
-        if chunk_stats.capped {
+        if chunk_stats.capped || manifest_chunk_stats.capped {
             warnings.push(format!(
                 "stopped after {} discovered chunks; results may be incomplete",
-                chunk_stats.discovered
+                chunk_stats.discovered + manifest_chunk_stats.discovered
             ));
         }
 
@@ -330,17 +355,10 @@ pub fn write_memory(memory: &MemoryCache, url: String, body: Body) {
 
 async fn scan_next_manifests(
     client: &Client,
-    base: &Url,
-    build_id: Option<&str>,
+    base: Url,
+    build_id: String,
     allow_private: bool,
-    apis: &mut ApiMap,
-    candidates: &mut CandidateMap,
-    chunks: &mut Vec<Url>,
-) {
-    let Some(build_id) = build_id else {
-        return;
-    };
-
+) -> ManifestScan {
     let mut manifests = Vec::with_capacity(2);
     for name in ["_buildManifest.js", "_ssgManifest.js"] {
         let Ok(manifest_url) = base.join(&format!("/_next/static/{build_id}/{name}")) else {
@@ -354,15 +372,17 @@ async fn scan_next_manifests(
         ));
     }
 
+    let mut out = ManifestScan::default();
     for (manifest_url, task) in manifests {
         let Ok(Some(body)) = task.await else {
             continue;
         };
         let result = scan::scan_document(&body, &manifest_url);
-        scan::merge_into(apis, result.apis);
-        scan::merge_candidates_into(candidates, result.candidates);
-        chunks.extend(result.refs);
+        scan::merge_into(&mut out.apis, result.apis);
+        scan::merge_candidates_into(&mut out.candidates, result.candidates);
+        out.chunks.extend(result.refs);
     }
+    out
 }
 
 async fn fetch_manifest(client: &Client, url: Url, allow_private: bool) -> Option<bytes::Bytes> {

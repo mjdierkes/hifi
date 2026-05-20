@@ -1,4 +1,8 @@
-use hifi::scan::{scan, scan_candidates, scan_document, ApiMap, CandidateMap};
+use hifi::scan::{
+    scan, scan_candidates, scan_document, ApiMap, CandidateMap, ScanResult,
+    StreamingDocumentScanner,
+};
+use serde_json::Value;
 use url::Url;
 
 #[test]
@@ -101,8 +105,65 @@ fn fused_scan_collects_apis_candidates_and_chunk_refs() {
         .any(|url| url.as_str().ends_with("app/dashboard-deadbeef.js")));
 }
 
+#[test]
+fn streaming_scan_matches_full_scan_across_split_boundaries() {
+    let base = Url::parse("https://example.com/_next/static/chunks/app/main.js").unwrap();
+    let body = br#"
+        fetch("/api/users", {method:"POST", headers:{"Content-Type":"application/json"}});
+        const route=`/api/team/${id}`;
+        self.__next_f.push([1,/_next/data/b1/raw.json]);
+        e.u=function(e){return"static/chunks/app/dashboard-deadbeef.js"};
+    "#;
+    let expected = comparable(scan_document(body, &base));
+
+    for split in 0..=body.len() {
+        let mut scanner = StreamingDocumentScanner::new(base.clone());
+        scanner.push(&body[..split]);
+        scanner.push(&body[split..]);
+        assert_eq!(comparable(scanner.finish()), expected, "split at {split}");
+    }
+}
+
+#[test]
+fn streaming_scan_processes_incremental_prefixes_without_losing_context() {
+    let base = Url::parse("https://example.com/_next/static/chunks/app/main.js").unwrap();
+    let mut body = Vec::new();
+    body.extend_from_slice(&vec![b'a'; 9000]);
+    body.extend_from_slice(
+        br#"
+        const headers={"Content-Type":"application/json"};
+        fetch("/api/late", {method:"POST", headers});
+        const nested="static/chunks/app/late.js";
+    "#,
+    );
+    body.extend_from_slice(&vec![b'b'; 9000]);
+    body.extend_from_slice(br#"const candidate="/api/final/${team}";"#);
+    let expected = comparable(scan_document(&body, &base));
+
+    let mut scanner = StreamingDocumentScanner::new(base);
+    for chunk in body.chunks(137) {
+        scanner.push(chunk);
+    }
+
+    assert_eq!(comparable(scanner.finish()), expected);
+}
+
 fn scanned(bytes: &[u8]) -> ApiMap {
     let mut apis = ApiMap::default();
     scan(bytes, &mut apis);
     apis
+}
+
+fn comparable(result: ScanResult) -> Value {
+    let mut refs = result
+        .refs
+        .iter()
+        .map(|url| url.as_str().to_string())
+        .collect::<Vec<_>>();
+    refs.sort();
+    serde_json::json!({
+        "apis": result.apis,
+        "candidates": result.candidates,
+        "refs": refs,
+    })
 }
