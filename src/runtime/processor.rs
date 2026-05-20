@@ -55,18 +55,18 @@ impl<'a> Processor<'a> {
         let request_base =
             redirected_base(active_cache.redirects.as_ref(), &base).unwrap_or_else(|| base.clone());
 
-        if !no_cache {
-            if let Some((v, age)) = cache::read_any(&cache_path) {
-                if age < CACHE_STALE_SECS {
-                    let status = if age < CACHE_FRESH_SECS {
-                        "fresh"
-                    } else {
-                        self.spawn_refresh(url, active_cache.clone());
-                        "stale"
-                    };
-                    return Ok(annotate(v, t0, status, age));
-                }
-            }
+        if let Some((v, age)) = (!no_cache)
+            .then(|| cache::read_any(&cache_path))
+            .flatten()
+            .filter(|(_, age)| *age < CACHE_STALE_SECS)
+        {
+            let status = if age < CACHE_FRESH_SECS {
+                "fresh"
+            } else {
+                self.spawn_refresh(url, active_cache.clone());
+                "stale"
+            };
+            return Ok(annotate(v, t0, status, age));
         }
 
         let (out, cache_hit) = self
@@ -203,12 +203,11 @@ fn remember_redirect(redirects: Option<&RedirectMemory>, from: &Url, to: &Url) {
     if from_key == to_key {
         return;
     }
-    let Some(to_origin) = origin_url(to) else {
-        return;
-    };
     if let Some(redirects) = redirects {
         if let Ok(mut entries) = redirects.write() {
-            entries.insert(from_key, to_origin);
+            if let Ok(to_origin) = Url::parse(&format!("{to_key}/")) {
+                entries.insert(from_key, to_origin);
+            }
         }
     }
 }
@@ -221,23 +220,19 @@ fn origin_key(url: &Url) -> Option<String> {
     }
 }
 
-fn origin_url(url: &Url) -> Option<Url> {
-    Url::parse(&format!("{}/", origin_key(url)?)).ok()
-}
-
 fn write_caches(
     cache_path: &Path,
     out: &Value,
     url: &str,
     memory: Option<MemoryCache>,
 ) -> Result<(), Box<dyn Error>> {
-    let bytes = cache::write(cache_path, out);
+    cache::write(cache_path, out);
     if let Some(memory) = memory {
-        let body = match bytes {
-            Some(bytes) => Arc::from(String::from_utf8(bytes)?),
-            None => Arc::from(serde_json::to_string(out)?),
-        };
-        write_memory(&memory, url.to_string(), body);
+        write_memory(
+            &memory,
+            url.to_string(),
+            Arc::from(serde_json::to_string(out)?),
+        );
     }
     Ok(())
 }

@@ -78,14 +78,14 @@ pub fn read_any(path: &std::path::Path) -> Option<(serde_json::Value, u64)> {
     Some((v, age))
 }
 
-pub fn write(path: &std::path::Path, value: &serde_json::Value) -> Option<Vec<u8>> {
+pub fn write(path: &std::path::Path, value: &serde_json::Value) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let bytes = serde_json::to_vec(value).ok()?;
-    let _ = std::fs::write(path, &bytes);
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        let _ = std::fs::write(path, bytes);
+    }
     write_meta(path, value);
-    Some(bytes)
 }
 
 fn read_build_id(path: &std::path::Path) -> Option<String> {

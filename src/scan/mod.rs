@@ -27,6 +27,7 @@ const METHODS: [(u8, &str); 5] = [
     (METHOD_DELETE, "DELETE"),
     (METHOD_PATCH, "PATCH"),
 ];
+const CONTENT_TYPES: [(u8, &str); 1] = [(CONTENT_JSON, "application/json")];
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Shape {
@@ -46,40 +47,41 @@ pub struct Shape {
 }
 
 fn serialize_methods<S: serde::Serializer>(bits: &u8, s: S) -> Result<S::Ok, S::Error> {
-    METHODS
+    serialize_flags(bits, &METHODS, s)
+}
+
+fn serialize_content_types<S: serde::Serializer>(bits: &u8, s: S) -> Result<S::Ok, S::Error> {
+    serialize_flags(bits, &CONTENT_TYPES, s)
+}
+
+fn serialize_flags<S: serde::Serializer>(
+    bits: &u8,
+    flags: &[(u8, &str)],
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    flags
         .iter()
-        .filter_map(|(bit, method)| (bits & bit != 0).then_some(*method))
+        .filter_map(|(bit, name)| (bits & bit != 0).then_some(*name))
         .collect::<Vec<_>>()
         .serialize(s)
 }
 
-fn serialize_content_types<S: serde::Serializer>(bits: &u8, s: S) -> Result<S::Ok, S::Error> {
-    let content_types = ["application/json"];
-    content_types[..(bits & CONTENT_JSON != 0) as usize].serialize(s)
-}
-
 fn deserialize_methods<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
-    let methods = Vec::<String>::deserialize(d)?;
-    let mut bits = 0;
-    for method in methods {
-        bits |= match method.as_str() {
-            "GET" => METHOD_GET,
-            "POST" => METHOD_POST,
-            "PUT" => METHOD_PUT,
-            "DELETE" => METHOD_DELETE,
-            "PATCH" => METHOD_PATCH,
-            _ => 0,
-        };
-    }
-    Ok(bits)
+    deserialize_flags(d, &METHODS)
 }
 
 fn deserialize_content_types<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
-    let content_types = Vec::<String>::deserialize(d)?;
+    deserialize_flags(d, &CONTENT_TYPES)
+}
+
+fn deserialize_flags<'de, D: serde::Deserializer<'de>>(
+    d: D,
+    flags: &[(u8, &str)],
+) -> Result<u8, D::Error> {
     let mut bits = 0;
-    for content_type in content_types {
-        if content_type == "application/json" {
-            bits |= CONTENT_JSON;
+    for value in Vec::<String>::deserialize(d)? {
+        if let Some((bit, _)) = flags.iter().find(|(_, name)| *name == value) {
+            bits |= *bit;
         }
     }
     Ok(bits)

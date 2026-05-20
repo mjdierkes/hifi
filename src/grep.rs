@@ -34,8 +34,8 @@ pub async fn run(
 
     let hits = grep_chunks(client, chunks.into_iter(), concurrency, &pattern, context).await;
     eprintln!("{} hits", hits.len());
-    for h in hits {
-        println!("{}@{}\t{}", h.url, h.offset, h.snippet);
+    for (url, offset, snippet) in hits {
+        println!("{url}@{offset}\t{snippet}");
     }
     Ok(())
 }
@@ -46,7 +46,7 @@ async fn grep_chunks(
     concurrency: usize,
     pattern: &str,
     context: usize,
-) -> Vec<GrepHit> {
+) -> Vec<(String, usize, String)> {
     let pat = std::sync::Arc::new(pattern.to_string());
     let mut searched = stream::iter(chunks)
         .map(|url| grep_one(client.clone(), url, pat.clone(), context))
@@ -59,18 +59,12 @@ async fn grep_chunks(
     hits
 }
 
-struct GrepHit {
-    url: String,
-    offset: usize,
-    snippet: String,
-}
-
 async fn grep_one(
     client: Client,
     url: Url,
     pattern: std::sync::Arc<String>,
     context: usize,
-) -> Vec<GrepHit> {
+) -> Vec<(String, usize, String)> {
     let Ok(resp) = client.get(url.clone()).send().await else {
         return Vec::new();
     };
@@ -91,11 +85,7 @@ async fn grep_one(
         let lo = abs.saturating_sub(context);
         let hi = (abs + pat_bytes.len() + context).min(bytes.len());
         let snippet = String::from_utf8_lossy(&bytes[lo..hi]).replace('\n', " ");
-        hits.push(GrepHit {
-            url: url.to_string(),
-            offset: abs,
-            snippet,
-        });
+        hits.push((url.to_string(), abs, snippet));
     }
     hits
 }

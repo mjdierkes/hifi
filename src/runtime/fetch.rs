@@ -24,11 +24,6 @@ pub struct ChunkScanStats {
     pub errors: usize,
 }
 
-struct ChunkResult {
-    data: Arc<ChunkData>,
-    source: ChunkSource,
-}
-
 enum ChunkSource {
     Fetched,
     Disk,
@@ -61,10 +56,10 @@ pub async fn scan_chunks(
 
         while let Some(res) = fetched.next().await {
             match res {
-                Ok(chunk) => {
-                    stats.record(chunk.source);
-                    scan::merge_refs_into(apis, chunk.data.apis.iter());
-                    enqueue_refs(&chunk.data.refs, &mut visited, &mut queue);
+                Ok((chunk, source)) => {
+                    stats.record(source);
+                    scan::merge_refs_into(apis, chunk.apis.iter());
+                    enqueue_refs(&chunk.refs, &mut visited, &mut queue);
                 }
                 Err(()) => stats.errors += 1,
             }
@@ -101,20 +96,14 @@ async fn fetch_scan(
     url: Url,
     use_cache: bool,
     memory: Option<ChunkMemoryCache>,
-) -> Result<ChunkResult, ()> {
+) -> Result<(Arc<ChunkData>, ChunkSource), ()> {
     if use_cache {
         if let Some(chunk) = read_memory_chunk(memory.as_ref(), &url) {
-            return Ok(ChunkResult {
-                data: chunk,
-                source: ChunkSource::Memory,
-            });
+            return Ok((chunk, ChunkSource::Memory));
         }
         if let Some(chunk) = cache::read_chunk(&url).map(Arc::new) {
             write_memory_chunk(memory.as_ref(), &url, chunk.clone());
-            return Ok(ChunkResult {
-                data: chunk,
-                source: ChunkSource::Disk,
-            });
+            return Ok((chunk, ChunkSource::Disk));
         }
     }
 
@@ -134,10 +123,7 @@ async fn fetch_scan(
         cache::write_chunk(&url, &chunk);
         write_memory_chunk(memory.as_ref(), &url, chunk.clone());
     }
-    Ok(ChunkResult {
-        data: chunk,
-        source: ChunkSource::Fetched,
-    })
+    Ok((chunk, ChunkSource::Fetched))
 }
 
 fn read_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url) -> Option<Arc<ChunkData>> {
