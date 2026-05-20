@@ -1,8 +1,7 @@
-use crate::{
-    cache::{self, ChunkData},
-    html,
-    scan::{self, ApiMap},
-};
+use crate::scan::html;
+use crate::scan::{self, ApiMap};
+
+use super::cache::{self, ChunkData};
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;

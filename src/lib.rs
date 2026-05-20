@@ -1,9 +1,7 @@
 pub mod app;
-pub mod cache;
-pub mod daemon;
-pub mod fetch;
 pub mod grep;
-pub mod html;
-pub mod literals;
-pub mod processor;
+pub mod runtime;
 pub mod scan;
+
+pub use runtime::{cache, daemon, fetch, processor};
+pub use scan::{html, literals};

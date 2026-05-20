@@ -1,4 +1,4 @@
-use crate::literals::SKIPPED_CHUNK_FRAGMENTS;
+use super::literals::SKIPPED_CHUNK_FRAGMENTS;
 use memchr::memmem;
 use rustc_hash::FxHashSet;
 use url::Url;

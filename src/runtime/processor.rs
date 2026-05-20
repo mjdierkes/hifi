@@ -1,5 +1,7 @@
 use crate::scan::ApiMap;
-use crate::{cache, fetch, html, scan};
+use crate::scan::{self, html};
+
+use super::{cache, fetch};
 use reqwest::Client;
 use rustc_hash::FxHashMap;
 use serde_json::{json, Value};

@@ -1,4 +1,4 @@
-use crate::html;
+use crate::scan::html;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use std::error::Error;

@@ -1,4 +1,4 @@
-use crate::literals::{BAD_EXTS, CALL_LITERALS, SHAPE_LITERALS};
+use self::literals::{BAD_EXTS, CALL_LITERALS, SHAPE_LITERALS};
 use aho_corasick::AhoCorasick;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,9 @@ static SHAPE_AC: LazyLock<AhoCorasick> =
     LazyLock::new(|| AhoCorasick::new(SHAPE_LITERALS).expect("valid shape literals"));
 
 pub type ApiMap = FxHashMap<String, Shape>;
+
+pub mod html;
+pub mod literals;
 
 const METHOD_GET: u8 = 1 << 0;
 const METHOD_POST: u8 = 1 << 1;

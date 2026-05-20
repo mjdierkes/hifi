@@ -1,5 +1,5 @@
-use crate::fetch;
-use crate::processor::{
+use super::fetch;
+use super::processor::{
     read_memory, write_memory, Body, CacheContext, MemoryCache, Processor, RedirectMemory,
     CACHE_FRESH_SECS, CACHE_STALE_SECS,
 };

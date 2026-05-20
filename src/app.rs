@@ -1,5 +1,6 @@
-use crate::processor::{CacheContext, Processor, CACHE_FRESH_SECS};
-use crate::{daemon, grep};
+use crate::grep;
+use crate::runtime::daemon;
+use crate::runtime::processor::{CacheContext, Processor, CACHE_FRESH_SECS};
 use reqwest::Client;
 use std::{error::Error, time::Duration};
 
