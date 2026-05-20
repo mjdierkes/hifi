@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 use serde_json::{json, Value};
 use std::{
     error::Error,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Instant,
 };
@@ -17,6 +17,7 @@ pub const CACHE_FRESH_SECS: u64 = 300;
 pub const CACHE_STALE_SECS: u64 = 3600;
 const MEMORY_CACHE_MAX_ENTRIES: usize = 256;
 
+type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
 pub type Body = Arc<str>;
 pub type MemoryCache = Arc<RwLock<FxHashMap<String, (Body, Instant)>>>;
 pub type RedirectMemory = Arc<RwLock<FxHashMap<String, Url>>>;
@@ -43,17 +44,9 @@ impl<'a> Processor<'a> {
         }
     }
 
-    pub async fn process(
-        &self,
-        url: &str,
-        no_cache: bool,
-        t0: Instant,
-    ) -> Result<Value, Box<dyn Error>> {
-        let base = Url::parse(url)?;
-        let cache_path = cache::path_for(&base);
+    pub async fn process(&self, url: &str, no_cache: bool, t0: Instant) -> Result<Value> {
         let active_cache = (!no_cache).then(|| self.cache.clone()).unwrap_or_default();
-        let request_base =
-            redirected_base(active_cache.redirects.as_ref(), &base).unwrap_or_else(|| base.clone());
+        let (base, cache_path, request_base) = request_parts(url, &active_cache)?;
 
         if let Some((v, age)) = (!no_cache)
             .then(|| cache::read_any(&cache_path))
@@ -63,7 +56,7 @@ impl<'a> Processor<'a> {
             let status = if age < CACHE_FRESH_SECS {
                 "fresh"
             } else {
-                self.spawn_refresh(url, active_cache.clone());
+                self.refresh_later(url, active_cache.clone());
                 "stale"
             };
             return Ok(annotate(v, t0, status, age));
@@ -86,22 +79,8 @@ impl<'a> Processor<'a> {
         Ok(out)
     }
 
-    fn spawn_refresh(&self, url: &str, cache: CacheContext) {
-        let client = self.client.clone();
-        let url = url.to_string();
-        let concurrency = self.concurrency;
-        tokio::spawn(async move {
-            let _ = Processor::new(&client, concurrency, cache)
-                .refresh(&url)
-                .await;
-        });
-    }
-
-    pub async fn refresh(&self, url: &str) -> Result<(), Box<dyn Error>> {
-        let base = Url::parse(url)?;
-        let request_base =
-            redirected_base(self.cache.redirects.as_ref(), &base).unwrap_or_else(|| base.clone());
-        let cache_path = cache::path_for(&base);
+    pub async fn refresh(&self, url: &str) -> Result<()> {
+        let (base, cache_path, request_base) = request_parts(url, &self.cache)?;
         let (out, _) = self
             .collect(
                 url,
@@ -115,6 +94,10 @@ impl<'a> Processor<'a> {
         write_caches(&cache_path, &out, url, self.cache.memory.clone())
     }
 
+    fn refresh_later(&self, url: &str, cache: CacheContext) {
+        spawn_refresh(self.client.clone(), self.concurrency, url, cache);
+    }
+
     async fn collect(
         &self,
         url: &str,
@@ -123,7 +106,7 @@ impl<'a> Processor<'a> {
         cache_path: Option<&Path>,
         t0: Option<Instant>,
         cache_ctx: CacheContext,
-    ) -> Result<(Value, bool), Box<dyn Error>> {
+    ) -> Result<(Value, bool)> {
         let response = self.client.get(request_base.clone()).send().await?;
         let final_base = response.url().clone();
         remember_redirect(cache_ctx.redirects.as_ref(), original_base, &final_base);
@@ -170,6 +153,15 @@ impl<'a> Processor<'a> {
     }
 }
 
+pub fn spawn_refresh(client: Client, concurrency: usize, url: &str, cache: CacheContext) {
+    let url = url.to_string();
+    tokio::spawn(async move {
+        let _ = Processor::new(&client, concurrency, cache)
+            .refresh(&url)
+            .await;
+    });
+}
+
 pub fn read_memory(memory: &MemoryCache, url: &str) -> Option<(Body, u64)> {
     memory
         .read()
@@ -194,6 +186,14 @@ fn redirected_base(redirects: Option<&RedirectMemory>, base: &Url) -> Option<Url
     out.set_query(base.query());
     out.set_fragment(base.fragment());
     Some(out)
+}
+
+fn request_parts(url: &str, cache: &CacheContext) -> Result<(Url, PathBuf, Url), url::ParseError> {
+    let base = Url::parse(url)?;
+    let request_base =
+        redirected_base(cache.redirects.as_ref(), &base).unwrap_or_else(|| base.clone());
+    let cache_path = cache::path_for(&base);
+    Ok((base, cache_path, request_base))
 }
 
 fn remember_redirect(redirects: Option<&RedirectMemory>, from: &Url, to: &Url) {
@@ -225,14 +225,11 @@ fn write_caches(
     out: &Value,
     url: &str,
     memory: Option<MemoryCache>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<()> {
     cache::write(cache_path, out);
     if let Some(memory) = memory {
-        write_memory(
-            &memory,
-            url.to_string(),
-            Arc::from(serde_json::to_string(out)?),
-        );
+        let body = Arc::from(serde_json::to_string(out)?);
+        write_memory(&memory, url.to_string(), body);
     }
     Ok(())
 }
@@ -241,14 +238,7 @@ fn prune_memory(entries: &mut FxHashMap<String, (Body, Instant)>, now: Instant) 
     entries.retain(|_, (_, written)| {
         now.saturating_duration_since(*written).as_secs() < CACHE_STALE_SECS
     });
-    if entries.len() <= MEMORY_CACHE_MAX_ENTRIES {
-        return;
-    }
-    let overflow = entries.len() - MEMORY_CACHE_MAX_ENTRIES;
-    let keys: Vec<_> = entries.keys().take(overflow).cloned().collect();
-    for key in keys {
-        entries.remove(&key);
-    }
+    cache::prune_overflow(entries, MEMORY_CACHE_MAX_ENTRIES);
 }
 
 fn annotate(mut v: Value, t0: Instant, status: &str, age_secs: u64) -> Value {

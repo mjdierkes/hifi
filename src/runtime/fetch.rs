@@ -49,8 +49,7 @@ pub async fn scan_chunks(
         if queue.is_empty() {
             break;
         }
-        let batch = std::mem::take(&mut queue);
-        let mut fetched = stream::iter(batch)
+        let mut fetched = stream::iter(std::mem::take(&mut queue))
             .map(|url| fetch_scan(client.clone(), url, use_cache, memory.clone()))
             .buffer_unordered(concurrency);
 
@@ -136,14 +135,7 @@ fn write_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url, chunk: Arc<C
     };
     if let Ok(mut entries) = memory.write() {
         entries.insert(url.as_str().to_string(), chunk);
-        if entries.len() <= CHUNK_MEMORY_CACHE_MAX_ENTRIES {
-            return;
-        }
-        let overflow = entries.len() - CHUNK_MEMORY_CACHE_MAX_ENTRIES;
-        let keys: Vec<_> = entries.keys().take(overflow).cloned().collect();
-        for key in keys {
-            entries.remove(&key);
-        }
+        cache::prune_overflow(&mut entries, CHUNK_MEMORY_CACHE_MAX_ENTRIES);
     }
 }
 

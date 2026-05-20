@@ -1,5 +1,12 @@
 use crate::scan::ApiMap;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    hash::Hash,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 use url::Url;
 
 pub fn fingerprint(chunks: &[Url]) -> String {
@@ -22,7 +29,7 @@ fn hash_parts<'a>(parts: impl Iterator<Item = &'a str>) -> u64 {
     h
 }
 
-pub fn path_for(base: &Url) -> std::path::PathBuf {
+pub fn path_for(base: &Url) -> PathBuf {
     let host = base.host_str().unwrap_or("unknown").replace('/', "_");
     dir().join(format!("{host}.json"))
 }
@@ -34,20 +41,14 @@ pub struct ChunkData {
 }
 
 pub fn read_chunk(url: &Url) -> Option<ChunkData> {
-    serde_json::from_slice(&std::fs::read(chunk_path_for(url)).ok()?).ok()
+    serde_json::from_slice(&fs::read(chunk_path_for(url)).ok()?).ok()
 }
 
 pub fn write_chunk(url: &Url, chunk: &ChunkData) {
-    let path = chunk_path_for(url);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(bytes) = serde_json::to_vec(&chunk) {
-        let _ = std::fs::write(path, bytes);
-    }
+    write_json(&chunk_path_for(url), chunk);
 }
 
-fn chunk_path_for(url: &Url) -> std::path::PathBuf {
+fn chunk_path_for(url: &Url) -> PathBuf {
     let host = url.host_str().unwrap_or("unknown").replace('/', "_");
     let hash = hash_parts(std::iter::once(url.as_str()));
     dir()
@@ -56,7 +57,7 @@ fn chunk_path_for(url: &Url) -> std::path::PathBuf {
         .join(format!("{hash:016x}.json"))
 }
 
-pub fn read(path: &std::path::Path, build_id: Option<&str>) -> Option<serde_json::Value> {
+pub fn read(path: &Path, build_id: Option<&str>) -> Option<serde_json::Value> {
     let expected = build_id?;
     if let Some(cached) = read_build_id(path) {
         return (cached == expected).then(|| read_any(path).map(|(v, _)| v))?;
@@ -67,49 +68,57 @@ pub fn read(path: &std::path::Path, build_id: Option<&str>) -> Option<serde_json
     (cached_build == Some(expected)).then_some(v)
 }
 
-pub fn read_any(path: &std::path::Path) -> Option<(serde_json::Value, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
+pub fn read_any(path: &Path) -> Option<(serde_json::Value, u64)> {
+    let meta = fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
-    let age = std::time::SystemTime::now()
-        .duration_since(modified)
-        .ok()?
-        .as_secs();
-    let v = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let age = SystemTime::now().duration_since(modified).ok()?.as_secs();
+    let v = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
     Some((v, age))
 }
 
-pub fn write(path: &std::path::Path, value: &serde_json::Value) {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(bytes) = serde_json::to_vec(value) {
-        let _ = std::fs::write(path, bytes);
-    }
+pub fn write(path: &Path, value: &serde_json::Value) {
+    write_json(path, value);
     write_meta(path, value);
 }
 
-fn read_build_id(path: &std::path::Path) -> Option<String> {
+fn write_json<T: Serialize>(path: &Path, value: &T) {
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        let _ = fs::write(path, bytes);
+    }
+}
+
+pub fn prune_overflow<K: Clone + Eq + Hash, V>(entries: &mut FxHashMap<K, V>, max: usize) {
+    let overflow = entries.len().saturating_sub(max);
+    for key in entries.keys().take(overflow).cloned().collect::<Vec<_>>() {
+        entries.remove(&key);
+    }
+}
+
+fn read_build_id(path: &Path) -> Option<String> {
     let meta_path = meta_path(path);
-    let bytes = std::fs::read(meta_path).ok()?;
+    let bytes = fs::read(meta_path).ok()?;
     let id = std::str::from_utf8(&bytes).ok()?.trim_end();
     (!id.is_empty()).then(|| id.to_string())
 }
 
-fn write_meta(path: &std::path::Path, value: &serde_json::Value) {
+fn write_meta(path: &Path, value: &serde_json::Value) {
     if let Some(build_id) = value.get("build_id").and_then(|b| b.as_str()) {
-        let _ = std::fs::write(meta_path(path), build_id);
+        let _ = fs::write(meta_path(path), build_id);
     }
 }
 
-fn meta_path(path: &std::path::Path) -> std::path::PathBuf {
+fn meta_path(path: &Path) -> PathBuf {
     let mut meta = path.as_os_str().to_os_string();
     meta.push(".build");
     meta.into()
 }
 
-fn dir() -> std::path::PathBuf {
+fn dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    std::path::PathBuf::from(home).join(".cache/hifi")
+    PathBuf::from(home).join(".cache/hifi")
 }
 
 #[cfg(test)]

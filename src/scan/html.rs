@@ -15,7 +15,7 @@ pub fn extract_chunks(html: &[u8], base: &Url) -> Vec<Url> {
             .position(|b| b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'<' | b'>' | b')'))
             .map(|n| needle_pos + n)
             .unwrap_or(html.len());
-        push_chunk(&html[start..end], base, &mut seen, &mut out);
+        push_chunk(&html[start..end], base, false, &mut seen, &mut out);
         offset = end;
     }
     out
@@ -78,32 +78,28 @@ pub fn extract_chunk_refs(body: &[u8], base: &Url) -> Vec<Url> {
             })
             .map(|n| pos + n)
             .unwrap_or(body.len());
-        push_chunk_path(&body[pos..end], base, &mut seen, &mut out);
+        push_chunk(&body[pos..end], base, true, &mut seen, &mut out);
         offset = end;
     }
     out
 }
 
-fn push_chunk(src: &[u8], base: &Url, seen: &mut FxHashSet<Url>, out: &mut Vec<Url>) {
-    if memmem::find(src, b".js").is_none() || is_skipped_chunk(src) {
+fn push_chunk(src: &[u8], base: &Url, nested: bool, seen: &mut FxHashSet<Url>, out: &mut Vec<Url>) {
+    if is_skipped_chunk(src)
+        || (nested && !src.ends_with(b".js"))
+        || (!nested && memmem::find(src, b".js").is_none())
+    {
         return;
     }
     let Ok(src) = std::str::from_utf8(src) else {
         return;
     };
-    if let Ok(url) = base.join(src) {
-        push_unique(url, seen, out);
-    }
-}
-
-fn push_chunk_path(src: &[u8], base: &Url, seen: &mut FxHashSet<Url>, out: &mut Vec<Url>) {
-    if !src.ends_with(b".js") || is_skipped_chunk(src) {
-        return;
-    }
-    let Ok(src) = std::str::from_utf8(src) else {
-        return;
+    let url = if nested {
+        base.join(&format!("/_next/{src}"))
+    } else {
+        base.join(src)
     };
-    if let Ok(url) = base.join(&format!("/_next/{src}")) {
+    if let Ok(url) = url {
         push_unique(url, seen, out);
     }
 }

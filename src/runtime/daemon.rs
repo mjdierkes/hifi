@@ -1,7 +1,7 @@
 use super::fetch;
 use super::processor::{
-    read_memory, write_memory, Body, CacheContext, MemoryCache, Processor, RedirectMemory,
-    CACHE_FRESH_SECS, CACHE_STALE_SECS,
+    read_memory, spawn_refresh, write_memory, Body, CacheContext, MemoryCache, Processor,
+    RedirectMemory, CACHE_FRESH_SECS, CACHE_STALE_SECS,
 };
 use reqwest::Client;
 use rustc_hash::FxHashMap;
@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{oneshot, Mutex};
 
+type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 type Inflight = Arc<Mutex<FxHashMap<String, Vec<oneshot::Sender<Body>>>>>;
 
 #[derive(Clone)]
@@ -74,7 +75,7 @@ pub async fn request(url: &str, no_cache: bool) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
-pub async fn serve(client: Client, concurrency: usize) -> Result<(), Box<dyn Error>> {
+pub async fn serve(client: Client, concurrency: usize) -> Result {
     let path = socket_path();
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
@@ -99,11 +100,7 @@ fn socket_path() -> PathBuf {
     dir.join("hifi.sock")
 }
 
-async fn handle_conn(
-    mut stream: UnixStream,
-    state: State,
-    concurrency: usize,
-) -> Result<(), Box<dyn Error>> {
+async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -> Result {
     let t0 = Instant::now();
     let mut req = Vec::with_capacity(512);
     stream.read_to_end(&mut req).await?;
@@ -114,7 +111,7 @@ async fn handle_conn(
         if let Some((body, age)) = read_memory(&state.memory, url) {
             if age < CACHE_STALE_SECS {
                 if age >= CACHE_FRESH_SECS {
-                    refresh(&state, concurrency, url);
+                    spawn_refresh(state.client.clone(), concurrency, url, state.cache());
                 }
                 return reply(&mut stream, body.as_ref()).await;
             }
@@ -141,18 +138,7 @@ async fn handle_conn(
     reply(&mut stream, &body).await
 }
 
-fn refresh(state: &State, concurrency: usize, url: &str) {
-    let client = state.client.clone();
-    let cache = state.cache();
-    let url = url.to_string();
-    tokio::spawn(async move {
-        let _ = Processor::new(&client, concurrency, cache)
-            .refresh(&url)
-            .await;
-    });
-}
-
-async fn reply(stream: &mut UnixStream, body: &str) -> Result<(), Box<dyn Error>> {
+async fn reply(stream: &mut UnixStream, body: &str) -> Result {
     stream.write_all(body.as_bytes()).await?;
     Ok(())
 }
