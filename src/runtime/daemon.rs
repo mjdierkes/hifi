@@ -3,9 +3,10 @@ use super::processor::{
     memory_cache, read_memory, redirect_cache, spawn_refresh, write_memory, Body, CacheContext,
     MemoryCache, Processor, RedirectMemory, CACHE_FRESH_SECS, CACHE_STALE_SECS,
 };
-use crate::app::{render_json_mode, OutputMode};
+use crate::app::{render_json_mode, warning_text, warning_text_from_json, OutputMode};
 use reqwest::Client;
 use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
     io,
@@ -21,6 +22,14 @@ use tokio::sync::{oneshot, Mutex};
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 type Inflight = Arc<Mutex<FxHashMap<String, Vec<oneshot::Sender<Body>>>>>;
 const MAX_DAEMON_REQUEST_BYTES: usize = 8192;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DaemonReply {
+    pub exit_code: i32,
+    pub stdout: String,
+    #[serde(default)]
+    pub stderr: String,
+}
 
 #[derive(Clone)]
 struct State {
@@ -67,7 +76,7 @@ pub fn start() -> bool {
         .is_some()
 }
 
-pub async fn request(url: &str, no_cache: bool, mode: OutputMode) -> Option<String> {
+pub async fn request(url: &str, no_cache: bool, mode: OutputMode) -> Option<DaemonReply> {
     let mut stream = UnixStream::connect(socket_path()).await.ok()?;
     stream
         .write_all(&[b'0' + no_cache as u8, mode.as_daemon_byte()])
@@ -78,7 +87,24 @@ pub async fn request(url: &str, no_cache: bool, mode: OutputMode) -> Option<Stri
 
     let mut buf = Vec::with_capacity(4096);
     stream.read_to_end(&mut buf).await.ok()?;
-    String::from_utf8(buf).ok()
+    let body = String::from_utf8(buf).ok()?;
+    serde_json::from_str(&body).ok().or_else(|| {
+        if let Some(error) = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        {
+            return Some(DaemonReply {
+                exit_code: 2,
+                stdout: String::new(),
+                stderr: format!("hifi: {error}\n"),
+            });
+        }
+        Some(DaemonReply {
+            exit_code: 0,
+            stdout: body,
+            stderr: String::new(),
+        })
+    })
 }
 
 pub async fn serve(client: Client, concurrency: usize) -> Result {
@@ -123,7 +149,15 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
         .read_to_end(&mut req)
         .await?;
     if req.len() > MAX_DAEMON_REQUEST_BYTES {
-        return reply(&mut stream, r#"{"error":"request too large"}"#).await;
+        return reply(
+            &mut stream,
+            DaemonReply {
+                exit_code: 2,
+                stdout: String::new(),
+                stderr: "hifi: request too large\n".into(),
+            },
+        )
+        .await;
     }
     let no_cache = req.first() == Some(&b'1');
     let (mode, url_bytes) = req
@@ -134,8 +168,15 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
     let url = std::str::from_utf8(url_bytes)?;
     if let Ok(parsed) = url::Url::parse(url) {
         if let Err(e) = super::net::validate_url(&parsed, super::net::allow_private_networks()) {
-            let body = serde_json::json!({ "error": e.to_string() }).to_string();
-            return reply(&mut stream, &body).await;
+            return reply(
+                &mut stream,
+                DaemonReply {
+                    exit_code: 2,
+                    stdout: String::new(),
+                    stderr: format!("hifi: {e}\n"),
+                },
+            )
+            .await;
         }
     }
 
@@ -147,17 +188,43 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
                     spawn_refresh(state.client.clone(), concurrency, url, state.cache());
                 }
                 let rendered = render_json_mode(body.as_ref(), mode);
-                return reply(&mut stream, &rendered).await;
+                let stderr = warning_text_from_json(body.as_ref());
+                return reply(
+                    &mut stream,
+                    DaemonReply {
+                        exit_code: 0,
+                        stdout: rendered,
+                        stderr,
+                    },
+                )
+                .await;
             }
         }
 
         let Some(mut guard) = join_inflight(&state.inflight, url).await else {
-            return reply(&mut stream, r#"{"error":"too many inflight requests"}"#).await;
+            return reply(
+                &mut stream,
+                DaemonReply {
+                    exit_code: 2,
+                    stdout: String::new(),
+                    stderr: "hifi: too many inflight requests\n".into(),
+                },
+            )
+            .await;
         };
         if let Some(rx) = guard.waiter.take() {
             if let Ok(body) = rx.await {
                 let rendered = render_json_mode(body.as_ref(), mode);
-                return reply(&mut stream, &rendered).await;
+                let stderr = warning_text_from_json(body.as_ref());
+                return reply(
+                    &mut stream,
+                    DaemonReply {
+                        exit_code: 0,
+                        stdout: rendered,
+                        stderr,
+                    },
+                )
+                .await;
             }
         }
         if guard.owner {
@@ -165,24 +232,55 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
         }
     }
 
-    let out = Processor::new(&state.client, concurrency, state.cache())
-        .process(url, no_cache, t0)
-        .await
-        .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }).to_string());
-    let body = out;
+    let processed = Processor::new(&state.client, concurrency, state.cache())
+        .process_for_display(url, no_cache, t0)
+        .await;
+    let out = match processed {
+        Ok(out) => out,
+        Err(e) => {
+            return reply(
+                &mut stream,
+                DaemonReply {
+                    exit_code: 2,
+                    stdout: String::new(),
+                    stderr: format!("hifi: {e}\n"),
+                },
+            )
+            .await;
+        }
+    };
+    let stderr = warning_text(&out);
+    let body = out.to_json_string()?;
     if !no_cache {
         let body: Body = Arc::from(body);
         write_memory(&state.memory, url.to_string(), body.clone());
         finish_inflight(&state.inflight, url, body.clone()).await;
         drop(inflight_guard);
         let rendered = render_json_mode(body.as_ref(), mode);
-        return reply(&mut stream, &rendered).await;
+        return reply(
+            &mut stream,
+            DaemonReply {
+                exit_code: 0,
+                stdout: rendered,
+                stderr,
+            },
+        )
+        .await;
     }
     let rendered = render_json_mode(&body, mode);
-    reply(&mut stream, &rendered).await
+    reply(
+        &mut stream,
+        DaemonReply {
+            exit_code: 0,
+            stdout: rendered,
+            stderr,
+        },
+    )
+    .await
 }
 
-async fn reply(stream: &mut UnixStream, body: &str) -> Result {
+async fn reply(stream: &mut UnixStream, body: DaemonReply) -> Result {
+    let body = serde_json::to_string(&body)?;
     stream.write_all(body.as_bytes()).await?;
     Ok(())
 }

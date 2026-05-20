@@ -38,6 +38,7 @@ pub struct ChunkScanOptions {
 pub struct ChunkScanStats {
     pub discovered: usize,
     pub memory_hits: usize,
+    pub failed: usize,
 }
 
 struct ScannedChunk {
@@ -81,12 +82,15 @@ pub async fn scan_chunks(
                 .buffer_unordered(opts.concurrency);
 
             while let Some(res) = scanned.next().await {
-                if let Ok(result) = res {
-                    stats.record(result.memory_hit);
-                    let chunk = result.chunk;
-                    scan::merge_refs_into(apis, chunk.apis.iter());
-                    scan::merge_candidate_refs_into(candidates, chunk.candidates.iter());
-                    enqueue_refs(&chunk.refs, &mut visited, &mut queue);
+                match res {
+                    Ok(result) => {
+                        stats.record(result.memory_hit);
+                        let chunk = result.chunk;
+                        scan::merge_refs_into(apis, chunk.apis.iter());
+                        scan::merge_candidate_refs_into(candidates, chunk.candidates.iter());
+                        enqueue_refs(&chunk.refs, &mut visited, &mut queue);
+                    }
+                    Err(()) => stats.failed += 1,
                 }
             }
         }
@@ -111,16 +115,19 @@ pub async fn scan_chunks(
             .buffer_unordered(opts.concurrency);
 
         while let Some(res) = fetched.next().await {
-            if let Ok(result) = res {
-                if let Some(body) = &result.raw_body {
-                    pack_entries.push((result.url.clone(), body.to_vec()));
-                    pack_dirty = true;
+            match res {
+                Ok(result) => {
+                    if let Some(body) = &result.raw_body {
+                        pack_entries.push((result.url.clone(), body.to_vec()));
+                        pack_dirty = true;
+                    }
+                    stats.record(result.memory_hit);
+                    let chunk = result.chunk;
+                    scan::merge_refs_into(apis, chunk.apis.iter());
+                    scan::merge_candidate_refs_into(candidates, chunk.candidates.iter());
+                    enqueue_refs(&chunk.refs, &mut visited, &mut queue);
                 }
-                stats.record(result.memory_hit);
-                let chunk = result.chunk;
-                scan::merge_refs_into(apis, chunk.apis.iter());
-                scan::merge_candidate_refs_into(candidates, chunk.candidates.iter());
-                enqueue_refs(&chunk.refs, &mut visited, &mut queue);
+                Err(()) => stats.failed += 1,
             }
         }
     }

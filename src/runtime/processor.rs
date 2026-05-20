@@ -48,6 +48,8 @@ pub struct Output {
     pub cache_age_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_us: Option<u128>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl Output {
@@ -235,7 +237,7 @@ impl<'a> Processor<'a> {
         .await;
         let mut apis = ApiMap::default();
         let mut candidates = CandidateMap::default();
-        fetch::scan_chunks(
+        let chunk_stats = fetch::scan_chunks(
             self.client.clone(),
             chunks.iter().cloned(),
             fetch::ChunkScanOptions {
@@ -258,6 +260,13 @@ impl<'a> Processor<'a> {
         for url in apis.keys() {
             candidates.remove(url);
         }
+        let mut warnings = Vec::new();
+        if chunk_stats.failed > 0 {
+            warnings.push(format!(
+                "failed to read {} chunks; results may be incomplete",
+                chunk_stats.failed
+            ));
+        }
 
         Ok((
             Output {
@@ -267,6 +276,7 @@ impl<'a> Processor<'a> {
                 cache: "miss".into(),
                 cache_age_secs: None,
                 elapsed_us: t0.map(|t| t.elapsed().as_micros()),
+                warnings,
             },
             false,
         ))
@@ -390,10 +400,10 @@ fn write_caches(
 fn prune_memory(entries: &mut LruCache<String, (Body, Instant)>, now: Instant) {
     let stale = entries
         .iter()
-        .filter_map(|(url, (_, written))| {
-            (now.saturating_duration_since(*written).as_secs() >= CACHE_STALE_SECS)
-                .then(|| url.clone())
+        .filter(|(_, (_, written))| {
+            now.saturating_duration_since(*written).as_secs() >= CACHE_STALE_SECS
         })
+        .map(|(url, _)| url.clone())
         .collect::<Vec<_>>();
     for url in stale {
         entries.pop(&url);
@@ -416,6 +426,7 @@ mod tests {
             cache: "miss".into(),
             cache_age_secs: Some(1),
             elapsed_us: Some(1000),
+            warnings: Vec::new(),
         }
         .mark(None, "", None);
         let v = serde_json::to_value(&cached).unwrap();
@@ -478,5 +489,55 @@ mod tests {
 
         assert!(v["apis"].get("/api/from-chunk").is_some());
         assert!(v["candidates"].get("/api/from-manifest").is_some());
+    }
+
+    #[tokio::test]
+    async fn chunk_fetch_failures_are_reported_as_warnings() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0; 2048];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let (status, body) = if req.starts_with("GET /_next/static/chunks/app/ok.js ") {
+                        ("200 OK", r#"fetch("/api/ok")"#)
+                    } else if req.starts_with("GET /_next/static/chunks/app/missing.js ") {
+                        ("404 Not Found", "")
+                    } else {
+                        (
+                            "200 OK",
+                            r#"<script src="/_next/static/chunks/app/ok.js"></script><script src="/_next/static/chunks/app/missing.js"></script>"#,
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let client = Client::new();
+        let out = Processor::new(
+            &client,
+            2,
+            CacheContext {
+                allow_private: true,
+                ..CacheContext::default()
+            },
+        )
+        .process_for_display(&format!("http://{addr}/"), true, Instant::now())
+        .await
+        .unwrap();
+
+        assert!(out.apis.contains_key("/api/ok"));
+        assert_eq!(
+            out.warnings,
+            vec!["failed to read 1 chunks; results may be incomplete"]
+        );
     }
 }

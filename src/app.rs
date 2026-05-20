@@ -101,12 +101,13 @@ pub async fn run(raw: Vec<String>) -> Result<i32, Box<dyn Error>> {
         }
     }
     let url = url.ok_or("missing URL (try --help)")?;
-    let url = normalize_url(&url);
+    let url = normalize_url(&url)?;
 
     if !no_daemon {
-        if let Some(out) = daemon_output(&url, no_cache, mode).await {
-            print!("{out}");
-            return Ok(0);
+        if let Some(reply) = daemon_output(&url, no_cache, mode).await {
+            print!("{}", reply.stdout);
+            eprint!("{}", reply.stderr);
+            return Ok(reply.exit_code);
         }
     }
 
@@ -120,7 +121,8 @@ pub async fn run(raw: Vec<String>) -> Result<i32, Box<dyn Error>> {
     )
     .process_for_display(&url, no_cache, std::time::Instant::now())
     .await?;
-    render_processed(out, mode)?;
+    render_processed(&out, mode)?;
+    render_warnings(&out);
     Ok(0)
 }
 
@@ -131,11 +133,15 @@ fn set_mode(current: OutputMode, next: OutputMode) -> Result<OutputMode, Box<dyn
     Ok(next)
 }
 
-pub fn normalize_url(url: &str) -> String {
-    if url.starts_with("http://") || url.starts_with("https://") {
-        url.to_string()
+pub fn normalize_url(url: &str) -> Result<String, Box<dyn Error>> {
+    if url.contains("://") {
+        let parsed = url::Url::parse(url)?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(format!("unsupported URL scheme '{}'", parsed.scheme()).into());
+        }
+        Ok(parsed.to_string())
     } else {
-        format!("https://{url}")
+        Ok(url::Url::parse(&format!("https://{url}"))?.to_string())
     }
 }
 
@@ -153,7 +159,7 @@ pub fn render_json_mode(json: &str, mode: OutputMode) -> String {
     }
 }
 
-fn render_processed(out: Output, mode: OutputMode) -> Result<(), Box<dyn Error>> {
+fn render_processed(out: &Output, mode: OutputMode) -> Result<(), Box<dyn Error>> {
     let stdout = io::stdout();
     let mut stdout = io::BufWriter::new(stdout.lock());
     match mode.for_stdout() {
@@ -161,9 +167,26 @@ fn render_processed(out: Output, mode: OutputMode) -> Result<(), Box<dyn Error>>
             serde_json::to_writer(&mut stdout, &out)?;
             stdout.write_all(b"\n")?;
         }
-        OutputMode::Flat | OutputMode::Auto => render_flat_output(&out, &mut stdout)?,
+        OutputMode::Flat | OutputMode::Auto => render_flat_output(out, &mut stdout)?,
     }
     Ok(())
+}
+
+pub fn warning_text(out: &Output) -> String {
+    out.warnings
+        .iter()
+        .map(|w| format!("hifi: warning: {w}\n"))
+        .collect()
+}
+
+pub fn warning_text_from_json(json: &str) -> String {
+    serde_json::from_str::<Output>(json)
+        .map(|out| warning_text(&out))
+        .unwrap_or_default()
+}
+
+fn render_warnings(out: &Output) {
+    eprint!("{}", warning_text(out));
 }
 
 fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
@@ -198,7 +221,7 @@ fn render_flat(json: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| format!("{json}\n"))
 }
 
-async fn daemon_output(url: &str, no_cache: bool, mode: OutputMode) -> Option<String> {
+async fn daemon_output(url: &str, no_cache: bool, mode: OutputMode) -> Option<daemon::DaemonReply> {
     if let Some(out) = daemon::request(url, no_cache, mode).await {
         return Some(out);
     }
@@ -260,5 +283,19 @@ mod tests {
     #[test]
     fn terminal_escape_rewrites_control_bytes() {
         assert_eq!(escape_terminal("ok\u{1b}[31m"), "ok\\x1b[31m");
+    }
+
+    #[test]
+    fn normalize_url_adds_https_to_bare_hosts() {
+        assert_eq!(
+            normalize_url("example.com/path").unwrap(),
+            "https://example.com/path"
+        );
+    }
+
+    #[test]
+    fn normalize_url_rejects_unsupported_schemes() {
+        let err = normalize_url("ftp://example.com").unwrap_err().to_string();
+        assert_eq!(err, "unsupported URL scheme 'ftp'");
     }
 }

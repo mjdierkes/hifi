@@ -8,6 +8,12 @@ use url::Url;
 
 type Hit = (String, usize, String);
 
+#[derive(Default)]
+struct GrepResult {
+    hits: Vec<Hit>,
+    failed: usize,
+}
+
 pub async fn run(
     args: &[String],
     client: Client,
@@ -33,7 +39,10 @@ pub async fn run(
     }
     let url = url.ok_or("usage: hifi grep <url> <pattern> [-C N]")?;
     let pattern = pattern.ok_or("usage: hifi grep <url> <pattern> [-C N]")?;
-    let url = normalize_url(&url);
+    if pattern.is_empty() {
+        return Err("pattern must not be empty".into());
+    }
+    let url = normalize_url(&url)?;
 
     let base = Url::parse(&url)?;
     let response = net::get_limited(&client, base.clone(), net::allow_private_networks()).await?;
@@ -41,16 +50,22 @@ pub async fn run(
     let html = net::read_limited(response).await?;
     let chunks = html::extract_chunks(&html, &final_base);
 
-    let hits = grep_chunks(client, chunks.into_iter(), concurrency, &pattern, context).await;
-    eprintln!("{} hits", hits.len());
-    for (url, line, snippet) in &hits {
+    let result = grep_chunks(client, chunks.into_iter(), concurrency, &pattern, context).await;
+    if result.failed > 0 {
+        eprintln!(
+            "hifi: warning: failed to read {} chunks; results may be incomplete",
+            result.failed
+        );
+    }
+    eprintln!("{} hits", result.hits.len());
+    for (url, line, snippet) in &result.hits {
         println!(
             "{}:{line}\t{}",
             escape_terminal(url),
             escape_terminal(snippet)
         );
     }
-    Ok(if hits.is_empty() { 1 } else { 0 })
+    Ok(if result.hits.is_empty() { 1 } else { 0 })
 }
 
 async fn grep_chunks(
@@ -59,17 +74,20 @@ async fn grep_chunks(
     concurrency: usize,
     pattern: &str,
     context: usize,
-) -> Vec<Hit> {
+) -> GrepResult {
     let pat = std::sync::Arc::new(pattern.to_string());
     let mut searched = stream::iter(chunks)
         .map(|url| grep_one(client.clone(), url, pat.clone(), context))
         .buffer_unordered(concurrency);
 
-    let mut hits = Vec::new();
-    while let Some(mut h) = searched.next().await {
-        hits.append(&mut h);
+    let mut result = GrepResult::default();
+    while let Some(chunk) = searched.next().await {
+        match chunk {
+            Ok(mut hits) => result.hits.append(&mut hits),
+            Err(()) => result.failed += 1,
+        }
     }
-    hits
+    result
 }
 
 async fn grep_one(
@@ -77,18 +95,16 @@ async fn grep_one(
     url: Url,
     pattern: std::sync::Arc<String>,
     context: usize,
-) -> Vec<Hit> {
-    let Ok(body) =
-        net::get_bytes_limited(&client, url.clone(), net::allow_private_networks()).await
-    else {
-        return Vec::new();
-    };
+) -> Result<Vec<Hit>, ()> {
+    let body = net::get_bytes_limited(&client, url.clone(), net::allow_private_networks())
+        .await
+        .map_err(|_| ())?;
 
     let mut hits = Vec::new();
     let bytes = &body[..];
     let pat_bytes = pattern.as_bytes();
     if pat_bytes.is_empty() {
-        return hits;
+        return Ok(hits);
     }
 
     let line_starts: Vec<usize> = std::iter::once(0)
@@ -106,5 +122,5 @@ async fn grep_one(
             .replace('\n', " ");
         hits.push((url.to_string(), line_idx + 1, snippet));
     }
-    hits
+    Ok(hits)
 }
