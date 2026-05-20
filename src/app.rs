@@ -1,11 +1,13 @@
 use crate::grep;
 use crate::runtime::daemon;
+use crate::runtime::net;
 use crate::runtime::processor::{CacheContext, Output, Processor, CACHE_FRESH_SECS};
 use reqwest::Client;
 use std::io::{self, Write};
 use std::{error::Error, time::Duration};
 
 const MAX_CHUNK_CONCURRENCY: usize = 32;
+const HARD_MAX_CHUNK_CONCURRENCY: usize = 128;
 
 const HELP: &str = "\
 hifi — map an HTTP API surface
@@ -108,9 +110,16 @@ pub async fn run(raw: Vec<String>) -> Result<i32, Box<dyn Error>> {
         }
     }
 
-    let out = Processor::new(&client, concurrency, CacheContext::default())
-        .process_for_display(&url, no_cache, std::time::Instant::now())
-        .await?;
+    let out = Processor::new(
+        &client,
+        concurrency,
+        CacheContext {
+            allow_private: net::allow_private_networks(),
+            ..CacheContext::default()
+        },
+    )
+    .process_for_display(&url, no_cache, std::time::Instant::now())
+    .await?;
     render_processed(out, mode)?;
     Ok(0)
 }
@@ -162,12 +171,18 @@ fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
     keys.sort_unstable();
     for k in keys {
         let shape = &v.apis[k];
-        writeln!(out, "{}\t{k}\t{}", shape.methods_csv(), shape.flags_csv())?;
+        writeln!(
+            out,
+            "{}\t{}\t{}",
+            shape.methods_csv(),
+            escape_terminal(k),
+            shape.flags_csv()
+        )?;
     }
     let mut keys: Vec<&String> = v.candidates.keys().collect();
     keys.sort_unstable();
     for k in keys {
-        writeln!(out, "?\t{k}\t")?;
+        writeln!(out, "?\t{}\t", escape_terminal(k))?;
     }
     Ok(())
 }
@@ -201,8 +216,9 @@ async fn daemon_output(url: &str, no_cache: bool, mode: OutputMode) -> Option<St
 fn chunk_concurrency() -> usize {
     std::env::var("HIFI_CHUNK_CONCURRENCY")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
+        .map(|v| v.min(HARD_MAX_CHUNK_CONCURRENCY))
         .unwrap_or(MAX_CHUNK_CONCURRENCY)
 }
 
@@ -213,6 +229,36 @@ fn make_client(chunk_concurrency: usize) -> reqwest::Result<Client> {
         .tcp_keepalive(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if net::validate_url(attempt.url(), net::allow_private_networks()).is_ok() {
+                attempt.follow()
+            } else {
+                attempt.error("blocked redirect to private or unsupported URL")
+            }
+        }))
         .user_agent("hifi/0.1")
         .build()
+}
+
+pub fn escape_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_control() || ch == '\u{7f}' {
+            use std::fmt::Write as _;
+            let _ = write!(out, "\\x{:02x}", ch as u32);
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_escape_rewrites_control_bytes() {
+        assert_eq!(escape_terminal("ok\u{1b}[31m"), "ok\\x1b[31m");
+    }
 }

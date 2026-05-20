@@ -2,22 +2,35 @@ use crate::scan::html;
 use crate::scan::{self, ApiMap, CandidateMap};
 
 use super::cache::{self, ChunkData};
+use super::net;
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
+use lru::LruCache;
 use reqwest::Client;
-use rustc_hash::{FxHashMap, FxHashSet};
-use std::sync::{Arc, RwLock};
+use rustc_hash::FxHashSet;
+use std::{
+    num::NonZeroUsize,
+    sync::{Arc, RwLock},
+};
 use url::Url;
 
 const CHUNK_MEMORY_CACHE_MAX_ENTRIES: usize = 1024;
 const MAX_CHUNK_DISCOVERY_ROUNDS: usize = 4;
 
-pub type ChunkMemoryCache = Arc<RwLock<FxHashMap<String, Arc<ChunkData>>>>;
+pub type ChunkMemoryCache = Arc<RwLock<LruCache<String, Arc<ChunkData>>>>;
+
+pub fn chunk_memory_cache() -> ChunkMemoryCache {
+    Arc::new(RwLock::new(LruCache::new(
+        NonZeroUsize::new(CHUNK_MEMORY_CACHE_MAX_ENTRIES).expect("nonzero cache size"),
+    )))
+}
 
 pub struct ChunkScanOptions {
     pub concurrency: usize,
     pub use_processed_cache: bool,
     pub use_bundle_cache: bool,
+    pub cache_key: Option<String>,
+    pub allow_private: bool,
     pub memory: Option<ChunkMemoryCache>,
 }
 
@@ -53,7 +66,7 @@ pub async fn scan_chunks(
     let mut pack_dirty = false;
 
     if opts.use_bundle_cache && !opts.use_processed_cache {
-        if let Some(entries) = cache::read_bundle_pack(&initial) {
+        if let Some(entries) = cache::read_bundle_pack(&initial, opts.cache_key.as_deref()) {
             queue.clear();
             for (url, _) in &entries {
                 visited.insert(url.clone());
@@ -64,7 +77,7 @@ pub async fn scan_chunks(
                     .map(|(url, body)| (url.clone(), body.clone())),
             );
             let mut scanned = stream::iter(entries)
-                .map(|(url, body)| scan_body(Bytes::from(body), url, false, None))
+                .map(|(url, body)| scan_body(Bytes::from(body), url, false, None, None))
                 .buffer_unordered(opts.concurrency);
 
             while let Some(res) = scanned.next().await {
@@ -90,6 +103,8 @@ pub async fn scan_chunks(
                     url,
                     opts.use_processed_cache,
                     opts.use_bundle_cache,
+                    opts.cache_key.as_deref(),
+                    opts.allow_private,
                     opts.memory.clone(),
                 )
             })
@@ -113,7 +128,7 @@ pub async fn scan_chunks(
     stats.discovered = visited.len();
     if opts.use_bundle_cache && !opts.use_processed_cache && pack_dirty && !pack_entries.is_empty()
     {
-        cache::write_bundle_pack(&initial, &pack_entries);
+        cache::write_bundle_pack(&initial, &pack_entries, opts.cache_key.as_deref());
     }
     stats
 }
@@ -139,10 +154,12 @@ async fn fetch_scan(
     url: Url,
     use_processed_cache: bool,
     use_bundle_cache: bool,
+    cache_key: Option<&str>,
+    allow_private: bool,
     memory: Option<ChunkMemoryCache>,
 ) -> Result<ScannedChunk, ()> {
     if use_processed_cache {
-        if let Some(chunk) = read_memory_chunk(memory.as_ref(), &url) {
+        if let Some(chunk) = read_memory_chunk(memory.as_ref(), &url, cache_key) {
             return Ok(ScannedChunk {
                 url,
                 chunk,
@@ -150,8 +167,8 @@ async fn fetch_scan(
                 raw_body: None,
             });
         }
-        if let Some(chunk) = cache::read_chunk(&url).map(Arc::new) {
-            write_memory_chunk(memory.as_ref(), &url, chunk.clone());
+        if let Some(chunk) = cache::read_chunk(&url, cache_key).map(Arc::new) {
+            write_memory_chunk(memory.as_ref(), &url, cache_key, chunk.clone());
             return Ok(ScannedChunk {
                 url,
                 chunk,
@@ -160,28 +177,30 @@ async fn fetch_scan(
             });
         }
     }
-    if use_bundle_cache {
+    if use_bundle_cache && cache_key.is_none() {
         if let Some(body) = cache::read_bundle(&url) {
-            return scan_body(Bytes::from(body), url, use_processed_cache, memory).await;
+            return scan_body(
+                Bytes::from(body),
+                url,
+                use_processed_cache,
+                cache_key,
+                memory,
+            )
+            .await;
         }
     }
 
-    let response = client
-        .get(url.clone())
-        .send()
+    let body = net::get_bytes_limited(&client, url.clone(), allow_private)
         .await
-        .map_err(|_| ())?
-        .error_for_status()
         .map_err(|_| ())?;
-    let body = response.bytes().await.map_err(|_| ())?;
-    cache::write_bundle(&url, &body);
-    scan_body(body, url, use_processed_cache, memory).await
+    scan_body(body, url, use_processed_cache, cache_key, memory).await
 }
 
 async fn scan_body(
     body: Bytes,
     url: Url,
     use_cache: bool,
+    cache_key: Option<&str>,
     memory: Option<ChunkMemoryCache>,
 ) -> Result<ScannedChunk, ()> {
     let mut apis = ApiMap::default();
@@ -195,8 +214,8 @@ async fn scan_body(
         refs,
     });
     if use_cache {
-        cache::write_chunk(&url, &chunk);
-        write_memory_chunk(memory.as_ref(), &url, chunk.clone());
+        cache::write_chunk(&url, &chunk, cache_key);
+        write_memory_chunk(memory.as_ref(), &url, cache_key, chunk.clone());
     }
     Ok(ScannedChunk {
         url,
@@ -206,17 +225,36 @@ async fn scan_body(
     })
 }
 
-fn read_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url) -> Option<Arc<ChunkData>> {
-    memory?.read().ok()?.get(url.as_str()).cloned()
+fn read_memory_chunk(
+    memory: Option<&ChunkMemoryCache>,
+    url: &Url,
+    cache_key: Option<&str>,
+) -> Option<Arc<ChunkData>> {
+    memory?
+        .write()
+        .ok()?
+        .get(&memory_key(url, cache_key))
+        .cloned()
 }
 
-fn write_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url, chunk: Arc<ChunkData>) {
+fn write_memory_chunk(
+    memory: Option<&ChunkMemoryCache>,
+    url: &Url,
+    cache_key: Option<&str>,
+    chunk: Arc<ChunkData>,
+) {
     let Some(memory) = memory else {
         return;
     };
     if let Ok(mut entries) = memory.write() {
-        entries.insert(url.as_str().to_string(), chunk);
-        cache::prune_overflow(&mut entries, CHUNK_MEMORY_CACHE_MAX_ENTRIES);
+        entries.put(memory_key(url, cache_key), chunk);
+    }
+}
+
+fn memory_key(url: &Url, cache_key: Option<&str>) -> String {
+    match cache_key {
+        Some(cache_key) => format!("{cache_key}\n{}", url.as_str()),
+        None => url.as_str().to_string(),
     }
 }
 
@@ -272,7 +310,7 @@ mod tests {
         });
 
         let client = Client::new();
-        let memory = Arc::new(RwLock::new(FxHashMap::default()));
+        let memory = chunk_memory_cache();
         let initial = Url::parse(&format!("http://{addr}/_next/static/chunks/a.js")).unwrap();
 
         let mut first = ApiMap::default();
@@ -283,6 +321,8 @@ mod tests {
                 concurrency: 1,
                 use_processed_cache: true,
                 use_bundle_cache: true,
+                cache_key: Some("b1".into()),
+                allow_private: true,
                 memory: Some(memory.clone()),
             },
             &mut first,
@@ -301,6 +341,8 @@ mod tests {
                 concurrency: 1,
                 use_processed_cache: true,
                 use_bundle_cache: true,
+                cache_key: Some("b1".into()),
+                allow_private: true,
                 memory: Some(memory),
             },
             &mut second,

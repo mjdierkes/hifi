@@ -1,26 +1,39 @@
 use crate::scan::{self, html};
 use crate::scan::{ApiMap, CandidateMap};
 
-use super::{cache, fetch};
+use super::{cache, fetch, net};
+use lru::LruCache;
 use reqwest::Client;
-use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::{
-    error::Error,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Instant,
 };
+use thiserror::Error;
 use url::Url;
 
 pub const CACHE_FRESH_SECS: u64 = 300;
 pub const CACHE_STALE_SECS: u64 = 3600;
 const MEMORY_CACHE_MAX_ENTRIES: usize = 256;
 
-type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
+type Result<T, E = RuntimeError> = std::result::Result<T, E>;
 pub type Body = Arc<str>;
-pub type MemoryCache = Arc<RwLock<FxHashMap<String, (Body, Instant)>>>;
-pub type RedirectMemory = Arc<RwLock<FxHashMap<String, Url>>>;
+pub type MemoryCache = Arc<RwLock<LruCache<String, (Body, Instant)>>>;
+pub type RedirectMemory = Arc<RwLock<LruCache<String, Url>>>;
+
+#[derive(Debug, Error)]
+pub enum RuntimeError {
+    #[error(transparent)]
+    Net(#[from] net::NetError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Url(#[from] url::ParseError),
+    #[error(transparent)]
+    Join(#[from] tokio::task::JoinError),
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Output {
@@ -56,6 +69,19 @@ pub struct CacheContext {
     pub memory: Option<MemoryCache>,
     pub chunks: Option<fetch::ChunkMemoryCache>,
     pub redirects: Option<RedirectMemory>,
+    pub allow_private: bool,
+}
+
+pub fn memory_cache() -> MemoryCache {
+    Arc::new(RwLock::new(LruCache::new(
+        NonZeroUsize::new(MEMORY_CACHE_MAX_ENTRIES).expect("nonzero cache size"),
+    )))
+}
+
+pub fn redirect_cache() -> RedirectMemory {
+    Arc::new(RwLock::new(LruCache::new(
+        NonZeroUsize::new(MEMORY_CACHE_MAX_ENTRIES).expect("nonzero cache size"),
+    )))
 }
 
 pub struct Processor<'a> {
@@ -85,12 +111,17 @@ impl<'a> Processor<'a> {
         no_cache: bool,
         t0: Instant,
     ) -> Result<Output> {
+        let no_cache_ctx;
         let active_cache = if no_cache {
-            CacheContext::default()
+            no_cache_ctx = CacheContext {
+                allow_private: self.cache.allow_private,
+                ..CacheContext::default()
+            };
+            &no_cache_ctx
         } else {
-            self.cache.clone()
+            &self.cache
         };
-        let (base, cache_path, request_base) = request_parts(url, &active_cache)?;
+        let (base, cache_path, request_base) = request_parts(url, active_cache)?;
 
         if let Some((json, age)) = (!no_cache)
             .then(|| cache::read_any_bytes(&cache_path))
@@ -104,7 +135,7 @@ impl<'a> Processor<'a> {
                     self.client.clone(),
                     self.concurrency,
                     url,
-                    active_cache.clone(),
+                    (*active_cache).clone(),
                 );
                 "stale"
             };
@@ -135,7 +166,7 @@ impl<'a> Processor<'a> {
                 &request_base,
                 Some(cache_path.as_path()),
                 None,
-                self.cache.clone(),
+                &self.cache,
             )
             .await?;
         write_caches(&cache_path, &out, url, self.cache.memory.clone())
@@ -147,7 +178,7 @@ impl<'a> Processor<'a> {
         request_base: &Url,
         cache_path: Option<&Path>,
         t0: Option<Instant>,
-        cache_ctx: CacheContext,
+        cache_ctx: &CacheContext,
     ) -> Result<(Output, bool)> {
         let (html, final_base) = if let Some((body, final_base)) = cache_path
             .is_none()
@@ -156,10 +187,12 @@ impl<'a> Processor<'a> {
         {
             (bytes::Bytes::from(body), final_base)
         } else {
-            let response = self.client.get(request_base.clone()).send().await?;
+            let response =
+                net::get_limited(self.client, request_base.clone(), cache_ctx.allow_private)
+                    .await?;
             let final_base = response.url().clone();
             remember_redirect(cache_ctx.redirects.as_ref(), original_base, &final_base);
-            let html = response.bytes().await?;
+            let html = net::read_limited(response).await?;
             cache::write_page(request_base, &final_base, &html);
             (html, final_base)
         };
@@ -194,6 +227,7 @@ impl<'a> Processor<'a> {
             self.client,
             &final_base,
             html_build_id.as_deref(),
+            cache_ctx.allow_private,
             &mut manifest_apis,
             &mut manifest_candidates,
             &mut chunks,
@@ -208,7 +242,9 @@ impl<'a> Processor<'a> {
                 concurrency: self.concurrency,
                 use_processed_cache: cache_path.is_some(),
                 use_bundle_cache: true,
-                memory: cache_ctx.chunks,
+                cache_key: build_id.clone(),
+                allow_private: cache_ctx.allow_private,
+                memory: cache_ctx.chunks.clone(),
             },
             &mut apis,
             &mut candidates,
@@ -248,7 +284,7 @@ pub fn spawn_refresh(client: Client, concurrency: usize, url: &str, cache: Cache
 
 pub fn read_memory(memory: &MemoryCache, url: &str) -> Option<(Body, u64)> {
     memory
-        .read()
+        .write()
         .ok()?
         .get(url)
         .cloned()
@@ -258,7 +294,7 @@ pub fn read_memory(memory: &MemoryCache, url: &str) -> Option<(Body, u64)> {
 pub fn write_memory(memory: &MemoryCache, url: String, body: Body) {
     if let Ok(mut entries) = memory.write() {
         let now = Instant::now();
-        entries.insert(url, (body, now));
+        entries.put(url, (body, now));
         prune_memory(&mut entries, now);
     }
 }
@@ -267,6 +303,7 @@ async fn scan_next_manifests(
     client: &Client,
     base: &Url,
     build_id: Option<&str>,
+    allow_private: bool,
     apis: &mut ApiMap,
     candidates: &mut CandidateMap,
     chunks: &mut Vec<Url>,
@@ -279,7 +316,7 @@ async fn scan_next_manifests(
         let Ok(manifest_url) = base.join(&format!("/_next/static/{build_id}/{name}")) else {
             continue;
         };
-        let Some(body) = fetch_manifest(client, manifest_url.clone()).await else {
+        let Some(body) = fetch_manifest(client, manifest_url.clone(), allow_private).await else {
             continue;
         };
         scan::scan(&body, apis);
@@ -288,22 +325,14 @@ async fn scan_next_manifests(
     }
 }
 
-async fn fetch_manifest(client: &Client, url: Url) -> Option<bytes::Bytes> {
-    let bytes = client
-        .get(url)
-        .send()
+async fn fetch_manifest(client: &Client, url: Url, allow_private: bool) -> Option<bytes::Bytes> {
+    net::get_bytes_limited(client, url, allow_private)
         .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .bytes()
-        .await
-        .ok()?;
-    Some(bytes)
+        .ok()
 }
 
 fn redirected_base(redirects: Option<&RedirectMemory>, base: &Url) -> Option<Url> {
-    let target = redirects?.read().ok()?.get(&origin_key(base)?).cloned()?;
+    let target = redirects?.write().ok()?.get(&origin_key(base)?).cloned()?;
     let mut out = target;
     out.set_path(base.path());
     out.set_query(base.query());
@@ -329,7 +358,7 @@ fn remember_redirect(redirects: Option<&RedirectMemory>, from: &Url, to: &Url) {
     if let Some(redirects) = redirects {
         if let Ok(mut entries) = redirects.write() {
             if let Ok(to_origin) = Url::parse(&format!("{to_key}/")) {
-                entries.insert(from_key, to_origin);
+                entries.put(from_key, to_origin);
             }
         }
     }
@@ -358,11 +387,17 @@ fn write_caches(
     Ok(())
 }
 
-fn prune_memory(entries: &mut FxHashMap<String, (Body, Instant)>, now: Instant) {
-    entries.retain(|_, (_, written)| {
-        now.saturating_duration_since(*written).as_secs() < CACHE_STALE_SECS
-    });
-    cache::prune_overflow(entries, MEMORY_CACHE_MAX_ENTRIES);
+fn prune_memory(entries: &mut LruCache<String, (Body, Instant)>, now: Instant) {
+    let stale = entries
+        .iter()
+        .filter_map(|(url, (_, written))| {
+            (now.saturating_duration_since(*written).as_secs() >= CACHE_STALE_SECS)
+                .then(|| url.clone())
+        })
+        .collect::<Vec<_>>();
+    for url in stale {
+        entries.pop(&url);
+    }
 }
 
 #[cfg(test)]
@@ -428,10 +463,17 @@ mod tests {
         });
 
         let client = Client::new();
-        let out = Processor::new(&client, 2, CacheContext::default())
-            .process(&format!("http://{addr}/"), true, Instant::now())
-            .await
-            .unwrap();
+        let out = Processor::new(
+            &client,
+            2,
+            CacheContext {
+                allow_private: true,
+                ..CacheContext::default()
+            },
+        )
+        .process(&format!("http://{addr}/"), true, Instant::now())
+        .await
+        .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
 
         assert!(v["apis"].get("/api/from-chunk").is_some());

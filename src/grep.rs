@@ -1,4 +1,5 @@
-use crate::app::normalize_url;
+use crate::app::{escape_terminal, normalize_url};
+use crate::runtime::net;
 use crate::scan::html;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
@@ -35,15 +36,19 @@ pub async fn run(
     let url = normalize_url(&url);
 
     let base = Url::parse(&url)?;
-    let response = client.get(base.clone()).send().await?;
+    let response = net::get_limited(&client, base.clone(), net::allow_private_networks()).await?;
     let final_base = response.url().clone();
-    let html = response.bytes().await?;
+    let html = net::read_limited(response).await?;
     let chunks = html::extract_chunks(&html, &final_base);
 
     let hits = grep_chunks(client, chunks.into_iter(), concurrency, &pattern, context).await;
     eprintln!("{} hits", hits.len());
     for (url, line, snippet) in &hits {
-        println!("{url}:{line}\t{snippet}");
+        println!(
+            "{}:{line}\t{}",
+            escape_terminal(url),
+            escape_terminal(snippet)
+        );
     }
     Ok(if hits.is_empty() { 1 } else { 0 })
 }
@@ -73,13 +78,9 @@ async fn grep_one(
     pattern: std::sync::Arc<String>,
     context: usize,
 ) -> Vec<Hit> {
-    let Ok(resp) = client.get(url.clone()).send().await else {
-        return Vec::new();
-    };
-    let Ok(resp) = resp.error_for_status() else {
-        return Vec::new();
-    };
-    let Ok(body) = resp.bytes().await else {
+    let Ok(body) =
+        net::get_bytes_limited(&client, url.clone(), net::allow_private_networks()).await
+    else {
         return Vec::new();
     };
 

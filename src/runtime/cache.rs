@@ -1,9 +1,7 @@
 use crate::scan::{ApiMap, CandidateMap};
-use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    hash::Hash,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -30,7 +28,7 @@ fn hash_parts<'a>(parts: impl Iterator<Item = &'a str>) -> u64 {
 }
 
 pub fn path_for(base: &Url) -> PathBuf {
-    dir().join(format!("{}.json", host(base)))
+    hashed_path("processed", base, "json")
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -40,29 +38,36 @@ pub struct ChunkData {
     pub refs: Vec<Url>,
 }
 
-pub fn read_chunk(url: &Url) -> Option<ChunkData> {
-    serde_json::from_slice(&fs::read(chunk_path_for(url)).ok()?).ok()
+pub fn read_chunk(url: &Url, cache_key: Option<&str>) -> Option<ChunkData> {
+    let (bytes, _) = read_fresh(
+        &chunk_path_for(url, cache_key),
+        super::processor::CACHE_STALE_SECS,
+    )?;
+    serde_json::from_slice(&bytes).ok()
 }
 
-pub fn write_chunk(url: &Url, chunk: &ChunkData) {
-    write_json(&chunk_path_for(url), chunk);
+pub fn write_chunk(url: &Url, chunk: &ChunkData, cache_key: Option<&str>) {
+    write_json(&chunk_path_for(url, cache_key), chunk);
 }
 
 pub fn read_bundle(url: &Url) -> Option<Vec<u8>> {
-    fs::read(bundle_path_for(url)).ok()
+    read_fresh(&bundle_path_for(url), super::processor::CACHE_STALE_SECS).map(|(bytes, _)| bytes)
 }
 
 pub fn write_bundle(url: &Url, bytes: &[u8]) {
     write_bytes(&bundle_path_for(url), bytes);
 }
 
-pub fn read_bundle_pack(seed: &[Url]) -> Option<Vec<(Url, Vec<u8>)>> {
-    let bytes = fs::read(bundle_pack_path_for(seed)?).ok()?;
+pub fn read_bundle_pack(seed: &[Url], cache_key: Option<&str>) -> Option<Vec<(Url, Vec<u8>)>> {
+    let (bytes, _) = read_fresh(
+        &bundle_pack_path_for(seed, cache_key)?,
+        super::processor::CACHE_FRESH_SECS,
+    )?;
     parse_bundle_pack(&bytes)
 }
 
-pub fn write_bundle_pack(seed: &[Url], entries: &[(Url, Vec<u8>)]) {
-    let Some(path) = bundle_pack_path_for(seed) else {
+pub fn write_bundle_pack(seed: &[Url], entries: &[(Url, Vec<u8>)], cache_key: Option<&str>) {
+    let Some(path) = bundle_pack_path_for(seed, cache_key) else {
         return;
     };
     let mut out = Vec::new();
@@ -79,7 +84,7 @@ pub fn write_bundle_pack(seed: &[Url], entries: &[(Url, Vec<u8>)]) {
 
 pub fn read_page(url: &Url) -> Option<(Vec<u8>, Url)> {
     let path = page_path_for(url);
-    let body = fs::read(&path).ok()?;
+    let (body, _) = read_fresh(&path, super::processor::CACHE_STALE_SECS)?;
     let final_url = fs::read_to_string(url_sidecar_path(&path))
         .ok()
         .and_then(|s| Url::parse(s.trim()).ok())
@@ -90,25 +95,28 @@ pub fn read_page(url: &Url) -> Option<(Vec<u8>, Url)> {
 pub fn write_page(url: &Url, final_url: &Url, bytes: &[u8]) {
     let path = page_path_for(url);
     write_bytes(&path, bytes);
-    let _ = fs::write(url_sidecar_path(&path), final_url.as_str());
+    write_bytes(&url_sidecar_path(&path), final_url.as_str().as_bytes());
 }
 
-fn chunk_path_for(url: &Url) -> PathBuf {
-    hashed_path("chunks", url, "json")
+fn chunk_path_for(url: &Url, cache_key: Option<&str>) -> PathBuf {
+    keyed_hashed_path("chunks", url, cache_key, "json")
 }
 
 fn bundle_path_for(url: &Url) -> PathBuf {
     hashed_path("bundles", url, "bin")
 }
 
-fn bundle_pack_path_for(seed: &[Url]) -> Option<PathBuf> {
+fn bundle_pack_path_for(seed: &[Url], cache_key: Option<&str>) -> Option<PathBuf> {
     let first = seed.first()?;
-    let hash = fingerprint(seed);
+    let mut parts: Vec<&str> = seed.iter().map(|u| u.as_str()).collect();
+    parts.sort();
+    let key = cache_key.unwrap_or("");
+    let hash = hash_parts(std::iter::once(key).chain(parts));
     Some(
         dir()
             .join("bundle-packs")
             .join(host(first))
-            .join(format!("{hash}.bin")),
+            .join(format!("{hash:016x}.bin")),
     )
 }
 
@@ -118,6 +126,14 @@ fn page_path_for(url: &Url) -> PathBuf {
 
 fn hashed_path(kind: &str, url: &Url, ext: &str) -> PathBuf {
     let hash = hash_parts(std::iter::once(url.as_str()));
+    dir()
+        .join(kind)
+        .join(host(url))
+        .join(format!("{hash:016x}.{ext}"))
+}
+
+fn keyed_hashed_path(kind: &str, url: &Url, cache_key: Option<&str>, ext: &str) -> PathBuf {
+    let hash = hash_parts(cache_key.into_iter().chain(std::iter::once(url.as_str())));
     dir()
         .join(kind)
         .join(host(url))
@@ -170,16 +186,23 @@ pub fn read_build_bytes(path: &Path, build_id: Option<&str>) -> Option<Vec<u8>> 
 }
 
 pub fn read_any_bytes(path: &Path) -> Option<(Vec<u8>, u64)> {
+    read_fresh(path, u64::MAX)
+}
+
+fn read_fresh(path: &Path, max_age_secs: u64) -> Option<(Vec<u8>, u64)> {
     let meta = fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
     let age = SystemTime::now().duration_since(modified).ok()?.as_secs();
+    if age >= max_age_secs {
+        return None;
+    }
     Some((fs::read(path).ok()?, age))
 }
 
 pub fn write_with_build_id<T: Serialize>(path: &Path, value: &T, build_id: Option<&str>) {
     write_json(path, value);
     if let Some(build_id) = build_id {
-        let _ = fs::write(meta_path(path), build_id);
+        write_bytes(&meta_path(path), build_id.as_bytes());
     }
 }
 
@@ -191,16 +214,9 @@ fn write_json<T: Serialize>(path: &Path, value: &T) {
 
 fn write_bytes(path: &Path, bytes: &[u8]) {
     if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
+        let _ = create_private_dir_all(dir);
     }
-    let _ = fs::write(path, bytes);
-}
-
-pub fn prune_overflow<K: Clone + Eq + Hash, V>(entries: &mut FxHashMap<K, V>, max: usize) {
-    let overflow = entries.len().saturating_sub(max);
-    for key in entries.keys().take(overflow).cloned().collect::<Vec<_>>() {
-        entries.remove(&key);
-    }
+    let _ = write_private_file(path, bytes);
 }
 
 fn read_build_id(path: &Path) -> Option<String> {
@@ -227,6 +243,47 @@ fn dir() -> PathBuf {
     PathBuf::from(home).join(".cache/hifi")
 }
 
+#[cfg(unix)]
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir_all(path)?;
+    let mut cur = PathBuf::new();
+    for component in path.components() {
+        cur.push(component);
+        if cur.starts_with(dir()) {
+            let _ = fs::set_permissions(&cur, fs::Permissions::from_mode(0o700));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)
+}
+
+#[cfg(unix)]
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    fs::write(path, bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,7 +307,7 @@ mod tests {
     #[test]
     fn chunk_cache_round_trips_api_map_and_refs() {
         let url = Url::parse("https://example.com/_next/static/chunks/app-abc.js").unwrap();
-        let path = chunk_path_for(&url);
+        let path = chunk_path_for(&url, Some("b1"));
         let _ = std::fs::remove_file(&path);
 
         let mut apis = ApiMap::default();
@@ -264,8 +321,9 @@ mod tests {
                 candidates: CandidateMap::default(),
                 refs: refs.clone(),
             },
+            Some("b1"),
         );
-        let cached = read_chunk(&url).unwrap();
+        let cached = read_chunk(&url, Some("b1")).unwrap();
 
         assert_eq!(
             serde_json::to_value(&cached.apis).unwrap(),
@@ -274,6 +332,47 @@ mod tests {
         assert_eq!(cached.refs, refs);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn chunk_cache_is_scoped_by_cache_key() {
+        let url = Url::parse(&format!(
+            "https://example.com/_next/static/chunks/shared-{}.js",
+            TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+        .unwrap();
+        let mut v1 = ApiMap::default();
+        let mut v2 = ApiMap::default();
+        crate::scan::scan(br#"fetch("/api/v1")"#, &mut v1);
+        crate::scan::scan(br#"fetch("/api/v2")"#, &mut v2);
+
+        write_chunk(
+            &url,
+            &ChunkData {
+                apis: v1,
+                candidates: CandidateMap::default(),
+                refs: Vec::new(),
+            },
+            Some("build-1"),
+        );
+        write_chunk(
+            &url,
+            &ChunkData {
+                apis: v2,
+                candidates: CandidateMap::default(),
+                refs: Vec::new(),
+            },
+            Some("build-2"),
+        );
+
+        assert!(read_chunk(&url, Some("build-1"))
+            .unwrap()
+            .apis
+            .contains_key("/api/v1"));
+        assert!(read_chunk(&url, Some("build-2"))
+            .unwrap()
+            .apis
+            .contains_key("/api/v2"));
     }
 
     #[test]
@@ -324,7 +423,7 @@ mod tests {
         .unwrap();
         let b = Url::parse("https://example.com/_next/static/chunks/b.js").unwrap();
         let seed = vec![a.clone()];
-        let path = bundle_pack_path_for(&seed).unwrap();
+        let path = bundle_pack_path_for(&seed, Some("b1")).unwrap();
         let _ = std::fs::remove_file(&path);
 
         write_bundle_pack(
@@ -333,8 +432,9 @@ mod tests {
                 (a.clone(), b"fetch('/api/a')".to_vec()),
                 (b.clone(), b"fetch('/api/b')".to_vec()),
             ],
+            Some("b1"),
         );
-        let entries = read_bundle_pack(&seed).unwrap();
+        let entries = read_bundle_pack(&seed, Some("b1")).unwrap();
 
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, a);

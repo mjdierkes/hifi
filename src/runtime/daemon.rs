@@ -1,16 +1,17 @@
 use super::fetch;
 use super::processor::{
-    read_memory, spawn_refresh, write_memory, Body, CacheContext, MemoryCache, Processor,
-    RedirectMemory, CACHE_FRESH_SECS, CACHE_STALE_SECS,
+    memory_cache, read_memory, redirect_cache, spawn_refresh, write_memory, Body, CacheContext,
+    MemoryCache, Processor, RedirectMemory, CACHE_FRESH_SECS, CACHE_STALE_SECS,
 };
 use crate::app::{render_json_mode, OutputMode};
 use reqwest::Client;
 use rustc_hash::FxHashMap;
 use std::{
     error::Error,
+    io,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::Instant,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,6 +20,7 @@ use tokio::sync::{oneshot, Mutex};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 type Inflight = Arc<Mutex<FxHashMap<String, Vec<oneshot::Sender<Body>>>>>;
+const MAX_DAEMON_REQUEST_BYTES: usize = 8192;
 
 #[derive(Clone)]
 struct State {
@@ -33,9 +35,9 @@ impl State {
     fn new(client: Client) -> Self {
         Self {
             client,
-            memory: Arc::new(RwLock::new(FxHashMap::default())),
-            chunks: Arc::new(RwLock::new(FxHashMap::default())),
-            redirects: Arc::new(RwLock::new(FxHashMap::default())),
+            memory: memory_cache(),
+            chunks: fetch::chunk_memory_cache(),
+            redirects: redirect_cache(),
             inflight: Arc::new(Mutex::new(FxHashMap::default())),
         }
     }
@@ -45,6 +47,7 @@ impl State {
             memory: Some(self.memory.clone()),
             chunks: Some(self.chunks.clone()),
             redirects: Some(self.redirects.clone()),
+            allow_private: super::net::allow_private_networks(),
         }
     }
 }
@@ -80,8 +83,12 @@ pub async fn request(url: &str, no_cache: bool, mode: OutputMode) -> Option<Stri
 
 pub async fn serve(client: Client, concurrency: usize) -> Result {
     let path = socket_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
+    set_socket_private(&path)?;
     eprintln!("hifi daemon listening on {}", path.display());
 
     let state = State::new(client);
@@ -99,14 +106,25 @@ pub async fn serve(client: Client, concurrency: usize) -> Result {
 fn socket_path() -> PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
+        .unwrap_or_else(|_| private_runtime_dir());
     dir.join("hifi.sock")
+}
+
+fn private_runtime_dir() -> PathBuf {
+    let uid = std::env::var("UID").unwrap_or_else(|_| std::process::id().to_string());
+    std::env::temp_dir().join(format!("hifi-{uid}"))
 }
 
 async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -> Result {
     let t0 = Instant::now();
     let mut req = Vec::with_capacity(512);
-    stream.read_to_end(&mut req).await?;
+    (&mut stream)
+        .take(MAX_DAEMON_REQUEST_BYTES as u64 + 1)
+        .read_to_end(&mut req)
+        .await?;
+    if req.len() > MAX_DAEMON_REQUEST_BYTES {
+        return reply(&mut stream, r#"{"error":"request too large"}"#).await;
+    }
     let no_cache = req.first() == Some(&b'1');
     let (mode, url_bytes) = req
         .get(1)
@@ -114,7 +132,14 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
         .map(|mode| (mode, req.get(2..).unwrap_or_default()))
         .unwrap_or((OutputMode::Json, req.get(1..).unwrap_or_default()));
     let url = std::str::from_utf8(url_bytes)?;
+    if let Ok(parsed) = url::Url::parse(url) {
+        if let Err(e) = super::net::validate_url(&parsed, super::net::allow_private_networks()) {
+            let body = serde_json::json!({ "error": e.to_string() }).to_string();
+            return reply(&mut stream, &body).await;
+        }
+    }
 
+    let mut inflight_guard = None;
     if !no_cache {
         if let Some((body, age)) = read_memory(&state.memory, url) {
             if age < CACHE_STALE_SECS {
@@ -126,11 +151,17 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
             }
         }
 
-        if let Some(rx) = join_inflight(&state.inflight, url).await {
+        let Some(mut guard) = join_inflight(&state.inflight, url).await else {
+            return reply(&mut stream, r#"{"error":"too many inflight requests"}"#).await;
+        };
+        if let Some(rx) = guard.waiter.take() {
             if let Ok(body) = rx.await {
                 let rendered = render_json_mode(body.as_ref(), mode);
                 return reply(&mut stream, &rendered).await;
             }
+        }
+        if guard.owner {
+            inflight_guard = Some(guard);
         }
     }
 
@@ -143,6 +174,7 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
         let body: Body = Arc::from(body);
         write_memory(&state.memory, url.to_string(), body.clone());
         finish_inflight(&state.inflight, url, body.clone()).await;
+        drop(inflight_guard);
         let rendered = render_json_mode(body.as_ref(), mode);
         return reply(&mut stream, &rendered).await;
     }
@@ -155,15 +187,44 @@ async fn reply(stream: &mut UnixStream, body: &str) -> Result {
     Ok(())
 }
 
-async fn join_inflight(inflight: &Inflight, url: &str) -> Option<oneshot::Receiver<Body>> {
+struct InflightGuard {
+    inflight: Inflight,
+    url: String,
+    waiter: Option<oneshot::Receiver<Body>>,
+    owner: bool,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if self.owner {
+            let inflight = self.inflight.clone();
+            let url = self.url.clone();
+            tokio::spawn(async move {
+                inflight.lock().await.remove(&url);
+            });
+        }
+    }
+}
+
+async fn join_inflight(inflight: &Inflight, url: &str) -> Option<InflightGuard> {
     let mut in_flight = inflight.lock().await;
     if let Some(waiters) = in_flight.get_mut(url) {
         let (tx, rx) = oneshot::channel();
         waiters.push(tx);
-        Some(rx)
+        Some(InflightGuard {
+            inflight: inflight.clone(),
+            url: url.to_string(),
+            waiter: Some(rx),
+            owner: false,
+        })
     } else {
         in_flight.insert(url.to_string(), Vec::new());
-        None
+        Some(InflightGuard {
+            inflight: inflight.clone(),
+            url: url.to_string(),
+            waiter: None,
+            owner: true,
+        })
     }
 }
 
@@ -171,4 +232,24 @@ async fn finish_inflight(inflight: &Inflight, url: &str, body: Body) {
     for tx in inflight.lock().await.remove(url).unwrap_or_default() {
         let _ = tx.send(body.clone());
     }
+}
+
+#[cfg(unix)]
+fn set_socket_private(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_socket_private(path: &std::path::Path) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let _ = path;
+    Ok(())
 }
