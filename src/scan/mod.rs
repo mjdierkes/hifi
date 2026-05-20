@@ -13,6 +13,8 @@ static CALL_AC: LazyLock<AhoCorasick> =
     LazyLock::new(|| AhoCorasick::new(CALL_LITERALS).expect("valid call literals"));
 static SHAPE_AC: LazyLock<AhoCorasick> =
     LazyLock::new(|| AhoCorasick::new(SHAPE_LITERALS).expect("valid shape literals"));
+static CANDIDATE_AC: LazyLock<AhoCorasick> =
+    LazyLock::new(|| AhoCorasick::new(CANDIDATE_LITERALS).expect("valid candidate literals"));
 
 pub type ApiMap = FxHashMap<String, Shape>;
 pub type CandidateMap = FxHashMap<String, Candidate>;
@@ -34,6 +36,7 @@ const METHODS: [(u8, &str); 5] = [
     (METHOD_PATCH, "PATCH"),
 ];
 const CONTENT_TYPES: [(u8, &str); 1] = [(CONTENT_JSON, "application/json")];
+const CANDIDATE_LITERALS: &[&str] = &["/api", "/graphql", "/trpc", "/_next/data"];
 
 #[derive(Default, Clone)]
 pub struct Shape {
@@ -324,6 +327,7 @@ impl Shape {
 pub fn scan(bytes: &[u8], apis: &mut ApiMap) {
     const WIN: usize = 400;
 
+    let shape_matches = collect_shape_matches(bytes);
     for m in CALL_AC.find_iter(bytes) {
         let after = m.end();
         let Some(url) = extract_url_arg(bytes, after) else {
@@ -335,29 +339,73 @@ pub fn scan(bytes: &[u8], apis: &mut ApiMap) {
 
         let ws = m.start().saturating_sub(WIN);
         let we = (after + WIN).min(bytes.len());
-        let window = &bytes[ws..we];
 
         let entry = apis.entry(url.to_owned()).or_default();
 
         entry.methods |= method_hint(CALL_LITERALS[m.pattern().as_usize()]);
 
-        for sm in SHAPE_AC.find_iter(window) {
-            match sm.pattern().as_usize() {
-                0 | 1 => entry.methods |= METHOD_POST,
-                2 | 3 => entry.methods |= METHOD_PUT,
-                4 | 5 => entry.methods |= METHOD_DELETE,
-                6 | 7 => entry.methods |= METHOD_PATCH,
-                8 | 9 => entry.methods |= METHOD_GET,
-                10 => entry.has_body = true,
-                11 => entry.has_headers = true,
-                13 => entry.content_types |= CONTENT_JSON,
-                14 | 15 => entry.auth = true,
-                _ => {}
-            }
-        }
+        apply_shape_matches(entry, &shape_matches, ws, we);
         if entry.methods == 0 {
             entry.methods = METHOD_GET;
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ShapeMatch {
+    pos: usize,
+    kind: ShapeKind,
+}
+
+#[derive(Clone, Copy)]
+enum ShapeKind {
+    Method(u8),
+    Body,
+    Headers,
+    Json,
+    Auth,
+    Ignore,
+}
+
+fn collect_shape_matches(bytes: &[u8]) -> Vec<ShapeMatch> {
+    SHAPE_AC
+        .find_iter(bytes)
+        .filter_map(|m| {
+            let kind = match m.pattern().as_usize() {
+                0 | 1 => ShapeKind::Method(METHOD_POST),
+                2 | 3 => ShapeKind::Method(METHOD_PUT),
+                4 | 5 => ShapeKind::Method(METHOD_DELETE),
+                6 | 7 => ShapeKind::Method(METHOD_PATCH),
+                8 | 9 => ShapeKind::Method(METHOD_GET),
+                10 => ShapeKind::Body,
+                11 => ShapeKind::Headers,
+                13 => ShapeKind::Json,
+                14 | 15 => ShapeKind::Auth,
+                _ => ShapeKind::Ignore,
+            };
+            (!matches!(kind, ShapeKind::Ignore)).then_some(ShapeMatch {
+                pos: m.start(),
+                kind,
+            })
+        })
+        .collect()
+}
+
+fn apply_shape_matches(entry: &mut Shape, matches: &[ShapeMatch], ws: usize, we: usize) {
+    let mut i = matches.partition_point(|m| m.pos < ws);
+    while let Some(m) = matches.get(i) {
+        if m.pos >= we {
+            break;
+        }
+        match m.kind {
+            ShapeKind::Method(method) => entry.methods |= method,
+            ShapeKind::Body => entry.has_body = true,
+            ShapeKind::Headers => entry.has_headers = true,
+            ShapeKind::Json => entry.content_types |= CONTENT_JSON,
+            ShapeKind::Auth => entry.auth = true,
+            ShapeKind::Ignore => {}
+        }
+        i += 1;
     }
 }
 
@@ -489,19 +537,9 @@ fn skip_template_expr(bytes: &[u8], mut i: usize) -> usize {
 }
 
 fn scan_candidate_text(bytes: &[u8], candidates: &mut CandidateMap) {
-    for needle in [
-        b"/api".as_slice(),
-        b"/graphql".as_slice(),
-        b"/trpc".as_slice(),
-        b"/_next/data".as_slice(),
-    ] {
-        let mut offset = 0;
-        while let Some(rel) = memchr::memmem::find(&bytes[offset..], needle) {
-            let pos = offset + rel;
-            if let Some(url) = extract_candidate_at(bytes, pos) {
-                candidates.entry(url).or_default();
-            }
-            offset = pos + needle.len();
+    for m in CANDIDATE_AC.find_iter(bytes) {
+        if let Some(url) = extract_candidate_at(bytes, m.start()) {
+            candidates.entry(url).or_default();
         }
     }
 }
@@ -542,6 +580,11 @@ fn skip_quoted(bytes: &[u8], start: usize) -> usize {
 }
 
 fn scan_template_candidate_text(bytes: &[u8], candidates: &mut CandidateMap) {
+    if memchr::memmem::find(bytes, b"${").is_none() {
+        scan_candidate_text(bytes, candidates);
+        return;
+    }
+
     let mut normalized = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
