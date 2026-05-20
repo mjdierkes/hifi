@@ -1,9 +1,9 @@
 use hifi::scan::ApiMap;
 use hifi::{cache, fetch, html, scan};
 use reqwest::Client;
+use rustc_hash::FxHashMap;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
     error::Error,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -19,8 +19,9 @@ const MAX_CHUNK_CONCURRENCY: usize = 32;
 const CACHE_FRESH_SECS: u64 = 300;
 const CACHE_STALE_SECS: u64 = 3600;
 
-type MemoryCache = Arc<RwLock<HashMap<String, (String, Instant)>>>;
-type Inflight = Arc<Mutex<HashMap<String, Vec<oneshot::Sender<String>>>>>;
+type Body = Arc<str>;
+type MemoryCache = Arc<RwLock<FxHashMap<String, (Body, Instant)>>>;
+type Inflight = Arc<Mutex<FxHashMap<String, Vec<oneshot::Sender<Body>>>>>;
 type DaemonState = Arc<(Client, MemoryCache, Inflight)>;
 
 fn socket_path() -> PathBuf {
@@ -121,8 +122,8 @@ async fn serve() -> Result<(), Box<dyn Error>> {
     let concurrency = chunk_concurrency();
     let state = Arc::new((
         make_client(concurrency)?,
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(RwLock::new(FxHashMap::default())),
+        Arc::new(Mutex::new(FxHashMap::default())),
     ));
 
     loop {
@@ -153,7 +154,7 @@ async fn handle_conn(
                 if age >= CACHE_FRESH_SECS {
                     spawn_refresh(&state.0, url, concurrency, Some(state.1.clone()));
                 }
-                return reply(&mut stream, &body).await;
+                return reply(&mut stream, body.as_ref()).await;
             }
         }
     }
@@ -161,7 +162,7 @@ async fn handle_conn(
     if !no_cache {
         if let Some(rx) = join_inflight(&state.2, url).await {
             if let Ok(body) = rx.await {
-                return reply(&mut stream, &body).await;
+                return reply(&mut stream, body.as_ref()).await;
             }
         }
     }
@@ -181,8 +182,10 @@ async fn handle_conn(
     };
     let body = serde_json::to_string(&out)?;
     if !no_cache {
+        let body: Body = Arc::from(body);
         write_memory(&state.1, url.to_string(), body.clone());
         finish_inflight(&state.2, url, body.clone()).await;
+        return reply(&mut stream, body.as_ref()).await;
     }
     reply(&mut stream, &body).await
 }
@@ -193,7 +196,7 @@ async fn reply(stream: &mut UnixStream, body: &str) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-async fn join_inflight(inflight: &Inflight, url: &str) -> Option<oneshot::Receiver<String>> {
+async fn join_inflight(inflight: &Inflight, url: &str) -> Option<oneshot::Receiver<Body>> {
     let mut in_flight = inflight.lock().await;
     if let Some(waiters) = in_flight.get_mut(url) {
         let (tx, rx) = oneshot::channel();
@@ -205,7 +208,7 @@ async fn join_inflight(inflight: &Inflight, url: &str) -> Option<oneshot::Receiv
     }
 }
 
-async fn finish_inflight(inflight: &Inflight, url: &str, body: String) {
+async fn finish_inflight(inflight: &Inflight, url: &str, body: Body) {
     for tx in inflight.lock().await.remove(url).unwrap_or_default() {
         let _ = tx.send(body.clone());
     }
@@ -248,13 +251,17 @@ async fn process(
     if !no_cache && !cache_hit {
         cache::write(&cache_path, &out);
         if let Some(memory) = memory {
-            write_memory(&memory, url.to_string(), serde_json::to_string(&out)?);
+            write_memory(
+                &memory,
+                url.to_string(),
+                Arc::from(serde_json::to_string(&out)?),
+            );
         }
     }
     Ok(out)
 }
 
-fn read_memory(memory: &MemoryCache, url: &str) -> Option<(String, u64)> {
+fn read_memory(memory: &MemoryCache, url: &str) -> Option<(Body, u64)> {
     memory
         .read()
         .ok()?
@@ -271,7 +278,7 @@ fn spawn_refresh(client: &Client, url: &str, concurrency: usize, memory: Option<
     });
 }
 
-fn write_memory(memory: &MemoryCache, url: String, body: String) {
+fn write_memory(memory: &MemoryCache, url: String, body: Body) {
     if let Ok(mut entries) = memory.write() {
         entries.insert(url, (body, Instant::now()));
     }
@@ -305,7 +312,11 @@ async fn refresh(
     .await?;
     cache::write(&cache_path, &out);
     if let Some(memory) = memory {
-        write_memory(&memory, url.to_string(), serde_json::to_string(&out)?);
+        write_memory(
+            &memory,
+            url.to_string(),
+            Arc::from(serde_json::to_string(&out)?),
+        );
     }
     Ok(())
 }
@@ -318,7 +329,7 @@ async fn collect(
     t0: Option<Instant>,
     concurrency: usize,
 ) -> Result<(Value, bool), Box<dyn Error>> {
-    let html = client.get(base.clone()).send().await?.text().await?;
+    let html = client.get(base.clone()).send().await?.bytes().await?;
     let chunks = html::extract_chunks(&html, base);
     let build_id = html::extract_build_id(&html).or_else(|| Some(cache::fingerprint(&chunks)));
 
@@ -331,7 +342,7 @@ async fn collect(
     }
 
     let mut apis = ApiMap::default();
-    scan::scan(html.as_bytes(), &mut apis);
+    scan::scan(&html, &mut apis);
 
     let (chunks_scanned, chunk_fetch_errors) = fetch::scan_chunks(
         client.clone(),

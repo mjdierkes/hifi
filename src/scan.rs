@@ -56,10 +56,7 @@ impl serde::Serialize for Methods {
             (METHOD_DELETE, "DELETE"),
             (METHOD_PATCH, "PATCH"),
         ];
-        let len = methods
-            .iter()
-            .filter(|(bit, _)| self.0 & *bit != 0)
-            .count();
+        let len = methods.iter().filter(|(bit, _)| self.0 & *bit != 0).count();
         let mut seq = serializer.serialize_seq(Some(len))?;
         for (bit, method) in methods {
             if self.0 & bit != 0 {
