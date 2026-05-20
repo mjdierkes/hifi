@@ -1,4 +1,5 @@
 use crate::scan::ApiMap;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 pub fn fingerprint(chunks: &[Url]) -> String {
@@ -26,16 +27,37 @@ pub fn path_for(base: &Url) -> std::path::PathBuf {
     dir().join(format!("{host}.json"))
 }
 
-pub fn read_chunk(url: &Url) -> Option<ApiMap> {
-    serde_json::from_slice(&std::fs::read(chunk_path_for(url)).ok()?).ok()
+pub struct CachedChunk {
+    pub apis: ApiMap,
+    pub refs: Vec<String>,
 }
 
-pub fn write_chunk(url: &Url, apis: &ApiMap) {
+#[derive(Serialize, Deserialize)]
+struct ChunkFile {
+    apis: ApiMap,
+    refs: Vec<String>,
+}
+
+pub fn read_chunk(url: &Url) -> Option<CachedChunk> {
+    let bytes = std::fs::read(chunk_path_for(url)).ok()?;
+    let chunk = serde_json::from_slice::<ChunkFile>(&bytes).ok()?;
+    Some(CachedChunk {
+        apis: chunk.apis,
+        refs: chunk.refs,
+    })
+}
+
+pub fn write_chunk(url: &Url, apis: &ApiMap, refs: &[Url]) {
     let path = chunk_path_for(url);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(bytes) = serde_json::to_vec(apis) {
+    let refs = refs.iter().map(|u| u.as_str().to_string()).collect();
+    let chunk = ChunkFile {
+        apis: apis.clone(),
+        refs,
+    };
+    if let Ok(bytes) = serde_json::to_vec(&chunk) {
         let _ = std::fs::write(path, bytes);
     }
 }
@@ -124,21 +146,23 @@ mod tests {
     }
 
     #[test]
-    fn chunk_cache_round_trips_api_map() {
+    fn chunk_cache_round_trips_api_map_and_refs() {
         let url = Url::parse("https://example.com/_next/static/chunks/app-abc.js").unwrap();
         let path = chunk_path_for(&url);
         let _ = std::fs::remove_file(&path);
 
         let mut apis = ApiMap::default();
         crate::scan::scan(br#"fetch("/api/users", {method:"POST"})"#, &mut apis);
+        let refs = vec![Url::parse("https://example.com/_next/static/chunks/app-def.js").unwrap()];
 
-        write_chunk(&url, &apis);
+        write_chunk(&url, &apis, &refs);
         let cached = read_chunk(&url).unwrap();
 
         assert_eq!(
-            serde_json::to_value(&cached).unwrap(),
+            serde_json::to_value(&cached.apis).unwrap(),
             serde_json::to_value(&apis).unwrap()
         );
+        assert_eq!(cached.refs, vec![refs[0].as_str()]);
 
         let _ = std::fs::remove_file(path);
     }

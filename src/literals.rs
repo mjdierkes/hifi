@@ -27,6 +27,10 @@ pub const CALL_LITERALS: &[&str] = &[
     ".put(",
     ".delete(",
     ".patch(",
+    "useSWR(",
+    "useSWRMutation(",
+    "useSWRInfinite(",
+    "new Request(",
 ];
 
 pub const SHAPE_LITERALS: &[&str] = &[
@@ -53,4 +57,18 @@ pub const BAD_EXTS: &[&str] = &[
     ".webp", ".mp4", ".webm", ".map",
 ];
 
-pub const SKIPPED_CHUNK_FRAGMENTS: &[&str] = &["framework-", "polyfills-", "webpack-", "main-"];
+pub const SKIPPED_CHUNK_FRAGMENTS: &[&str] = &[
+    // webpack runtime / shared chunks
+    "framework-",
+    "polyfills-",
+    "webpack-",
+    "main-",
+    "main-app-",
+    // turbopack runtime chunks (Next 15+)
+    "_next/static/chunks/_turbopack_",
+    "[turbopack]_runtime",
+    "[next]_internal_",
+    // react / next shared vendor chunks
+    "react-refresh",
+    "next/dist/",
+];

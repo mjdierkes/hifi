@@ -1,67 +1,102 @@
 use crate::{
-    cache,
+    cache, html,
     scan::{self, ApiMap},
 };
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::{Arc, RwLock};
 use url::Url;
 
 const INLINE_SCAN_MAX: usize = 64 * 1024;
 const CHUNK_MEMORY_CACHE_MAX_ENTRIES: usize = 1024;
+const MAX_CHUNK_DISCOVERY_ROUNDS: usize = 4;
 
-pub type ChunkMemoryCache = Arc<RwLock<FxHashMap<String, Arc<ApiMap>>>>;
-
-pub async fn scan_chunks(
-    client: Client,
-    chunks: impl Iterator<Item = Url>,
-    concurrency: usize,
-    use_cache: bool,
-    memory: Option<ChunkMemoryCache>,
-    apis: &mut ApiMap,
-) -> ChunkScanStats {
-    let mut stats = ChunkScanStats::default();
-
-    let mut fetched = stream::iter(chunks)
-        .map(|url| fetch_scan(client.clone(), url, use_cache, memory.clone()))
-        .buffer_unordered(concurrency);
-
-    while let Some(res) = fetched.next().await {
-        match res {
-            Ok(ChunkScan::Fetched(chunk_apis)) => {
-                stats.scanned += 1;
-                scan::merge_into(apis, chunk_apis);
-            }
-            Ok(ChunkScan::Cached(chunk_apis)) => {
-                stats.cache_hits += 1;
-                scan::merge_into(apis, chunk_apis);
-            }
-            Ok(ChunkScan::MemoryCached(chunk_apis)) => {
-                stats.cache_hits += 1;
-                stats.memory_hits += 1;
-                scan::merge_refs_into(apis, chunk_apis.iter());
-            }
-            _ => stats.errors += 1,
-        }
-    }
-
-    stats
-}
+pub type ChunkMemoryCache = Arc<RwLock<FxHashMap<String, Arc<ChunkData>>>>;
 
 #[derive(Default)]
 pub struct ChunkScanStats {
+    pub discovered: usize,
     pub scanned: usize,
     pub cache_hits: usize,
     pub memory_hits: usize,
     pub errors: usize,
 }
 
+#[derive(Clone)]
+pub struct ChunkData {
+    apis: ApiMap,
+    refs: Vec<Url>,
+}
+
 enum ChunkScan {
-    Fetched(ApiMap),
-    Cached(ApiMap),
-    MemoryCached(Arc<ApiMap>),
+    Fetched(ChunkData),
+    Cached(ChunkData),
+    MemoryCached(Arc<ChunkData>),
+}
+
+pub async fn scan_chunks(
+    client: Client,
+    initial: impl IntoIterator<Item = Url>,
+    concurrency: usize,
+    use_cache: bool,
+    memory: Option<ChunkMemoryCache>,
+    apis: &mut ApiMap,
+) -> ChunkScanStats {
+    let mut stats = ChunkScanStats::default();
+    let mut visited: FxHashSet<String> = FxHashSet::default();
+    let mut queue: Vec<Url> = initial
+        .into_iter()
+        .filter(|u| visited.insert(u.as_str().to_string()))
+        .collect();
+
+    for _ in 0..MAX_CHUNK_DISCOVERY_ROUNDS {
+        if queue.is_empty() {
+            break;
+        }
+        let batch = std::mem::take(&mut queue);
+        let mut fetched = stream::iter(batch)
+            .map(|url| fetch_scan(client.clone(), url, use_cache, memory.clone()))
+            .buffer_unordered(concurrency);
+
+        while let Some(res) = fetched.next().await {
+            match res {
+                Ok(ChunkScan::Fetched(chunk)) => {
+                    stats.scanned += 1;
+                    merge_chunk(apis, &chunk);
+                    enqueue_refs(&chunk.refs, &mut visited, &mut queue);
+                }
+                Ok(ChunkScan::Cached(chunk)) => {
+                    stats.cache_hits += 1;
+                    merge_chunk(apis, &chunk);
+                    enqueue_refs(&chunk.refs, &mut visited, &mut queue);
+                }
+                Ok(ChunkScan::MemoryCached(chunk)) => {
+                    stats.cache_hits += 1;
+                    stats.memory_hits += 1;
+                    scan::merge_refs_into(apis, chunk.apis.iter());
+                    enqueue_refs(&chunk.refs, &mut visited, &mut queue);
+                }
+                _ => stats.errors += 1,
+            }
+        }
+    }
+
+    stats.discovered = visited.len();
+    stats
+}
+
+fn merge_chunk(apis: &mut ApiMap, chunk: &ChunkData) {
+    scan::merge_refs_into(apis, chunk.apis.iter());
+}
+
+fn enqueue_refs(refs: &[Url], visited: &mut FxHashSet<String>, queue: &mut Vec<Url>) {
+    for r in refs {
+        if visited.insert(r.as_str().to_string()) {
+            queue.push(r.clone());
+        }
+    }
 }
 
 async fn fetch_scan(
@@ -71,12 +106,20 @@ async fn fetch_scan(
     memory: Option<ChunkMemoryCache>,
 ) -> Result<ChunkScan, ()> {
     if use_cache {
-        if let Some(apis) = read_memory_chunk(memory.as_ref(), &url) {
-            return Ok(ChunkScan::MemoryCached(apis));
+        if let Some(chunk) = read_memory_chunk(memory.as_ref(), &url) {
+            return Ok(ChunkScan::MemoryCached(chunk));
         }
-        if let Some(apis) = cache::read_chunk(&url) {
-            write_memory_chunk(memory.as_ref(), &url, &apis);
-            return Ok(ChunkScan::Cached(apis));
+        if let Some(cached) = cache::read_chunk(&url) {
+            let chunk = ChunkData {
+                apis: cached.apis,
+                refs: cached
+                    .refs
+                    .into_iter()
+                    .filter_map(|s| Url::parse(&s).ok())
+                    .collect(),
+            };
+            write_memory_chunk(memory.as_ref(), &url, &chunk);
+            return Ok(ChunkScan::Cached(chunk));
         }
     }
 
@@ -89,24 +132,26 @@ async fn fetch_scan(
         .map_err(|_| ())?;
     let mut apis = ApiMap::default();
     let body = response.bytes().await.map_err(|_| ())?;
+    let refs = html::extract_chunk_refs(&body, &url);
     scan_bytes(body, &mut apis).await?;
+    let chunk = ChunkData { apis, refs };
     if use_cache {
-        cache::write_chunk(&url, &apis);
-        write_memory_chunk(memory.as_ref(), &url, &apis);
+        cache::write_chunk(&url, &chunk.apis, &chunk.refs);
+        write_memory_chunk(memory.as_ref(), &url, &chunk);
     }
-    Ok(ChunkScan::Fetched(apis))
+    Ok(ChunkScan::Fetched(chunk))
 }
 
-fn read_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url) -> Option<Arc<ApiMap>> {
+fn read_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url) -> Option<Arc<ChunkData>> {
     memory?.read().ok()?.get(url.as_str()).cloned()
 }
 
-fn write_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url, apis: &ApiMap) {
+fn write_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url, chunk: &ChunkData) {
     let Some(memory) = memory else {
         return;
     };
     if let Ok(mut entries) = memory.write() {
-        entries.insert(url.as_str().to_string(), Arc::new(apis.clone()));
+        entries.insert(url.as_str().to_string(), Arc::new(chunk.clone()));
         if entries.len() <= CHUNK_MEMORY_CACHE_MAX_ENTRIES {
             return;
         }
@@ -116,66 +161,6 @@ fn write_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url, apis: &ApiMa
             entries.remove(&key);
         }
     }
-}
-
-pub async fn grep_chunks(
-    client: Client,
-    chunks: impl Iterator<Item = Url>,
-    concurrency: usize,
-    pattern: &str,
-    context: usize,
-) -> Vec<GrepHit> {
-    let pat = std::sync::Arc::new(pattern.to_string());
-    let mut searched = stream::iter(chunks)
-        .map(|url| grep_one(client.clone(), url, pat.clone(), context))
-        .buffer_unordered(concurrency);
-
-    let mut hits = Vec::new();
-    while let Some(mut h) = searched.next().await {
-        hits.append(&mut h);
-    }
-    hits
-}
-
-pub struct GrepHit {
-    pub url: String,
-    pub offset: usize,
-    pub snippet: String,
-}
-
-async fn grep_one(
-    client: Client,
-    url: Url,
-    pattern: std::sync::Arc<String>,
-    context: usize,
-) -> Vec<GrepHit> {
-    let Ok(resp) = client.get(url.clone()).send().await else {
-        return Vec::new();
-    };
-    let Ok(resp) = resp.error_for_status() else {
-        return Vec::new();
-    };
-    let Ok(body) = resp.bytes().await else {
-        return Vec::new();
-    };
-
-    let mut hits = Vec::new();
-    let bytes = &body[..];
-    let pat_bytes = pattern.as_bytes();
-    if pat_bytes.is_empty() {
-        return hits;
-    }
-    for abs in memchr::memmem::find_iter(bytes, pat_bytes) {
-        let lo = abs.saturating_sub(context);
-        let hi = (abs + pat_bytes.len() + context).min(bytes.len());
-        let snippet = String::from_utf8_lossy(&bytes[lo..hi]).replace('\n', " ");
-        hits.push(GrepHit {
-            url: url.to_string(),
-            offset: abs,
-            snippet,
-        });
-    }
-    hits
 }
 
 async fn scan_bytes(bytes: Bytes, apis: &mut ApiMap) -> Result<(), ()> {
@@ -193,4 +178,63 @@ async fn scan_bytes(bytes: Bytes, apis: &mut ApiMap) -> Result<(), ()> {
     .map_err(|_| ())?;
     scan::merge_into(apis, chunk_apis);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn memory_cached_chunks_keep_recursive_refs() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0; 1024];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let body = if req.starts_with("GET /_next/static/chunks/b.js ") {
+                        r#"fetch("/api/b")"#
+                    } else {
+                        r#"fetch("/api/a");"static/chunks/b.js""#
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+
+        let client = Client::new();
+        let memory = Arc::new(RwLock::new(FxHashMap::default()));
+        let initial = Url::parse(&format!("http://{addr}/_next/static/chunks/a.js")).unwrap();
+
+        let mut first = ApiMap::default();
+        let first_stats = scan_chunks(
+            client.clone(),
+            [initial.clone()],
+            1,
+            true,
+            Some(memory.clone()),
+            &mut first,
+        )
+        .await;
+        assert_eq!(first_stats.discovered, 2);
+        assert!(first.contains_key("/api/a"));
+        assert!(first.contains_key("/api/b"));
+
+        let mut second = ApiMap::default();
+        let second_stats = scan_chunks(client, [initial], 1, true, Some(memory), &mut second).await;
+        assert_eq!(second_stats.discovered, 2);
+        assert_eq!(second_stats.memory_hits, 2);
+        assert!(second.contains_key("/api/a"));
+        assert!(second.contains_key("/api/b"));
+    }
 }
