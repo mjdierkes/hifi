@@ -1,6 +1,7 @@
 use crate::literals::{method_from_pattern, BAD_EXTS, CALL_LITERALS, SHAPE_LITERALS};
 use aho_corasick::AhoCorasick;
-use std::collections::BTreeMap;
+use serde::ser::{SerializeStruct, Serializer};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 
 static CALL_AC: LazyLock<AhoCorasick> =
@@ -8,16 +9,81 @@ static CALL_AC: LazyLock<AhoCorasick> =
 static SHAPE_AC: LazyLock<AhoCorasick> =
     LazyLock::new(|| AhoCorasick::new(SHAPE_LITERALS).expect("valid shape literals"));
 
-#[derive(Default, Clone, serde::Serialize)]
+pub type ApiMap = HashMap<String, Shape>;
+
+const METHOD_GET: u8 = 1 << 0;
+const METHOD_POST: u8 = 1 << 1;
+const METHOD_PUT: u8 = 1 << 2;
+const METHOD_DELETE: u8 = 1 << 3;
+const METHOD_PATCH: u8 = 1 << 4;
+const CONTENT_JSON: u8 = 1 << 0;
+
+#[derive(Default, Clone)]
 pub struct Shape {
-    methods: Vec<&'static str>,
+    methods: u8,
     has_body: bool,
     has_headers: bool,
-    content_types: Vec<&'static str>,
+    content_types: u8,
     auth: bool,
 }
 
-pub fn scan(bytes: &[u8], apis: &mut BTreeMap<String, Shape>) {
+impl serde::Serialize for Shape {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut st = serializer.serialize_struct("Shape", 5)?;
+        st.serialize_field("methods", &self.methods())?;
+        st.serialize_field("has_body", &self.has_body)?;
+        st.serialize_field("has_headers", &self.has_headers)?;
+        st.serialize_field("content_types", &self.content_types())?;
+        st.serialize_field("auth", &self.auth)?;
+        st.end()
+    }
+}
+
+impl Shape {
+    fn add_method(&mut self, method: &'static str) {
+        self.methods |= match method {
+            "GET" => METHOD_GET,
+            "POST" => METHOD_POST,
+            "PUT" => METHOD_PUT,
+            "DELETE" => METHOD_DELETE,
+            "PATCH" => METHOD_PATCH,
+            _ => METHOD_GET,
+        };
+    }
+
+    fn methods(&self) -> Vec<&'static str> {
+        [
+            (METHOD_GET, "GET"),
+            (METHOD_POST, "POST"),
+            (METHOD_PUT, "PUT"),
+            (METHOD_DELETE, "DELETE"),
+            (METHOD_PATCH, "PATCH"),
+        ]
+        .into_iter()
+        .filter_map(|(bit, method)| (self.methods & bit != 0).then_some(method))
+        .collect()
+    }
+
+    fn content_types(&self) -> Vec<&'static str> {
+        (self.content_types & CONTENT_JSON != 0)
+            .then_some("application/json")
+            .into_iter()
+            .collect()
+    }
+
+    fn merge(&mut self, other: Shape) {
+        self.methods |= other.methods;
+        self.has_body |= other.has_body;
+        self.has_headers |= other.has_headers;
+        self.content_types |= other.content_types;
+        self.auth |= other.auth;
+    }
+}
+
+pub fn scan(bytes: &[u8], apis: &mut ApiMap) {
     const WIN: usize = 400;
 
     for m in CALL_AC.find_iter(bytes) {
@@ -39,25 +105,29 @@ pub fn scan(bytes: &[u8], apis: &mut BTreeMap<String, Shape>) {
             match pat {
                 p if p.starts_with("method:") => {
                     let method = method_from_pattern(p);
-                    if !entry.methods.contains(&method) {
-                        entry.methods.push(method);
-                    }
+                    entry.add_method(method);
                 }
                 "body:" => entry.has_body = true,
                 "headers:" => entry.has_headers = true,
-                "application/json" => {
-                    if !entry.content_types.contains(&"application/json") {
-                        entry.content_types.push("application/json");
-                    }
-                }
+                "application/json" => entry.content_types |= CONTENT_JSON,
                 "Authorization" | "Bearer" => entry.auth = true,
                 _ => {}
             }
         }
-        if entry.methods.is_empty() {
-            entry.methods.push("GET");
+        if entry.methods == 0 {
+            entry.add_method("GET");
         }
     }
+}
+
+pub fn merge_into(dst: &mut ApiMap, src: ApiMap) {
+    for (url, shape) in src {
+        dst.entry(url).or_default().merge(shape);
+    }
+}
+
+pub fn sorted(apis: ApiMap) -> BTreeMap<String, Shape> {
+    apis.into_iter().collect()
 }
 
 fn extract_url_arg(bytes: &[u8], start: usize) -> Option<&str> {
