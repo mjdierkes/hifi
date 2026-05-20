@@ -50,14 +50,6 @@ pub fn write_chunk(url: &Url, chunk: &ChunkData, cache_key: Option<&str>) {
     write_json(&chunk_path_for(url, cache_key), chunk);
 }
 
-pub fn read_bundle(url: &Url) -> Option<Vec<u8>> {
-    read_fresh(&bundle_path_for(url), super::processor::CACHE_STALE_SECS).map(|(bytes, _)| bytes)
-}
-
-pub fn write_bundle(url: &Url, bytes: &[u8]) {
-    write_bytes(&bundle_path_for(url), bytes);
-}
-
 pub fn read_bundle_pack(seed: &[Url], cache_key: Option<&str>) -> Option<Vec<(Url, Vec<u8>)>> {
     let (bytes, _) = read_fresh(
         &bundle_pack_path_for(seed, cache_key)?,
@@ -100,10 +92,6 @@ pub fn write_page(url: &Url, final_url: &Url, bytes: &[u8]) {
 
 fn chunk_path_for(url: &Url, cache_key: Option<&str>) -> PathBuf {
     keyed_hashed_path("chunks", url, cache_key, "json")
-}
-
-fn bundle_path_for(url: &Url) -> PathBuf {
-    hashed_path("bundles", url, "bin")
 }
 
 fn bundle_pack_path_for(seed: &[Url], cache_key: Option<&str>) -> Option<PathBuf> {
@@ -373,23 +361,6 @@ mod tests {
             .unwrap()
             .apis
             .contains_key("/api/v2"));
-    }
-
-    #[test]
-    fn bundle_cache_round_trips_raw_bytes() {
-        let url = Url::parse(&format!(
-            "https://example.com/_next/static/chunks/test-{}.js",
-            TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
-        ))
-        .unwrap();
-        let path = bundle_path_for(&url);
-        let body = b"fetch('/api/raw-bundle')";
-        let _ = std::fs::remove_file(&path);
-
-        write_bundle(&url, body);
-
-        assert_eq!(read_bundle(&url).as_deref(), Some(body.as_slice()));
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]

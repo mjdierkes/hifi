@@ -153,7 +153,7 @@ async fn fetch_scan(
     client: Client,
     url: Url,
     use_processed_cache: bool,
-    use_bundle_cache: bool,
+    _use_bundle_cache: bool,
     cache_key: Option<&str>,
     allow_private: bool,
     memory: Option<ChunkMemoryCache>,
@@ -177,19 +177,6 @@ async fn fetch_scan(
             });
         }
     }
-    if use_bundle_cache && cache_key.is_none() {
-        if let Some(body) = cache::read_bundle(&url) {
-            return scan_body(
-                Bytes::from(body),
-                url,
-                use_processed_cache,
-                cache_key,
-                memory,
-            )
-            .await;
-        }
-    }
-
     let body = net::get_bytes_limited(&client, url.clone(), allow_private)
         .await
         .map_err(|_| ())?;
