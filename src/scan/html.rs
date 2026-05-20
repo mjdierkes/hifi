@@ -10,11 +10,7 @@ pub fn extract_chunks(html: &[u8], base: &Url) -> Vec<Url> {
     while let Some(rel) = memmem::find(&html[offset..], b"/_next/") {
         let needle_pos = offset + rel;
         let start = walk_url_start(html, needle_pos);
-        let end = html[needle_pos..]
-            .iter()
-            .position(|b| b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'<' | b'>' | b')'))
-            .map(|n| needle_pos + n)
-            .unwrap_or(html.len());
+        let end = needle_pos + url_len(&html[needle_pos..], false);
         push_chunk(&html[start..end], base, false, &mut seen, &mut out);
         offset = end;
     }
@@ -70,14 +66,7 @@ pub fn extract_chunk_refs(body: &[u8], base: &Url) -> Vec<Url> {
             offset = pos + needle.len();
             continue;
         }
-        let end = body[pos..]
-            .iter()
-            .position(|b| {
-                b.is_ascii_whitespace()
-                    || matches!(b, b'"' | b'\'' | b'`' | b'<' | b'>' | b')' | b',' | b';')
-            })
-            .map(|n| pos + n)
-            .unwrap_or(body.len());
+        let end = pos + url_len(&body[pos..], true);
         push_chunk(&body[pos..end], base, true, &mut seen, &mut out);
         offset = end;
     }
@@ -108,6 +97,17 @@ fn push_unique(url: Url, seen: &mut FxHashSet<Url>, out: &mut Vec<Url>) {
     if seen.insert(url.clone()) {
         out.push(url);
     }
+}
+
+fn url_len(bytes: &[u8], backtick: bool) -> usize {
+    bytes
+        .iter()
+        .position(|b| {
+            b.is_ascii_whitespace()
+                || matches!(b, b'"' | b'\'' | b'<' | b'>' | b')' | b',' | b';')
+                || (backtick && *b == b'`')
+        })
+        .unwrap_or(bytes.len())
 }
 
 fn is_skipped_chunk(src: &[u8]) -> bool {

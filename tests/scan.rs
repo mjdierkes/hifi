@@ -1,4 +1,4 @@
-use hifi::scan::{scan, ApiMap};
+use hifi::scan::{scan, scan_candidates, ApiMap, CandidateMap};
 
 #[test]
 fn finds_fetch_url_and_shape() {
@@ -38,6 +38,32 @@ fn rejects_asset_urls() {
 
     assert!(!apis.contains_key("/images/LOGO.PNG?cache=1"));
     assert!(apis.contains_key("/api/users"));
+}
+
+#[test]
+fn finds_api_candidate_literals_outside_calls() {
+    let mut candidates = CandidateMap::default();
+    scan_candidates(
+        br#"const routes={users:"/api/users",gql:"/graphql",data:"/_next/data/b1/users.json"}; let full="https://x.test/api/team";"#,
+        &mut candidates,
+    );
+
+    assert!(candidates.contains_key("/api/users"));
+    assert!(candidates.contains_key("/graphql"));
+    assert!(candidates.contains_key("/_next/data/b1/users.json"));
+    assert!(candidates.contains_key("https://x.test/api/team"));
+}
+
+#[test]
+fn finds_api_candidate_template_fragments() {
+    let mut candidates = CandidateMap::default();
+    scan_candidates(
+        br#"fetch(`/api/users/${id}`); fetch(`${base}/api/admin`)"#,
+        &mut candidates,
+    );
+
+    assert!(candidates.contains_key("/api/users/"));
+    assert!(candidates.contains_key("/api/admin"));
 }
 
 fn scanned(bytes: &[u8]) -> ApiMap {

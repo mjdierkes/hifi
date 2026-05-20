@@ -5,7 +5,6 @@ use super::processor::{
 };
 use reqwest::Client;
 use rustc_hash::FxHashMap;
-use serde_json::json;
 use std::{
     error::Error,
     path::PathBuf,
@@ -127,8 +126,8 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
     let out = Processor::new(&state.client, concurrency, state.cache())
         .process(url, no_cache, t0)
         .await
-        .unwrap_or_else(|e| json!({ "error": e.to_string() }));
-    let body = serde_json::to_string(&out)?;
+        .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }).to_string());
+    let body = out;
     if !no_cache {
         let body: Body = Arc::from(body);
         write_memory(&state.memory, url.to_string(), body.clone());

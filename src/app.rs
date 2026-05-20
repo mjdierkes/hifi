@@ -37,7 +37,7 @@ pub async fn run(raw: Vec<String>) -> Result<(), Box<dyn Error>> {
     let out = Processor::new(&client, concurrency, CacheContext::default())
         .process(&url, no_cache, std::time::Instant::now())
         .await?;
-    println!("{}", serde_json::to_string(&out)?);
+    println!("{}", out);
     Ok(())
 }
 

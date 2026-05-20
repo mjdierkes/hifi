@@ -1,4 +1,4 @@
-use crate::scan::ApiMap;
+use crate::scan::{ApiMap, CandidateMap};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -37,6 +37,7 @@ pub fn path_for(base: &Url) -> PathBuf {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ChunkData {
     pub apis: ApiMap,
+    pub candidates: CandidateMap,
     pub refs: Vec<Url>,
 }
 
@@ -59,21 +60,25 @@ fn chunk_path_for(url: &Url) -> PathBuf {
 
 pub fn read(path: &Path, build_id: Option<&str>) -> Option<serde_json::Value> {
     let expected = build_id?;
-    if let Some(cached) = read_build_id(path) {
-        return (cached == expected).then(|| read_any(path).map(|(v, _)| v))?;
-    }
-
-    let (v, _) = read_any(path)?;
-    let cached_build = v.get("build_id").and_then(|b| b.as_str());
-    (cached_build == Some(expected)).then_some(v)
+    (read_build_id(path)? == expected).then(|| read_any(path).map(|(v, _)| v))?
 }
 
 pub fn read_any(path: &Path) -> Option<(serde_json::Value, u64)> {
+    let (bytes, age) = read_any_bytes(path)?;
+    let v = serde_json::from_slice(&bytes).ok()?;
+    Some((v, age))
+}
+
+pub fn read_build_bytes(path: &Path, build_id: Option<&str>) -> Option<Vec<u8>> {
+    let expected = build_id?;
+    (read_build_id(path)? == expected).then(|| fs::read(path).ok())?
+}
+
+pub fn read_any_bytes(path: &Path) -> Option<(Vec<u8>, u64)> {
     let meta = fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
     let age = SystemTime::now().duration_since(modified).ok()?.as_secs();
-    let v = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    Some((v, age))
+    Some((fs::read(path).ok()?, age))
 }
 
 pub fn write(path: &Path, value: &serde_json::Value) {
@@ -140,6 +145,17 @@ mod tests {
     }
 
     #[test]
+    fn cache_without_build_sidecar_is_ignored() {
+        let path = test_path();
+        std::fs::write(&path, br#"{"build_id":"a","apis":{}}"#).unwrap();
+
+        assert!(read(&path, Some("a")).is_none());
+        assert!(read_build_bytes(&path, Some("a")).is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn chunk_cache_round_trips_api_map_and_refs() {
         let url = Url::parse("https://example.com/_next/static/chunks/app-abc.js").unwrap();
         let path = chunk_path_for(&url);
@@ -153,6 +169,7 @@ mod tests {
             &url,
             &ChunkData {
                 apis: apis.clone(),
+                candidates: CandidateMap::default(),
                 refs: refs.clone(),
             },
         );

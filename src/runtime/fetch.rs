@@ -1,5 +1,5 @@
 use crate::scan::html;
-use crate::scan::{self, ApiMap};
+use crate::scan::{self, ApiMap, CandidateMap};
 
 use super::cache::{self, ChunkData};
 use bytes::Bytes;
@@ -9,7 +9,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::{Arc, RwLock};
 use url::Url;
 
-const INLINE_SCAN_MAX: usize = 64 * 1024;
+const INLINE_SCAN_MAX: usize = 256 * 1024;
 const CHUNK_MEMORY_CACHE_MAX_ENTRIES: usize = 1024;
 const MAX_CHUNK_DISCOVERY_ROUNDS: usize = 4;
 
@@ -37,12 +37,13 @@ pub async fn scan_chunks(
     use_cache: bool,
     memory: Option<ChunkMemoryCache>,
     apis: &mut ApiMap,
+    candidates: &mut CandidateMap,
 ) -> ChunkScanStats {
     let mut stats = ChunkScanStats::default();
-    let mut visited: FxHashSet<String> = FxHashSet::default();
+    let mut visited: FxHashSet<Url> = FxHashSet::default();
     let mut queue: Vec<Url> = initial
         .into_iter()
-        .filter(|u| visited.insert(u.as_str().to_string()))
+        .filter(|u| visited.insert(u.clone()))
         .collect();
 
     for _ in 0..MAX_CHUNK_DISCOVERY_ROUNDS {
@@ -58,6 +59,7 @@ pub async fn scan_chunks(
                 Ok((chunk, source)) => {
                     stats.record(source);
                     scan::merge_refs_into(apis, chunk.apis.iter());
+                    scan::merge_candidate_refs_into(candidates, chunk.candidates.iter());
                     enqueue_refs(&chunk.refs, &mut visited, &mut queue);
                 }
                 Err(()) => stats.errors += 1,
@@ -82,9 +84,9 @@ impl ChunkScanStats {
     }
 }
 
-fn enqueue_refs(refs: &[Url], visited: &mut FxHashSet<String>, queue: &mut Vec<Url>) {
+fn enqueue_refs(refs: &[Url], visited: &mut FxHashSet<Url>, queue: &mut Vec<Url>) {
     for r in refs {
-        if visited.insert(r.as_str().to_string()) {
+        if visited.insert(r.clone()) {
             queue.push(r.clone());
         }
     }
@@ -114,10 +116,15 @@ async fn fetch_scan(
         .error_for_status()
         .map_err(|_| ())?;
     let mut apis = ApiMap::default();
+    let mut candidates = CandidateMap::default();
     let body = response.bytes().await.map_err(|_| ())?;
     let refs = html::extract_chunk_refs(&body, &url);
-    scan_bytes(body, &mut apis).await?;
-    let chunk = Arc::new(ChunkData { apis, refs });
+    scan_bytes(body, &mut apis, &mut candidates).await?;
+    let chunk = Arc::new(ChunkData {
+        apis,
+        candidates,
+        refs,
+    });
     if use_cache {
         cache::write_chunk(&url, &chunk);
         write_memory_chunk(memory.as_ref(), &url, chunk.clone());
@@ -139,20 +146,28 @@ fn write_memory_chunk(memory: Option<&ChunkMemoryCache>, url: &Url, chunk: Arc<C
     }
 }
 
-async fn scan_bytes(bytes: Bytes, apis: &mut ApiMap) -> Result<(), ()> {
+async fn scan_bytes(
+    bytes: Bytes,
+    apis: &mut ApiMap,
+    candidates: &mut CandidateMap,
+) -> Result<(), ()> {
     if bytes.len() <= INLINE_SCAN_MAX {
         scan::scan(&bytes, apis);
+        scan::scan_candidates(&bytes, candidates);
         return Ok(());
     }
 
-    let chunk_apis = tokio::task::spawn_blocking(move || {
+    let (chunk_apis, chunk_candidates) = tokio::task::spawn_blocking(move || {
         let mut chunk_apis = ApiMap::default();
+        let mut chunk_candidates = CandidateMap::default();
         scan::scan(&bytes, &mut chunk_apis);
-        chunk_apis
+        scan::scan_candidates(&bytes, &mut chunk_candidates);
+        (chunk_apis, chunk_candidates)
     })
     .await
     .map_err(|_| ())?;
     scan::merge_into(apis, chunk_apis);
+    scan::merge_candidates_into(candidates, chunk_candidates);
     Ok(())
 }
 
@@ -200,6 +215,7 @@ mod tests {
             true,
             Some(memory.clone()),
             &mut first,
+            &mut CandidateMap::default(),
         )
         .await;
         assert_eq!(first_stats.discovered, 2);
@@ -207,7 +223,16 @@ mod tests {
         assert!(first.contains_key("/api/b"));
 
         let mut second = ApiMap::default();
-        let second_stats = scan_chunks(client, [initial], 1, true, Some(memory), &mut second).await;
+        let second_stats = scan_chunks(
+            client,
+            [initial],
+            1,
+            true,
+            Some(memory),
+            &mut second,
+            &mut CandidateMap::default(),
+        )
+        .await;
         assert_eq!(second_stats.discovered, 2);
         assert_eq!(second_stats.memory_hits, 2);
         assert!(second.contains_key("/api/a"));

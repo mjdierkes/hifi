@@ -10,6 +10,7 @@ static SHAPE_AC: LazyLock<AhoCorasick> =
     LazyLock::new(|| AhoCorasick::new(SHAPE_LITERALS).expect("valid shape literals"));
 
 pub type ApiMap = FxHashMap<String, Shape>;
+pub type CandidateMap = FxHashMap<String, Candidate>;
 
 pub mod html;
 pub mod literals;
@@ -44,6 +45,21 @@ pub struct Shape {
     )]
     content_types: u8,
     auth: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Candidate {
+    source: String,
+    confidence: String,
+}
+
+impl Default for Candidate {
+    fn default() -> Self {
+        Self {
+            source: "literal".into(),
+            confidence: "candidate".into(),
+        }
+    }
 }
 
 fn serialize_methods<S: serde::Serializer>(bits: &u8, s: S) -> Result<S::Ok, S::Error> {
@@ -137,6 +153,53 @@ pub fn scan(bytes: &[u8], apis: &mut ApiMap) {
     }
 }
 
+pub fn scan_candidates(bytes: &[u8], candidates: &mut CandidateMap) {
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => {
+                let quote = bytes[i];
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len() && bytes[end] != quote {
+                    if bytes[end] == b'\\' && end + 1 < bytes.len() {
+                        end += 2;
+                        continue;
+                    }
+                    if quote == b'`'
+                        && bytes[end] == b'$'
+                        && end + 1 < bytes.len()
+                        && bytes[end + 1] == b'{'
+                    {
+                        scan_candidate_text(&bytes[start..end], candidates);
+                        end = skip_template_expr(bytes, end + 2);
+                        continue;
+                    }
+                    end += 1;
+                }
+                scan_candidate_text(&bytes[start..end], candidates);
+                i = end.saturating_add(1);
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+pub fn merge_candidates_into(dst: &mut CandidateMap, src: CandidateMap) {
+    for (url, candidate) in src {
+        dst.entry(url).or_insert(candidate);
+    }
+}
+
+pub fn merge_candidate_refs_into<'a>(
+    dst: &mut CandidateMap,
+    src: impl IntoIterator<Item = (&'a String, &'a Candidate)>,
+) {
+    for (url, candidate) in src {
+        dst.entry(url.clone()).or_insert_with(|| candidate.clone());
+    }
+}
+
 pub fn merge_into(dst: &mut ApiMap, src: ApiMap) {
     for (url, shape) in src {
         dst.entry(url).or_default().merge_ref(&shape);
@@ -197,6 +260,91 @@ fn extract_url_arg(bytes: &[u8], start: usize) -> Option<&str> {
     }
 
     std::str::from_utf8(&bytes[s..e]).ok()
+}
+
+fn skip_template_expr(bytes: &[u8], mut i: usize) -> usize {
+    let mut depth = 1;
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            b'\\' if i + 1 < bytes.len() => i += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+fn scan_candidate_text(bytes: &[u8], candidates: &mut CandidateMap) {
+    for needle in [
+        b"/api".as_slice(),
+        b"/graphql".as_slice(),
+        b"/trpc".as_slice(),
+        b"/_next/data".as_slice(),
+    ] {
+        let mut offset = 0;
+        while let Some(rel) = memchr::memmem::find(&bytes[offset..], needle) {
+            let pos = offset + rel;
+            if let Some(url) = extract_candidate_at(bytes, pos) {
+                candidates.entry(url).or_default();
+            }
+            offset = pos + needle.len();
+        }
+    }
+}
+
+fn extract_candidate_at(bytes: &[u8], pos: usize) -> Option<String> {
+    let start = walk_candidate_start(bytes, pos);
+    let end = bytes[pos..]
+        .iter()
+        .position(|b| is_candidate_delim(*b))
+        .map(|n| pos + n)
+        .unwrap_or(bytes.len());
+    let raw = std::str::from_utf8(&bytes[start..end]).ok()?;
+    let url = raw.trim_matches('\\');
+    is_api_candidate(url).then(|| url.to_owned())
+}
+
+fn walk_candidate_start(bytes: &[u8], pos: usize) -> usize {
+    let mut s = pos;
+    while s > 0 && !is_candidate_delim(bytes[s - 1]) {
+        s -= 1;
+    }
+    s
+}
+
+fn is_candidate_delim(b: u8) -> bool {
+    b.is_ascii_whitespace()
+        || matches!(
+            b,
+            b'"' | b'\''
+                | b'`'
+                | b'<'
+                | b'>'
+                | b')'
+                | b'('
+                | b','
+                | b';'
+                | b'{'
+                | b'}'
+                | b'['
+                | b']'
+        )
+}
+
+fn is_api_candidate(s: &str) -> bool {
+    is_url_like(s)
+        && (s.starts_with("/api")
+            || s.starts_with("/graphql")
+            || s.starts_with("/trpc")
+            || s.starts_with("/_next/data")
+            || ((s.starts_with("http://") || s.starts_with("https://"))
+                && (s.contains("/api/")
+                    || s.ends_with("/api")
+                    || s.contains("/graphql")
+                    || s.contains("/trpc")
+                    || s.contains("/_next/data/"))))
 }
 
 fn method_hint(anchor: &str) -> u8 {
