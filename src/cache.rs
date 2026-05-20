@@ -31,6 +31,20 @@ pub fn read(path: &std::path::Path, build_id: Option<&str>) -> Option<serde_json
     }
 }
 
+/// Read without buildId check — used for ttl-based fast path.
+/// Returns (value, age_secs) when the file exists and parses.
+pub fn read_any(path: &std::path::Path) -> Option<(serde_json::Value, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let age = std::time::SystemTime::now()
+        .duration_since(modified)
+        .ok()?
+        .as_secs();
+    let bytes = std::fs::read(path).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some((v, age))
+}
+
 pub fn write(path: &std::path::Path, value: &serde_json::Value) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
