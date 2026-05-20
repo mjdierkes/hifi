@@ -1,12 +1,8 @@
 use crate::scan::{ApiMap, CandidateMap};
 use rustc_hash::FxHashMap;
-use serde::{
-    de::{self, MapAccess, Visitor},
-    ser::SerializeStruct,
-    Deserialize, Deserializer, Serialize, Serializer,
-};
+use serde::{Deserialize, Serialize};
 use std::{
-    fmt, fs,
+    fs,
     hash::Hash,
     path::{Path, PathBuf},
     time::SystemTime,
@@ -38,97 +34,11 @@ pub fn path_for(base: &Url) -> PathBuf {
     dir().join(format!("{host}.json"))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ChunkData {
     pub apis: ApiMap,
     pub candidates: CandidateMap,
     pub refs: Vec<Url>,
-}
-
-impl Serialize for ChunkData {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let refs: Vec<&str> = self.refs.iter().map(Url::as_str).collect();
-        let mut st = serializer.serialize_struct("ChunkData", 3)?;
-        st.serialize_field("apis", &self.apis)?;
-        st.serialize_field("candidates", &self.candidates)?;
-        st.serialize_field("refs", &refs)?;
-        st.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for ChunkData {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        enum Field {
-            Apis,
-            Candidates,
-            Refs,
-            Ignore,
-        }
-
-        impl<'de> Deserialize<'de> for Field {
-            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                struct FieldVisitor;
-
-                impl Visitor<'_> for FieldVisitor {
-                    type Value = Field;
-
-                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                        f.write_str("chunk field")
-                    }
-
-                    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                        Ok(match value {
-                            "apis" => Field::Apis,
-                            "candidates" => Field::Candidates,
-                            "refs" => Field::Refs,
-                            _ => Field::Ignore,
-                        })
-                    }
-                }
-
-                deserializer.deserialize_identifier(FieldVisitor)
-            }
-        }
-
-        struct ChunkVisitor;
-
-        impl<'de> Visitor<'de> for ChunkVisitor {
-            type Value = ChunkData;
-
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("chunk data object")
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut apis = ApiMap::default();
-                let mut candidates = CandidateMap::default();
-                let mut refs = Vec::new();
-                while let Some(field) = map.next_key()? {
-                    match field {
-                        Field::Apis => apis = map.next_value()?,
-                        Field::Candidates => candidates = map.next_value()?,
-                        Field::Refs => {
-                            let raw: Vec<String> = map.next_value()?;
-                            refs = raw
-                                .into_iter()
-                                .filter_map(|s| Url::parse(&s).ok())
-                                .collect();
-                        }
-                        Field::Ignore => {
-                            let _ = map.next_value::<de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(ChunkData {
-                    apis,
-                    candidates,
-                    refs,
-                })
-            }
-        }
-
-        deserializer.deserialize_struct("ChunkData", &["apis", "candidates", "refs"], ChunkVisitor)
-    }
 }
 
 pub fn read_chunk(url: &Url) -> Option<ChunkData> {
@@ -269,17 +179,6 @@ fn read_u64(bytes: &[u8], pos: &mut usize) -> Option<u64> {
     Some(value)
 }
 
-pub fn read(path: &Path, build_id: Option<&str>) -> Option<serde_json::Value> {
-    let expected = build_id?;
-    (read_build_id(path)? == expected).then(|| read_any(path).map(|(v, _)| v))?
-}
-
-pub fn read_any(path: &Path) -> Option<(serde_json::Value, u64)> {
-    let (bytes, age) = read_any_bytes(path)?;
-    let v = serde_json::from_slice(&bytes).ok()?;
-    Some((v, age))
-}
-
 pub fn read_build_bytes(path: &Path, build_id: Option<&str>) -> Option<Vec<u8>> {
     let expected = build_id?;
     (read_build_id(path)? == expected).then(|| fs::read(path).ok())?
@@ -290,11 +189,6 @@ pub fn read_any_bytes(path: &Path) -> Option<(Vec<u8>, u64)> {
     let modified = meta.modified().ok()?;
     let age = SystemTime::now().duration_since(modified).ok()?.as_secs();
     Some((fs::read(path).ok()?, age))
-}
-
-pub fn write(path: &Path, value: &serde_json::Value) {
-    write_json(path, value);
-    write_meta(path, value);
 }
 
 pub fn write_with_build_id<T: Serialize>(path: &Path, value: &T, build_id: Option<&str>) {
@@ -327,12 +221,6 @@ fn read_build_id(path: &Path) -> Option<String> {
     (!id.is_empty()).then(|| id.to_string())
 }
 
-fn write_meta(path: &Path, value: &serde_json::Value) {
-    if let Some(build_id) = value.get("build_id").and_then(|b| b.as_str()) {
-        let _ = fs::write(meta_path(path), build_id);
-    }
-}
-
 fn meta_path(path: &Path) -> PathBuf {
     let mut meta = path.as_os_str().to_os_string();
     meta.push(".build");
@@ -353,7 +241,6 @@ fn dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use std::{
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
@@ -362,23 +249,10 @@ mod tests {
     static TEST_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn build_id_sidecar_skips_mismatched_cache_body() {
-        let path = test_path();
-        write(&path, &json!({"build_id": "a", "apis": {}}));
-
-        assert!(read(&path, Some("b")).is_none());
-        assert!(read(&path, Some("a")).is_some());
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(meta_path(&path));
-    }
-
-    #[test]
     fn cache_without_build_sidecar_is_ignored() {
         let path = test_path();
         std::fs::write(&path, br#"{"build_id":"a","apis":{}}"#).unwrap();
 
-        assert!(read(&path, Some("a")).is_none());
         assert!(read_build_bytes(&path, Some("a")).is_none());
 
         let _ = std::fs::remove_file(&path);

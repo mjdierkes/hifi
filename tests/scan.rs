@@ -6,11 +6,9 @@ fn finds_fetch_url_and_shape() {
         br#"fetch("/api/users", {method:"POST", body:x, headers:{"Content-Type":"application/json"}})"#,
     );
 
-    let v = serde_json::to_value(&apis["/api/users"]).unwrap();
-    assert_eq!(v["methods"], serde_json::json!(["POST"]));
-    assert_eq!(v["has_body"], true);
-    assert_eq!(v["has_headers"], true);
-    assert_eq!(v["content_types"], serde_json::json!(["application/json"]));
+    let shape = &apis["/api/users"];
+    assert_eq!(shape.methods_csv(), "POST");
+    assert_eq!(shape.flags_csv(), "body,headers,json");
 }
 
 #[test]
@@ -22,8 +20,7 @@ fn finds_useswr_calls() {
 #[test]
 fn finds_new_request_urls() {
     let apis = scanned(br#"new Request("/api/upload", {method:"POST"})"#);
-    let v = serde_json::to_value(&apis["/api/upload"]).unwrap();
-    assert_eq!(v["methods"], serde_json::json!(["POST"]));
+    assert_eq!(apis["/api/upload"].methods_csv(), "POST");
 }
 
 #[test]

@@ -12,11 +12,17 @@ use std::{
 };
 use url::Url;
 
-const INLINE_SCAN_MAX: usize = 0;
 const CHUNK_MEMORY_CACHE_MAX_ENTRIES: usize = 1024;
 const MAX_CHUNK_DISCOVERY_ROUNDS: usize = 4;
 
 pub type ChunkMemoryCache = Arc<RwLock<FxHashMap<String, Arc<ChunkData>>>>;
+
+pub struct ChunkScanOptions {
+    pub concurrency: usize,
+    pub use_processed_cache: bool,
+    pub use_bundle_cache: bool,
+    pub memory: Option<ChunkMemoryCache>,
+}
 
 #[derive(Default)]
 pub struct ChunkScanStats {
@@ -29,8 +35,6 @@ pub struct ChunkScanStats {
     pub errors: usize,
     pub bytes_fetched: u64,
     pub bytes_scanned: u64,
-    pub fetch_ms: u128,
-    pub scan_ms: u128,
     pub fetch_us: u128,
     pub scan_us: u128,
     pub ref_us: u128,
@@ -45,11 +49,10 @@ enum ChunkSource {
     Memory,
 }
 
+#[derive(Default)]
 struct FetchMetrics {
     bytes_fetched: u64,
     bytes_scanned: u64,
-    fetch_ms: u128,
-    scan_ms: u128,
     fetch_us: u128,
     scan_us: u128,
     ref_us: u128,
@@ -68,10 +71,7 @@ struct FetchResult {
 pub async fn scan_chunks(
     client: Client,
     initial: impl IntoIterator<Item = Url>,
-    concurrency: usize,
-    use_processed_cache: bool,
-    use_bundle_cache: bool,
-    memory: Option<ChunkMemoryCache>,
+    opts: ChunkScanOptions,
     apis: &mut ApiMap,
     candidates: &mut CandidateMap,
 ) -> ChunkScanStats {
@@ -80,13 +80,13 @@ pub async fn scan_chunks(
     let initial: Vec<Url> = initial.into_iter().collect();
     let mut queue: Vec<Url> = initial
         .iter()
+        .filter(|&u| visited.insert(u.clone()))
         .cloned()
-        .filter(|u| visited.insert(u.clone()))
         .collect();
     let mut pack_entries = Vec::new();
     let mut pack_dirty = false;
 
-    if use_bundle_cache && !use_processed_cache {
+    if opts.use_bundle_cache && !opts.use_processed_cache {
         if let Some(entries) = cache::read_bundle_pack(&initial) {
             queue.clear();
             for (url, _) in &entries {
@@ -102,7 +102,7 @@ pub async fn scan_chunks(
                 .map(|(url, body)| {
                     scan_body(Bytes::from(body), url, ChunkSource::Bundle, false, None)
                 })
-                .buffer_unordered(concurrency);
+                .buffer_unordered(opts.concurrency);
 
             while let Some(res) = scanned.next().await {
                 match res {
@@ -128,12 +128,12 @@ pub async fn scan_chunks(
                 fetch_scan(
                     client.clone(),
                     url,
-                    use_processed_cache,
-                    use_bundle_cache,
-                    memory.clone(),
+                    opts.use_processed_cache,
+                    opts.use_bundle_cache,
+                    opts.memory.clone(),
                 )
             })
-            .buffer_unordered(concurrency);
+            .buffer_unordered(opts.concurrency);
 
         while let Some(res) = fetched.next().await {
             match res {
@@ -154,7 +154,8 @@ pub async fn scan_chunks(
     }
 
     stats.discovered = visited.len();
-    if use_bundle_cache && !use_processed_cache && pack_dirty && !pack_entries.is_empty() {
+    if opts.use_bundle_cache && !opts.use_processed_cache && pack_dirty && !pack_entries.is_empty()
+    {
         cache::write_bundle_pack(&initial, &pack_entries);
     }
     stats
@@ -178,8 +179,6 @@ impl ChunkScanStats {
         }
         self.bytes_fetched += metrics.bytes_fetched;
         self.bytes_scanned += metrics.bytes_scanned;
-        self.fetch_ms += metrics.fetch_ms;
-        self.scan_ms += metrics.scan_ms;
         self.fetch_us += metrics.fetch_us;
         self.scan_us += metrics.scan_us;
         self.ref_us += metrics.ref_us;
@@ -209,7 +208,7 @@ async fn fetch_scan(
                 url,
                 chunk,
                 ChunkSource::Memory,
-                FetchMetrics::empty(),
+                FetchMetrics::default(),
                 None,
             ));
         }
@@ -219,7 +218,7 @@ async fn fetch_scan(
                 url,
                 chunk,
                 ChunkSource::Disk,
-                FetchMetrics::empty(),
+                FetchMetrics::default(),
                 None,
             ));
         }
@@ -250,7 +249,6 @@ async fn fetch_scan(
     cache::write_bundle(&url, &body);
     let mut result =
         scan_body(body, url, ChunkSource::Fetched, use_processed_cache, memory).await?;
-    result.metrics.fetch_ms = fetch_elapsed.as_millis();
     result.metrics.fetch_us = fetch_elapsed.as_micros();
     result.metrics.bytes_fetched = result.metrics.bytes_scanned;
     Ok(result)
@@ -289,8 +287,6 @@ async fn scan_body(
         FetchMetrics {
             bytes_fetched: 0,
             bytes_scanned,
-            fetch_ms: 0,
-            scan_ms: scan_elapsed.as_millis(),
             fetch_us: 0,
             scan_us: scan_elapsed.as_micros(),
             ref_us,
@@ -314,22 +310,6 @@ fn fetch_result(
         source,
         metrics,
         raw_body,
-    }
-}
-
-impl FetchMetrics {
-    fn empty() -> Self {
-        Self {
-            bytes_fetched: 0,
-            bytes_scanned: 0,
-            fetch_ms: 0,
-            scan_ms: 0,
-            fetch_us: 0,
-            scan_us: 0,
-            ref_us: 0,
-            api_scan_us: 0,
-            candidate_scan_us: 0,
-        }
     }
 }
 
@@ -358,19 +338,6 @@ async fn scan_bytes(
     apis: &mut ApiMap,
     candidates: &mut CandidateMap,
 ) -> Result<ScanBreakdown, ()> {
-    if bytes.len() <= INLINE_SCAN_MAX {
-        let api_t0 = Instant::now();
-        scan::scan(&bytes, apis);
-        let api_us = api_t0.elapsed().as_micros();
-        let candidate_t0 = Instant::now();
-        scan::scan_candidates(&bytes, candidates);
-        let candidate_us = candidate_t0.elapsed().as_micros();
-        return Ok(ScanBreakdown {
-            api_us,
-            candidate_us,
-        });
-    }
-
     let (chunk_apis, chunk_candidates, breakdown) = tokio::task::spawn_blocking(move || {
         let mut chunk_apis = ApiMap::default();
         let mut chunk_candidates = CandidateMap::default();
@@ -436,10 +403,12 @@ mod tests {
         let first_stats = scan_chunks(
             client.clone(),
             [initial.clone()],
-            1,
-            true,
-            true,
-            Some(memory.clone()),
+            ChunkScanOptions {
+                concurrency: 1,
+                use_processed_cache: true,
+                use_bundle_cache: true,
+                memory: Some(memory.clone()),
+            },
             &mut first,
             &mut CandidateMap::default(),
         )
@@ -452,10 +421,12 @@ mod tests {
         let second_stats = scan_chunks(
             client,
             [initial],
-            1,
-            true,
-            true,
-            Some(memory),
+            ChunkScanOptions {
+                concurrency: 1,
+                use_processed_cache: true,
+                use_bundle_cache: true,
+                memory: Some(memory),
+            },
             &mut second,
             &mut CandidateMap::default(),
         )

@@ -1,15 +1,5 @@
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(result) = hifi::app::try_run_cached(&args) {
-        match result {
-            Ok(code) => std::process::exit(code),
-            Err(e) => {
-                eprintln!("hifi: {e}");
-                std::process::exit(2);
-            }
-        }
-    }
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

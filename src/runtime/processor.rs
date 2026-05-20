@@ -34,8 +34,6 @@ pub struct Output {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_age_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub elapsed_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_us: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timings: Option<TimingStats>,
@@ -52,33 +50,23 @@ impl Output {
         self.cache.clear();
         self.cache.push_str(cache);
         self.cache_age_secs = age_secs;
-        let elapsed = t0.map(|t| t.elapsed());
-        self.elapsed_ms = elapsed.map(|e| e.as_millis());
-        self.elapsed_us = elapsed.map(|e| e.as_micros());
+        self.elapsed_us = t0.map(|t| t.elapsed().as_micros());
         self
     }
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct TimingStats {
-    pub page_fetch_ms: u128,
     pub page_fetch_us: u128,
-    pub html_scan_ms: u128,
     pub html_scan_us: u128,
-    pub manifest_fetch_ms: u128,
     pub manifest_fetch_us: u128,
-    pub manifest_scan_ms: u128,
     pub manifest_scan_us: u128,
-    pub chunk_wall_ms: u128,
     pub chunk_wall_us: u128,
-    pub chunk_fetch_ms: u128,
     pub chunk_fetch_us: u128,
-    pub chunk_scan_ms: u128,
     pub chunk_scan_us: u128,
     pub chunk_ref_us: u128,
     pub chunk_api_scan_us: u128,
     pub chunk_candidate_scan_us: u128,
-    pub total_ms: u128,
     pub total_us: u128,
 }
 
@@ -168,14 +156,9 @@ impl<'a> Processor<'a> {
     }
 
     pub async fn process(&self, url: &str, no_cache: bool, t0: Instant) -> Result<String> {
-        self.process_for_json(url, no_cache, t0).await
-    }
-
-    pub async fn process_for_json(&self, url: &str, no_cache: bool, t0: Instant) -> Result<String> {
-        match self.process_typed(url, no_cache, Some(t0), true).await? {
-            Processed::Json(s) => Ok(s),
-            Processed::Output(out) => out.to_json_string(),
-        }
+        self.process_for_display(url, no_cache, t0)
+            .await?
+            .to_json_string()
     }
 
     pub async fn process_for_display(
@@ -183,8 +166,8 @@ impl<'a> Processor<'a> {
         url: &str,
         no_cache: bool,
         t0: Instant,
-    ) -> Result<Processed> {
-        self.process_typed(url, no_cache, Some(t0), false).await
+    ) -> Result<Output> {
+        self.process_typed(url, no_cache, Some(t0)).await
     }
 
     async fn process_typed(
@@ -192,8 +175,7 @@ impl<'a> Processor<'a> {
         url: &str,
         no_cache: bool,
         t0: Option<Instant>,
-        cached_as_json: bool,
-    ) -> Result<Processed> {
+    ) -> Result<Output> {
         let active_cache = if no_cache {
             CacheContext::default()
         } else {
@@ -213,13 +195,7 @@ impl<'a> Processor<'a> {
                 "stale"
             };
             let t0 = t0.unwrap_or_else(Instant::now);
-            if cached_as_json {
-                return annotate_json(&json, t0, status, Some(age)).map(Processed::Json);
-            }
-            if let Ok(out) = serde_json::from_slice::<Output>(&json) {
-                return Ok(Processed::Output(out.mark(Some(t0), status, Some(age))));
-            }
-            return annotate_json(&json, t0, status, Some(age)).map(Processed::Json);
+            return Ok(serde_json::from_slice::<Output>(&json)?.mark(Some(t0), status, Some(age)));
         }
 
         let (out, cache_hit) = self
@@ -229,15 +205,12 @@ impl<'a> Processor<'a> {
                 &request_base,
                 (!no_cache).then_some(cache_path.as_path()),
                 t0,
-                cached_as_json,
                 active_cache,
             )
             .await?;
 
-        if let Processed::Output(v) = &out {
-            if !no_cache && !cache_hit {
-                write_caches(&cache_path, v, url, self.cache.memory.clone())?;
-            }
+        if !no_cache && !cache_hit {
+            write_caches(&cache_path, &out, url, self.cache.memory.clone())?;
         }
         Ok(out)
     }
@@ -251,21 +224,10 @@ impl<'a> Processor<'a> {
                 &request_base,
                 Some(cache_path.as_path()),
                 None,
-                true,
                 self.cache.clone(),
             )
             .await?;
-        match out {
-            Processed::Output(out) => {
-                write_caches(&cache_path, &out, url, self.cache.memory.clone())
-            }
-            Processed::Json(json) => {
-                if let Some(memory) = self.cache.memory.clone() {
-                    write_memory(&memory, url.to_string(), Arc::from(json));
-                }
-                Ok(())
-            }
-        }
+        write_caches(&cache_path, &out, url, self.cache.memory.clone())
     }
 
     fn refresh_later(&self, url: &str, cache: CacheContext) {
@@ -279,32 +241,25 @@ impl<'a> Processor<'a> {
         request_base: &Url,
         cache_path: Option<&Path>,
         t0: Option<Instant>,
-        cached_as_json: bool,
         cache_ctx: CacheContext,
-    ) -> Result<(Processed, bool)> {
-        let (html, final_base, page_fetch_ms, page_fetch_us, page_cache_hit) =
-            if let Some((body, final_base)) = cache_path
+    ) -> Result<(Output, bool)> {
+        let (html, final_base, page_fetch_us, page_cache_hit) = if let Some((body, final_base)) =
+            cache_path
                 .is_none()
                 .then(|| cache::read_page(request_base))
                 .flatten()
-            {
-                (bytes::Bytes::from(body), final_base, 0, 0, true)
-            } else {
-                let page_fetch_t0 = Instant::now();
-                let response = self.client.get(request_base.clone()).send().await?;
-                let final_base = response.url().clone();
-                remember_redirect(cache_ctx.redirects.as_ref(), original_base, &final_base);
-                let html = response.bytes().await?;
-                let page_fetch_elapsed = page_fetch_t0.elapsed();
-                cache::write_page(request_base, &final_base, &html);
-                (
-                    html,
-                    final_base,
-                    page_fetch_elapsed.as_millis(),
-                    page_fetch_elapsed.as_micros(),
-                    false,
-                )
-            };
+        {
+            (bytes::Bytes::from(body), final_base, 0, true)
+        } else {
+            let page_fetch_t0 = Instant::now();
+            let response = self.client.get(request_base.clone()).send().await?;
+            let final_base = response.url().clone();
+            remember_redirect(cache_ctx.redirects.as_ref(), original_base, &final_base);
+            let html = response.bytes().await?;
+            let page_fetch_elapsed = page_fetch_t0.elapsed();
+            cache::write_page(request_base, &final_base, &html);
+            (html, final_base, page_fetch_elapsed.as_micros(), false)
+        };
         let html_bytes = html.len() as u64;
         let html_scan_t0 = Instant::now();
         let mut chunks = html::extract_chunks(&html, &final_base);
@@ -318,13 +273,8 @@ impl<'a> Processor<'a> {
             if let (Some(bytes), Some(t0)) =
                 (cache::read_build_bytes(path, build_id.as_deref()), t0)
             {
-                if !cached_as_json {
-                    if let Ok(out) = serde_json::from_slice::<Output>(&bytes) {
-                        return Ok((Processed::Output(out.mark(Some(t0), "hit", None)), true));
-                    }
-                }
                 return Ok((
-                    Processed::Json(annotate_json(&bytes, t0, "hit", None)?),
+                    serde_json::from_slice::<Output>(&bytes)?.mark(Some(t0), "hit", None),
                     true,
                 ));
             }
@@ -356,10 +306,12 @@ impl<'a> Processor<'a> {
         let chunk_stats = fetch::scan_chunks(
             self.client.clone(),
             chunks.iter().cloned(),
-            self.concurrency,
-            cache_path.is_some(),
-            true,
-            cache_ctx.chunks,
+            fetch::ChunkScanOptions {
+                concurrency: self.concurrency,
+                use_processed_cache: cache_path.is_some(),
+                use_bundle_cache: true,
+                memory: cache_ctx.chunks,
+            },
             &mut apis,
             &mut candidates,
         )
@@ -370,34 +322,24 @@ impl<'a> Processor<'a> {
         scan::merge_candidates_into(&mut candidates, html_candidates);
         scan::merge_into(&mut apis, manifest_apis);
         scan::merge_candidates_into(&mut candidates, manifest_candidates);
-        let html_scan_ms = html_parse_elapsed.as_millis() + html_scan_elapsed.as_millis();
         let html_scan_us = html_parse_elapsed.as_micros() + html_scan_elapsed.as_micros();
         for url in apis.keys() {
             candidates.remove(url);
         }
 
         let total_elapsed = t0.map(|t| t.elapsed());
-        let total_ms = total_elapsed.map(|e| e.as_millis()).unwrap_or(0);
         let total_us = total_elapsed.map(|e| e.as_micros()).unwrap_or(0);
         let timings = TimingStats {
-            page_fetch_ms,
             page_fetch_us,
-            html_scan_ms,
             html_scan_us,
-            manifest_fetch_ms: manifest_stats.fetch_ms,
             manifest_fetch_us: manifest_stats.fetch_us,
-            manifest_scan_ms: manifest_stats.scan_ms,
             manifest_scan_us: manifest_stats.scan_us,
-            chunk_wall_ms: chunk_wall_elapsed.as_millis(),
             chunk_wall_us: chunk_wall_elapsed.as_micros(),
-            chunk_fetch_ms: chunk_stats.fetch_ms,
             chunk_fetch_us: chunk_stats.fetch_us,
-            chunk_scan_ms: chunk_stats.scan_ms,
             chunk_scan_us: chunk_stats.scan_us,
             chunk_ref_us: chunk_stats.ref_us,
             chunk_api_scan_us: chunk_stats.api_scan_us,
             chunk_candidate_scan_us: chunk_stats.candidate_scan_us,
-            total_ms,
             total_us,
         };
         let stats = RunStats::from_parts(
@@ -408,25 +350,19 @@ impl<'a> Processor<'a> {
             &timings,
         );
         Ok((
-            Processed::Output(Output {
+            Output {
                 apis,
                 candidates,
                 build_id,
                 cache: "miss".into(),
                 cache_age_secs: None,
-                elapsed_ms: t0.map(|_| total_ms),
                 elapsed_us: t0.map(|_| total_us),
                 timings: Some(timings),
                 stats: Some(stats),
-            }),
+            },
             false,
         ))
     }
-}
-
-pub enum Processed {
-    Json(String),
-    Output(Output),
 }
 
 pub fn spawn_refresh(client: Client, concurrency: usize, url: &str, cache: CacheContext) {
@@ -460,9 +396,7 @@ struct ManifestStats {
     scanned: usize,
     errors: usize,
     bytes: u64,
-    fetch_ms: u128,
     fetch_us: u128,
-    scan_ms: u128,
     scan_us: u128,
 }
 
@@ -486,7 +420,6 @@ async fn scan_next_manifests(
         match fetch_manifest(client, manifest_url.clone()).await {
             Some((body, fetch_elapsed)) => {
                 stats.scanned += 1;
-                stats.fetch_ms += fetch_elapsed.as_millis();
                 stats.fetch_us += fetch_elapsed.as_micros();
                 stats.bytes += body.len() as u64;
                 let scan_t0 = Instant::now();
@@ -494,7 +427,6 @@ async fn scan_next_manifests(
                 scan::scan_candidates(&body, candidates);
                 chunks.extend(html::extract_chunk_refs(&body, &manifest_url));
                 let scan_elapsed = scan_t0.elapsed();
-                stats.scan_ms += scan_elapsed.as_millis();
                 stats.scan_us += scan_elapsed.as_micros();
             }
             None => stats.errors += 1,
@@ -581,23 +513,6 @@ fn prune_memory(entries: &mut FxHashMap<String, (Body, Instant)>, now: Instant) 
     cache::prune_overflow(entries, MEMORY_CACHE_MAX_ENTRIES);
 }
 
-fn annotate_json(bytes: &[u8], t0: Instant, status: &str, age_secs: Option<u64>) -> Result<String> {
-    let raw = std::str::from_utf8(bytes)?.trim_end();
-    let body = raw
-        .strip_suffix('}')
-        .ok_or("cache entry must be a JSON object")?;
-    let elapsed = t0.elapsed();
-    let sep = if body.ends_with('{') { "" } else { "," };
-    let mut out = format!(
-        "{body}{sep}\"elapsed_ms\":{},\"cache\":\"{status}\"}}",
-        elapsed.as_millis(),
-    );
-    if let Some(age_secs) = age_secs {
-        out.insert_str(out.len() - 1, &format!(",\"cache_age_secs\":{age_secs}"));
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,7 +528,6 @@ mod tests {
             build_id: Some("b1".into()),
             cache: "miss".into(),
             cache_age_secs: Some(1),
-            elapsed_ms: Some(1),
             elapsed_us: Some(1000),
             timings: Some(TimingStats::default()),
             stats: Some(RunStats::default()),
@@ -623,23 +537,7 @@ mod tests {
         assert!(v.get("apis").is_some());
         assert!(v.get("build_id").is_some());
         assert!(v.get("cache_age_secs").is_none());
-        assert!(v.get("elapsed_ms").is_none());
         assert!(v.get("elapsed_us").is_none());
-    }
-
-    #[test]
-    fn annotate_json_appends_valid_status_fields() {
-        let out = annotate_json(
-            br#"{"url":"https://example.com","apis":{}}"#,
-            Instant::now(),
-            "hit",
-            None,
-        )
-        .unwrap();
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["cache"], "hit");
-        assert!(v.get("cache_age_secs").is_none());
-        assert!(v.get("elapsed_ms").is_some());
     }
 
     #[tokio::test]

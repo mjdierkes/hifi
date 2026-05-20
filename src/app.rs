@@ -1,19 +1,10 @@
 use crate::grep;
 use crate::runtime::daemon;
-use crate::runtime::processor::{
-    CacheContext, Output, Processed, Processor, RunStats, TimingStats, CACHE_FRESH_SECS,
-};
-use crate::runtime::{cache, cache::ChunkData};
-use crate::scan::{self, html, ApiMap, CandidateMap};
+use crate::runtime::processor::{CacheContext, Output, Processor, CACHE_FRESH_SECS};
 use reqwest::Client;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use std::io::{self, IsTerminal, Write};
-use std::{
-    error::Error,
-    sync::mpsc,
-    time::{Duration, Instant},
-};
-use url::Url;
+use std::{error::Error, time::Duration};
 
 const MAX_CHUNK_CONCURRENCY: usize = 32;
 
@@ -131,252 +122,6 @@ pub async fn run(raw: Vec<String>) -> Result<i32, Box<dyn Error>> {
     Ok(0)
 }
 
-pub fn try_run_cached(raw: &[String]) -> Option<Result<i32, Box<dyn Error>>> {
-    match try_run_cached_inner(raw) {
-        Ok(Some(code)) => Some(Ok(code)),
-        Ok(None) => None,
-        Err(e) => Some(Err(e)),
-    }
-}
-
-fn try_run_cached_inner(raw: &[String]) -> Result<Option<i32>, Box<dyn Error>> {
-    if raw.is_empty() || matches!(raw[0].as_str(), "-h" | "--help" | "help" | "grep" | "serve") {
-        return Ok(None);
-    }
-
-    let mut url = None;
-    let (mut no_cache, mut no_daemon) = (false, false);
-    let mut mode = OutputMode::Auto;
-    for arg in raw {
-        match arg.as_str() {
-            "--no-cache" => no_cache = true,
-            "--no-daemon" => no_daemon = true,
-            "--flat" => mode = set_mode(mode, OutputMode::Flat)?,
-            "--tree" => mode = set_mode(mode, OutputMode::Tree)?,
-            "--json" => mode = set_mode(mode, OutputMode::Json)?,
-            s if s.starts_with("--") || s.starts_with('-') => return Ok(None),
-            _ if url.is_none() => url = Some(arg.clone()),
-            _ => return Ok(None),
-        }
-    }
-    if !no_cache || !no_daemon {
-        return Ok(None);
-    }
-
-    let url = normalize_url(&url.ok_or("missing URL (try --help)")?);
-    let base = Url::parse(&url)?;
-    let Some((html, final_base)) = cache::read_page(&base) else {
-        return Ok(None);
-    };
-    let Some(out) = collect_cached_raw(&html, &final_base) else {
-        return Ok(None);
-    };
-    render_processed(Processed::Output(out), mode)?;
-    Ok(Some(0))
-}
-
-fn collect_cached_raw(html: &[u8], final_base: &Url) -> Option<Output> {
-    let total_t0 = Instant::now();
-    let parse_t0 = Instant::now();
-    let chunks = html::extract_chunks(html, final_base);
-    let build_id = html::extract_build_id(html).or_else(|| Some(cache::fingerprint(&chunks)));
-    let parse_elapsed = parse_t0.elapsed();
-    let entries = cache::read_bundle_pack(&chunks)?;
-    let html_body = bytes::Bytes::copy_from_slice(html);
-    let html_bytes = html.len() as u64;
-
-    let chunk_t0 = Instant::now();
-    let (tx, rx) = mpsc::channel();
-    std::thread::scope(|scope| {
-        let html_tx = tx.clone();
-        scope.spawn(move || {
-            let scan_t0 = Instant::now();
-            let mut apis = ApiMap::default();
-            let mut candidates = CandidateMap::default();
-            scan::scan(&html_body, &mut apis);
-            scan::scan_candidates(&html_body, &mut candidates);
-            let _ = html_tx.send(CachedScanPart::Html {
-                apis,
-                candidates,
-                elapsed: scan_t0.elapsed(),
-            });
-        });
-
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(entries.len().max(1));
-        let stride = entries.len().div_ceil(workers);
-        for chunk in entries.chunks(stride) {
-            let tx = tx.clone();
-            scope.spawn(move || {
-                let mut out = Vec::with_capacity(chunk.len());
-                for (url, body) in chunk {
-                    out.push(scan_cached_bundle(url, body));
-                }
-                let _ = tx.send(CachedScanPart::Chunks(out));
-            });
-        }
-    });
-    drop(tx);
-
-    let mut apis = ApiMap::default();
-    let mut candidates = CandidateMap::default();
-    let mut html_scan_us = 0;
-    let mut chunk_scan_us = 0;
-    let mut chunk_ref_us = 0;
-    let mut chunk_api_scan_us = 0;
-    let mut chunk_candidate_scan_us = 0;
-    let mut chunk_bytes = 0;
-    let mut scanned = 0;
-    let mut refs = Vec::new();
-    let mut pack_urls = FxHashSet::default();
-    for part in rx {
-        match part {
-            CachedScanPart::Html {
-                apis: html_apis,
-                candidates: html_candidates,
-                elapsed,
-            } => {
-                scan::merge_into(&mut apis, html_apis);
-                scan::merge_candidates_into(&mut candidates, html_candidates);
-                html_scan_us = elapsed.as_micros();
-            }
-            CachedScanPart::Chunks(chunks) => {
-                for chunk in chunks {
-                    pack_urls.insert(chunk.url);
-                    scan::merge_into(&mut apis, chunk.data.apis);
-                    scan::merge_candidates_into(&mut candidates, chunk.data.candidates);
-                    refs.extend(chunk.data.refs);
-                    chunk_scan_us += chunk.scan_us;
-                    chunk_ref_us += chunk.ref_us;
-                    chunk_api_scan_us += chunk.api_us;
-                    chunk_candidate_scan_us += chunk.candidate_us;
-                    chunk_bytes += chunk.bytes;
-                    scanned += 1;
-                }
-            }
-        }
-    }
-
-    if refs.iter().any(|url| !pack_urls.contains(url)) {
-        return None;
-    }
-    for url in apis.keys() {
-        candidates.remove(url);
-    }
-
-    let chunk_wall_elapsed = chunk_t0.elapsed();
-    let html_scan_us = parse_elapsed.as_micros() + html_scan_us;
-    let total_elapsed = total_t0.elapsed();
-    Some(Output {
-        apis,
-        candidates,
-        build_id,
-        cache: "miss".into(),
-        cache_age_secs: None,
-        elapsed_ms: Some(total_elapsed.as_millis()),
-        elapsed_us: Some(total_elapsed.as_micros()),
-        timings: Some(TimingStats {
-            page_fetch_ms: 0,
-            page_fetch_us: 0,
-            html_scan_ms: html_scan_us / 1000,
-            html_scan_us,
-            manifest_fetch_ms: 0,
-            manifest_fetch_us: 0,
-            manifest_scan_ms: 0,
-            manifest_scan_us: 0,
-            chunk_wall_ms: chunk_wall_elapsed.as_millis(),
-            chunk_wall_us: chunk_wall_elapsed.as_micros(),
-            chunk_fetch_ms: 0,
-            chunk_fetch_us: 0,
-            chunk_scan_ms: chunk_scan_us / 1000,
-            chunk_scan_us,
-            chunk_ref_us,
-            chunk_api_scan_us,
-            chunk_candidate_scan_us,
-            total_ms: total_elapsed.as_millis(),
-            total_us: total_elapsed.as_micros(),
-        }),
-        stats: Some(RunStats {
-            html_bytes,
-            page_cache_hit: true,
-            page_bytes_fetched: 0,
-            manifest_bytes: 0,
-            chunk_bytes_fetched: 0,
-            chunk_bytes_scanned: chunk_bytes,
-            chunks_discovered: scanned,
-            chunks_scanned: scanned,
-            chunk_cache_hits: 0,
-            chunk_bundle_hits: scanned,
-            chunk_bundle_pack_hits: scanned,
-            chunk_memory_hits: 0,
-            manifest_scanned: 0,
-            manifest_errors: 0,
-            chunk_errors: 0,
-            scan_mib_per_sec: mib_per_sec_from_us(
-                html_bytes + chunk_bytes,
-                html_scan_us + chunk_scan_us,
-            ),
-            fetch_mib_per_sec: 0.0,
-        }),
-    })
-}
-
-enum CachedScanPart {
-    Html {
-        apis: ApiMap,
-        candidates: CandidateMap,
-        elapsed: Duration,
-    },
-    Chunks(Vec<CachedBundleScan>),
-}
-
-struct CachedBundleScan {
-    url: Url,
-    data: ChunkData,
-    bytes: u64,
-    scan_us: u128,
-    ref_us: u128,
-    api_us: u128,
-    candidate_us: u128,
-}
-
-fn scan_cached_bundle(url: &Url, body: &[u8]) -> CachedBundleScan {
-    let ref_t0 = Instant::now();
-    let refs = html::extract_chunk_refs(body, url);
-    let ref_us = ref_t0.elapsed().as_micros();
-    let scan_t0 = Instant::now();
-    let api_t0 = Instant::now();
-    let mut apis = ApiMap::default();
-    scan::scan(body, &mut apis);
-    let api_us = api_t0.elapsed().as_micros();
-    let candidate_t0 = Instant::now();
-    let mut candidates = CandidateMap::default();
-    scan::scan_candidates(body, &mut candidates);
-    let candidate_us = candidate_t0.elapsed().as_micros();
-    CachedBundleScan {
-        url: url.clone(),
-        data: ChunkData {
-            apis,
-            candidates,
-            refs,
-        },
-        bytes: body.len() as u64,
-        scan_us: scan_t0.elapsed().as_micros(),
-        ref_us,
-        api_us,
-        candidate_us,
-    }
-}
-
-fn mib_per_sec_from_us(bytes: u64, us: u128) -> f64 {
-    if bytes == 0 || us == 0 {
-        return 0.0;
-    }
-    (bytes as f64 / 1_048_576.0) / (us as f64 / 1_000_000.0)
-}
-
 fn set_mode(current: OutputMode, next: OutputMode) -> Result<OutputMode, Box<dyn Error>> {
     if current != OutputMode::Auto && current != next {
         return Err("choose only one of --flat, --tree, or --json".into());
@@ -480,26 +225,18 @@ pub fn render_json_mode(json: &str, mode: OutputMode) -> String {
     }
 }
 
-fn render_processed(out: Processed, mode: OutputMode) -> Result<(), Box<dyn Error>> {
-    match out {
-        Processed::Json(json) => {
-            print!("{}", render_json_mode(&json, mode));
-            Ok(())
+fn render_processed(out: Output, mode: OutputMode) -> Result<(), Box<dyn Error>> {
+    let stdout = io::stdout();
+    let mut stdout = io::BufWriter::new(stdout.lock());
+    match mode.for_stdout() {
+        OutputMode::Json => {
+            serde_json::to_writer(&mut stdout, &out)?;
+            stdout.write_all(b"\n")?;
         }
-        Processed::Output(out) => {
-            let stdout = io::stdout();
-            let mut stdout = io::BufWriter::new(stdout.lock());
-            match mode.for_stdout() {
-                OutputMode::Json => {
-                    serde_json::to_writer(&mut stdout, &out)?;
-                    stdout.write_all(b"\n")?;
-                }
-                OutputMode::Tree => render_tree_output(&out, &mut stdout)?,
-                OutputMode::Flat | OutputMode::Auto => render_flat_output(&out, &mut stdout)?,
-            }
-            Ok(())
-        }
+        OutputMode::Tree => render_tree_output(&out, &mut stdout)?,
+        OutputMode::Flat | OutputMode::Auto => render_flat_output(&out, &mut stdout)?,
     }
+    Ok(())
 }
 
 fn render_tree_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
@@ -531,7 +268,7 @@ fn render_tree_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
             render_node(out, &root, "")?;
         }
     }
-    writeln!(out, "{} {}ms", v.cache, v.elapsed_ms.unwrap_or(0))
+    writeln!(out, "{} {}ms", v.cache, v.elapsed_us.unwrap_or(0) / 1000)
 }
 
 fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
