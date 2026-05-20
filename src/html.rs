@@ -17,11 +17,9 @@ pub fn extract_chunks(html: &str, base: &Url) -> Vec<Url> {
         let src = &html[start..end];
         if src.contains(".js") && !is_skipped_chunk(src) {
             if let Ok(u) = base.join(src) {
-                if !seen.insert(u.as_str().to_owned()) {
-                    offset = end;
-                    continue;
+                if seen.insert(u.clone()) {
+                    out.push(u);
                 }
-                out.push(u);
             }
         }
         offset = end;

@@ -11,10 +11,11 @@ use std::{
     collections::HashMap,
     error::Error,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use url::Url;
 
@@ -22,18 +23,8 @@ const MAX_CHUNK_CONCURRENCY: usize = 32;
 const CACHE_FRESH_SECS: u64 = 300;
 const CACHE_STALE_SECS: u64 = 3600;
 
-type MemoryCache = Arc<RwLock<HashMap<PathBuf, MemoryEntry>>>;
-
-#[derive(Clone)]
-struct MemoryEntry {
-    value: Value,
-    written: Instant,
-}
-
-struct DaemonState {
-    client: Client,
-    memory: MemoryCache,
-}
+type MemoryCache = Arc<RwLock<HashMap<PathBuf, (String, Instant)>>>;
+type DaemonState = Arc<(Client, MemoryCache)>;
 
 fn socket_path() -> PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR")
@@ -80,6 +71,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("{}", json);
             return Ok(());
         }
+        if start_daemon() {
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(25));
+                if let Some(json) = try_daemon(&url, no_cache).await {
+                    println!("{}", json);
+                    return Ok(());
+                }
+            }
+        }
     }
 
     let t0 = Instant::now();
@@ -90,13 +90,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn start_daemon() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            Command::new(exe)
+                .arg("serve")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()
+        })
+        .is_some()
+}
+
 async fn try_daemon(url: &str, no_cache: bool) -> Option<String> {
     let path = socket_path();
     let mut stream = UnixStream::connect(&path).await.ok()?;
-    stream
-        .write_all(format!("{}\t{url}\n", no_cache as u8).as_bytes())
-        .await
-        .ok()?;
+    stream.write_all(&[b'0' + no_cache as u8]).await.ok()?;
+    stream.write_all(url.as_bytes()).await.ok()?;
     stream.shutdown().await.ok();
     let mut buf = Vec::with_capacity(4096);
     stream.read_to_end(&mut buf).await.ok()?;
@@ -110,10 +123,10 @@ async fn serve() -> Result<(), Box<dyn Error>> {
     eprintln!("hifi daemon listening on {}", path.display());
 
     let concurrency = chunk_concurrency();
-    let state = Arc::new(DaemonState {
-        client: make_client(concurrency)?,
-        memory: Arc::new(RwLock::new(HashMap::new())),
-    });
+    let state = Arc::new((
+        make_client(concurrency)?,
+        Arc::new(RwLock::new(HashMap::new())),
+    ));
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -127,25 +140,45 @@ async fn serve() -> Result<(), Box<dyn Error>> {
 }
 
 async fn handle_conn(
-    stream: UnixStream,
-    state: Arc<DaemonState>,
+    mut stream: UnixStream,
+    state: DaemonState,
     concurrency: usize,
 ) -> Result<(), Box<dyn Error>> {
-    let (rd, mut wr) = stream.into_split();
-    let mut rd = BufReader::new(rd);
-    let mut line = String::new();
-    rd.read_line(&mut line).await?;
-    let no_cache = line.starts_with("1\t");
-    let url = line.get(2..).unwrap_or("").trim_end();
-
     let t0 = Instant::now();
+    let mut req = Vec::with_capacity(512);
+    stream.read_to_end(&mut req).await?;
+    let no_cache = req.first() == Some(&b'1');
+    let url = std::str::from_utf8(req.get(1..).unwrap_or_default())?;
+
+    if !no_cache {
+        if let Ok(base) = Url::parse(url) {
+            let cache_path = cache::path_for(&base);
+            if let Some((body, age)) = read_memory(&state.1, &cache_path) {
+                if age < CACHE_STALE_SECS {
+                    if age >= CACHE_FRESH_SECS {
+                        spawn_refresh(
+                            &state.0,
+                            url,
+                            &cache_path,
+                            concurrency,
+                            Some(state.1.clone()),
+                        );
+                    }
+                    stream.write_all(body.as_bytes()).await?;
+                    stream.flush().await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     let out = match process(
-        &state.client,
+        &state.0,
         url,
         no_cache,
         t0,
         concurrency,
-        Some(state.memory.clone()),
+        Some(state.1.clone()),
     )
     .await
     {
@@ -153,8 +186,13 @@ async fn handle_conn(
         Err(e) => json!({ "error": e.to_string() }),
     };
     let body = serde_json::to_string(&out)?;
-    wr.write_all(body.as_bytes()).await?;
-    wr.flush().await?;
+    if !no_cache {
+        if let Ok(base) = Url::parse(url) {
+            write_memory(&state.1, cache::path_for(&base), body.clone());
+        }
+    }
+    stream.write_all(body.as_bytes()).await?;
+    stream.flush().await?;
     Ok(())
 }
 
@@ -170,35 +208,15 @@ async fn process(
     let cache_path = cache::path_for(&base);
 
     if !no_cache {
-        if let Some((v, age)) = read_memory(memory.as_ref(), &cache_path) {
-            if age < CACHE_FRESH_SECS {
-                return Ok(annotate(v, t0, "memory", age));
-            }
-            if age < CACHE_STALE_SECS {
-                let client = client.clone();
-                let url = url.to_string();
-                let cache_path = cache_path.clone();
-                let memory = memory.clone();
-                tokio::spawn(async move {
-                    let _ = refresh(&client, &url, &cache_path, concurrency, memory).await;
-                });
-                return Ok(annotate(v, t0, "memory-stale", age));
-            }
-        }
         if let Some((v, age)) = cache::read_any(&cache_path) {
-            write_memory(memory.as_ref(), cache_path.clone(), v.clone());
-            if age < CACHE_FRESH_SECS {
-                return Ok(annotate(v, t0, "fresh", age));
-            }
             if age < CACHE_STALE_SECS {
-                let client = client.clone();
-                let url = url.to_string();
-                let cache_path = cache_path.clone();
-                let memory = memory.clone();
-                tokio::spawn(async move {
-                    let _ = refresh(&client, &url, &cache_path, concurrency, memory).await;
-                });
-                return Ok(annotate(v, t0, "stale", age));
+                let status = if age < CACHE_FRESH_SECS {
+                    "fresh"
+                } else {
+                    spawn_refresh(client, url, &cache_path, concurrency, memory.clone());
+                    "stale"
+                };
+                return Ok(annotate(v, t0, status, age));
             }
         }
     }
@@ -214,29 +232,40 @@ async fn process(
     .await?;
     if !no_cache && !cache_hit {
         cache::write(&cache_path, &out);
-        write_memory(memory.as_ref(), cache_path, out.clone());
+        if let Some(memory) = memory {
+            write_memory(&memory, cache_path, serde_json::to_string(&out)?);
+        }
     }
     Ok(out)
 }
 
-fn read_memory(memory: Option<&MemoryCache>, path: &Path) -> Option<(Value, u64)> {
-    let entry = memory
-        .and_then(|m| m.read().ok()?.get(path).cloned())?;
-    let age = entry.written.elapsed().as_secs();
-    Some((entry.value, age))
+fn read_memory(memory: &MemoryCache, path: &Path) -> Option<(String, u64)> {
+    memory
+        .read()
+        .ok()?
+        .get(path)
+        .cloned()
+        .map(|(body, t)| (body, t.elapsed().as_secs()))
 }
 
-fn write_memory(memory: Option<&MemoryCache>, path: PathBuf, value: Value) {
-    if let Some(memory) = memory {
-        if let Ok(mut entries) = memory.write() {
-            entries.insert(
-                path,
-                MemoryEntry {
-                    value,
-                    written: Instant::now(),
-                },
-            );
-        }
+fn spawn_refresh(
+    client: &Client,
+    url: &str,
+    cache_path: &Path,
+    concurrency: usize,
+    memory: Option<MemoryCache>,
+) {
+    let client = client.clone();
+    let url = url.to_string();
+    let cache_path = cache_path.to_path_buf();
+    tokio::spawn(async move {
+        let _ = refresh(&client, &url, &cache_path, concurrency, memory).await;
+    });
+}
+
+fn write_memory(memory: &MemoryCache, path: PathBuf, body: String) {
+    if let Ok(mut entries) = memory.write() {
+        entries.insert(path, (body, Instant::now()));
     }
 }
 
@@ -259,7 +288,13 @@ async fn refresh(
     let base = Url::parse(url)?;
     let (out, _) = collect(client, url, &base, Some(cache_path), None, concurrency).await?;
     cache::write(cache_path, &out);
-    write_memory(memory.as_ref(), cache_path.to_path_buf(), out);
+    if let Some(memory) = memory {
+        write_memory(
+            &memory,
+            cache_path.to_path_buf(),
+            serde_json::to_string(&out)?,
+        );
+    }
     Ok(())
 }
 
@@ -300,7 +335,7 @@ async fn collect(
         "chunks_discovered": chunks.len(),
         "chunks_scanned": chunks_scanned,
         "chunk_fetch_errors": chunk_fetch_errors,
-        "apis": scan::sorted(apis),
+        "apis": apis,
         "cache": "miss",
     });
     if let (Some(obj), Some(t0)) = (out.as_object_mut(), t0) {

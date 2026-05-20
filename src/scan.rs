@@ -1,7 +1,7 @@
-use crate::literals::{method_from_pattern, BAD_EXTS, CALL_LITERALS, SHAPE_LITERALS};
+use crate::literals::{BAD_EXTS, CALL_LITERALS, SHAPE_LITERALS};
 use aho_corasick::AhoCorasick;
 use serde::ser::{SerializeStruct, Serializer};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 static CALL_AC: LazyLock<AhoCorasick> =
@@ -43,17 +43,6 @@ impl serde::Serialize for Shape {
 }
 
 impl Shape {
-    fn add_method(&mut self, method: &'static str) {
-        self.methods |= match method {
-            "GET" => METHOD_GET,
-            "POST" => METHOD_POST,
-            "PUT" => METHOD_PUT,
-            "DELETE" => METHOD_DELETE,
-            "PATCH" => METHOD_PATCH,
-            _ => METHOD_GET,
-        };
-    }
-
     fn methods(&self) -> Vec<&'static str> {
         [
             (METHOD_GET, "GET"),
@@ -101,21 +90,21 @@ pub fn scan(bytes: &[u8], apis: &mut ApiMap) {
 
         let entry = apis.entry(url.to_owned()).or_default();
         for sm in SHAPE_AC.find_iter(window) {
-            let pat = SHAPE_LITERALS[sm.pattern().as_usize()];
-            match pat {
-                p if p.starts_with("method:") => {
-                    let method = method_from_pattern(p);
-                    entry.add_method(method);
-                }
-                "body:" => entry.has_body = true,
-                "headers:" => entry.has_headers = true,
-                "application/json" => entry.content_types |= CONTENT_JSON,
-                "Authorization" | "Bearer" => entry.auth = true,
+            match sm.pattern().as_usize() {
+                0 | 1 => entry.methods |= METHOD_POST,
+                2 | 3 => entry.methods |= METHOD_PUT,
+                4 | 5 => entry.methods |= METHOD_DELETE,
+                6 | 7 => entry.methods |= METHOD_PATCH,
+                8 | 9 => entry.methods |= METHOD_GET,
+                10 => entry.has_body = true,
+                11 => entry.has_headers = true,
+                13 => entry.content_types |= CONTENT_JSON,
+                14 | 15 => entry.auth = true,
                 _ => {}
             }
         }
         if entry.methods == 0 {
-            entry.add_method("GET");
+            entry.methods = METHOD_GET;
         }
     }
 }
@@ -124,10 +113,6 @@ pub fn merge_into(dst: &mut ApiMap, src: ApiMap) {
     for (url, shape) in src {
         dst.entry(url).or_default().merge(shape);
     }
-}
-
-pub fn sorted(apis: ApiMap) -> BTreeMap<String, Shape> {
-    apis.into_iter().collect()
 }
 
 fn extract_url_arg(bytes: &[u8], start: usize) -> Option<&str> {
@@ -178,17 +163,11 @@ fn is_bad_asset_url(s: &[u8]) -> bool {
     let path = s.split(|b| *b == b'?').next().unwrap_or(s);
     BAD_EXTS
         .iter()
-        .any(|ext| path.ends_with_ignore_ascii_case(ext.as_bytes()))
+        .any(|ext| ends_with_ci(path, ext.as_bytes()))
 }
 
-trait EndsWithIgnoreAsciiCase {
-    fn ends_with_ignore_ascii_case(&self, suffix: &[u8]) -> bool;
-}
-
-impl EndsWithIgnoreAsciiCase for [u8] {
-    fn ends_with_ignore_ascii_case(&self, suffix: &[u8]) -> bool {
-        self.len() >= suffix.len() && self[self.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-    }
+fn ends_with_ci(s: &[u8], suffix: &[u8]) -> bool {
+    s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
 #[cfg(test)]

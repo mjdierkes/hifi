@@ -1,6 +1,3 @@
-// Tunable scanning rules. Edit here without touching scan logic.
-
-/// Call-site anchors: places where a URL string literal is the next token.
 pub const CALL_LITERALS: &[&str] = &[
     "fetch(",
     "fetch (",
@@ -27,7 +24,6 @@ pub const CALL_LITERALS: &[&str] = &[
     "endpoint:'",
 ];
 
-/// Shape markers searched inside the window around each call.
 pub const SHAPE_LITERALS: &[&str] = &[
     "method:\"POST\"",
     "method:'POST'",
@@ -47,22 +43,9 @@ pub const SHAPE_LITERALS: &[&str] = &[
     "Bearer",
 ];
 
-/// Asset extensions to exclude from candidate URLs.
 pub const BAD_EXTS: &[&str] = &[
     ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".ico",
     ".webp", ".mp4", ".webm", ".map",
 ];
 
-/// Substrings in Next.js chunk filenames we skip (framework / vendor / runtime).
 pub const SKIPPED_CHUNK_FRAGMENTS: &[&str] = &["framework-", "polyfills-", "webpack-", "main-"];
-
-pub fn method_from_pattern(p: &str) -> &'static str {
-    match p {
-        "method:\"POST\"" | "method:'POST'" => "POST",
-        "method:\"PUT\"" | "method:'PUT'" => "PUT",
-        "method:\"DELETE\"" | "method:'DELETE'" => "DELETE",
-        "method:\"PATCH\"" | "method:'PATCH'" => "PATCH",
-        "method:\"GET\"" | "method:'GET'" => "GET",
-        _ => "GET",
-    }
-}
