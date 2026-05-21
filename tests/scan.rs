@@ -118,6 +118,45 @@ fn variable_hoisted_urls_get_call_shape() {
 }
 
 #[test]
+fn template_hosts_resolve_nearby_string_constants() {
+    let result = scan(
+        r#"
+        const appId = "2DEAES0CUO";
+        fetch(`https://${appId}-dsn.algolia.net/1/indexes/products`, { method: "POST" });
+    "#,
+    );
+
+    let url = "https://2DEAES0CUO-dsn.algolia.net/1/indexes/products";
+    let shape = result
+        .apis
+        .get(url)
+        .expect("expected template host constant to be resolved");
+    assert_eq!(shape.methods_csv(), "POST");
+}
+
+#[test]
+fn template_hosts_resolve_hoisted_host_constants() {
+    let result = scan(
+        r#"
+        const host = "2deaes0cuo-dsn.algolia.net";
+        fetch(`https://${host}/1/indexes/products`);
+    "#,
+    );
+
+    assert!(result
+        .apis
+        .contains_key("https://2deaes0cuo-dsn.algolia.net/1/indexes/products"));
+}
+
+#[test]
+fn unresolved_leading_template_base_still_preserves_path() {
+    let result = scan(r#"fetch(`${base}/api/admin`);"#);
+
+    assert!(result.apis.contains_key("/api/admin"));
+    assert!(!result.apis.contains_key("{dynamic}/api/admin"));
+}
+
+#[test]
 fn url_consisting_only_of_dynamic_segments_is_ignored() {
     // When the entire URL is interpolation (`/${id}`), the resolved literal
     // collapses to `/{dynamic}` which carries no information.

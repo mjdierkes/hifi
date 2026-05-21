@@ -10,26 +10,73 @@ use crate::runtime::config::RuntimeConfig;
 use crate::runtime::net;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
+use std::sync::Arc;
 use url::Url;
 
-type Hit = (String, usize, String);
+const DEFAULT_MAX_HITS: usize = 50;
+const DEFAULT_MAX_BYTES_PER_HIT: usize = 200;
+
+#[derive(Clone, Debug)]
+struct GrepOptions {
+    context: usize,
+    max_hits: Option<usize>,
+    max_bytes_per_hit: usize,
+}
+
+impl Default for GrepOptions {
+    fn default() -> Self {
+        Self {
+            context: 2,
+            max_hits: Some(DEFAULT_MAX_HITS),
+            max_bytes_per_hit: DEFAULT_MAX_BYTES_PER_HIT,
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct Hit {
+    url: String,
+    line: usize,
+    column: usize,
+    snippet: String,
+}
 
 #[derive(Default)]
 struct GrepResult {
     hits: Vec<Hit>,
     failed: usize,
+    omitted_hits: usize,
+    omitted_files: usize,
+    omitted_bytes: usize,
+    shortened_hits: usize,
 }
 
 pub async fn run(args: &[String], client: Client, config: RuntimeConfig) -> Result<i32, AppError> {
     let mut url = None;
     let mut pattern = None;
-    let mut context: usize = 2;
+    let mut options = GrepOptions::default();
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         match a.as_str() {
             "-C" | "--context" => {
                 let v = iter.next().ok_or("'-C' needs a number")?;
-                context = v.parse().map_err(|_| format!("'-C {v}' is not a number"))?;
+                options.context = v.parse().map_err(|_| format!("'-C {v}' is not a number"))?;
+            }
+            "--max-hits" => {
+                let v = iter.next().ok_or("'--max-hits' needs a number")?;
+                options.max_hits = Some(
+                    v.parse()
+                        .map_err(|_| format!("'--max-hits {v}' is not a number"))?,
+                );
+            }
+            "--max-bytes-per-hit" => {
+                let v = iter.next().ok_or("'--max-bytes-per-hit' needs a number")?;
+                options.max_bytes_per_hit = v
+                    .parse()
+                    .map_err(|_| format!("'--max-bytes-per-hit {v}' is not a number"))?;
+            }
+            "-a" | "--all" => {
+                options.max_hits = None;
             }
             s if s.starts_with("--") || s.starts_with('-') => {
                 return Err(format!("unknown flag '{s}' (try --help)").into());
@@ -52,19 +99,30 @@ pub async fn run(args: &[String], client: Client, config: RuntimeConfig) -> Resu
     let html = net::read_limited(response).await?;
     let assets = discover::scan_document(&html, &final_base, DocumentKind::Html).assets;
 
-    let result = grep_assets(client, assets.into_iter(), config, &pattern, context).await;
+    let result = grep_assets(client, assets.into_iter(), config, &pattern, options).await;
     if result.failed > 0 {
         eprintln!(
             "hifi: warning: failed to read {} assets; results may be incomplete",
             result.failed
         );
     }
+    if result.omitted_hits > 0 || result.shortened_hits > 0 {
+        eprintln!(
+            "hifi: ...truncated ({} more in {} files, {} omitted hits, {} shortened hits)",
+            format_bytes(result.omitted_bytes),
+            result.omitted_files,
+            result.omitted_hits,
+            result.shortened_hits
+        );
+    }
     eprintln!("{} hits", result.hits.len());
-    for (url, line, snippet) in &result.hits {
+    for hit in &result.hits {
         println!(
-            "{}:{line}\t{}",
-            escape_terminal(url),
-            escape_terminal(snippet)
+            "{}:{}:{}\t{}",
+            escape_terminal(&hit.url),
+            hit.line,
+            hit.column,
+            escape_terminal(&hit.snippet)
         );
     }
     Ok(if result.hits.is_empty() { 1 } else { 0 })
@@ -75,16 +133,17 @@ async fn grep_assets(
     assets: impl Iterator<Item = AssetRef>,
     config: RuntimeConfig,
     pattern: &str,
-    context: usize,
+    options: GrepOptions,
 ) -> GrepResult {
-    let pat = std::sync::Arc::new(pattern.to_string());
+    let pat = Arc::new(pattern.to_string());
+    let options = Arc::new(options);
     let mut searched = stream::iter(assets)
         .map(|asset| {
             grep_one(
                 client.clone(),
                 asset,
                 pat.clone(),
-                context,
+                options.clone(),
                 config.allow_private,
             )
         })
@@ -93,30 +152,64 @@ async fn grep_assets(
     let mut result = GrepResult::default();
     while let Some(chunk) = searched.next().await {
         match chunk {
-            Ok(mut hits) => result.hits.append(&mut hits),
+            Ok(chunk) => merge_chunk(&mut result, chunk, options.max_hits),
             Err(()) => result.failed += 1,
         }
     }
     result
 }
 
+fn merge_chunk(result: &mut GrepResult, mut chunk: GrepResult, max_hits: Option<usize>) {
+    result.omitted_hits += chunk.omitted_hits;
+    result.omitted_files += chunk.omitted_files;
+    result.omitted_bytes += chunk.omitted_bytes;
+    result.shortened_hits += chunk.shortened_hits;
+
+    let Some(max_hits) = max_hits else {
+        result.hits.append(&mut chunk.hits);
+        return;
+    };
+    let remaining = max_hits.saturating_sub(result.hits.len());
+    if chunk.hits.len() <= remaining {
+        result.hits.append(&mut chunk.hits);
+        return;
+    }
+
+    let omitted = chunk.hits.split_off(remaining);
+    result.omitted_hits += omitted.len();
+    result.omitted_bytes += omitted.iter().map(|hit| hit.snippet.len()).sum::<usize>();
+    if !omitted.is_empty() && chunk.omitted_files == 0 {
+        result.omitted_files += 1;
+    }
+    result.hits.append(&mut chunk.hits);
+}
+
 async fn grep_one(
     client: Client,
     asset: AssetRef,
-    pattern: std::sync::Arc<String>,
-    context: usize,
+    pattern: Arc<String>,
+    options: Arc<GrepOptions>,
     allow_private: bool,
-) -> Result<Vec<Hit>, ()> {
+) -> Result<GrepResult, ()> {
     let body = net::get_bytes_limited(&client, asset.url.clone(), allow_private)
         .await
         .map_err(|_| ())?;
 
-    let mut hits = Vec::new();
-    let bytes = &body[..];
-    let pat_bytes = pattern.as_bytes();
+    Ok(grep_bytes(
+        asset.url.as_str(),
+        &body,
+        pattern.as_bytes(),
+        &options,
+    ))
+}
+
+fn grep_bytes(url: &str, bytes: &[u8], pat_bytes: &[u8], options: &GrepOptions) -> GrepResult {
+    let mut result = GrepResult::default();
     if pat_bytes.is_empty() {
-        return Ok(hits);
+        return result;
     }
+    let max_hits = options.max_hits.unwrap_or(usize::MAX);
+    let mut file_omitted = false;
 
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(memchr::memchr_iter(b'\n', bytes).map(|i| i + 1))
@@ -124,14 +217,208 @@ async fn grep_one(
 
     for abs in memchr::memmem::find_iter(bytes, pat_bytes) {
         let line_idx = line_starts.partition_point(|&s| s <= abs).saturating_sub(1);
-        let lo_line = line_idx.saturating_sub(context);
-        let hi_line = (line_idx + context + 1).min(line_starts.len());
+        let lo_line = line_idx.saturating_sub(options.context);
+        let hi_line = (line_idx + options.context + 1).min(line_starts.len());
         let lo = line_starts[lo_line];
         let hi = line_starts.get(hi_line).copied().unwrap_or(bytes.len());
-        let snippet = String::from_utf8_lossy(&bytes[lo..hi])
+        if result.hits.len() >= max_hits {
+            result.omitted_hits += 1;
+            result.omitted_bytes += hi.saturating_sub(lo);
+            file_omitted = true;
+            continue;
+        }
+        let (snip_lo, snip_hi) =
+            snippet_window(bytes, lo, hi, abs, pat_bytes.len(), options.max_bytes_per_hit);
+        let shortened = snip_lo > lo || snip_hi < hi;
+        if shortened {
+            result.shortened_hits += 1;
+            result.omitted_bytes += (hi - lo) - (snip_hi - snip_lo);
+        }
+        let raw = String::from_utf8_lossy(&bytes[snip_lo..snip_hi])
             .trim_end_matches('\n')
             .replace('\n', " ");
-        hits.push((asset.url.to_string(), line_idx + 1, snippet));
+        let mut snippet = String::new();
+        if snip_lo > lo {
+            snippet.push_str("…");
+        }
+        snippet.push_str(&raw);
+        if snip_hi < hi {
+            snippet.push_str("…");
+        }
+        result.hits.push(Hit {
+            url: url.to_string(),
+            line: line_idx + 1,
+            column: abs.saturating_sub(line_starts[line_idx]) + 1,
+            snippet,
+        });
     }
-    Ok(hits)
+    if file_omitted {
+        result.omitted_files = 1;
+    }
+    result
+}
+
+/// Pick a byte range inside [lo, hi] that fits within `max` bytes and stays
+/// centered on the match at absolute offset `abs` with length `pat_len`.
+/// Snaps both ends to UTF-8 boundaries so the slice decodes cleanly.
+fn snippet_window(
+    bytes: &[u8],
+    lo: usize,
+    hi: usize,
+    abs: usize,
+    pat_len: usize,
+    max: usize,
+) -> (usize, usize) {
+    let span = hi - lo;
+    if span <= max {
+        return (lo, hi);
+    }
+    let match_end = abs + pat_len;
+    // If the match itself is bigger than max, return the prefix of the match.
+    if pat_len >= max {
+        return (abs, snap_up(bytes, abs + max, hi));
+    }
+    let slack = max - pat_len;
+    let before = slack / 2;
+    let after = slack - before;
+    let mut start = abs.saturating_sub(before).max(lo);
+    let mut end = match_end.saturating_add(after).min(hi);
+    // If we hit one boundary, give the leftover budget to the other side.
+    if end - start < max {
+        if start == lo {
+            end = (start + max).min(hi);
+        } else if end == hi {
+            start = end.saturating_sub(max).max(lo);
+        }
+    }
+    let start = snap_down(bytes, start, lo);
+    let end = snap_up(bytes, end, hi);
+    (start, end)
+}
+
+/// Move `idx` backward until it sits on a UTF-8 char boundary (or hits `floor`).
+fn snap_down(bytes: &[u8], mut idx: usize, floor: usize) -> usize {
+    while idx > floor && (bytes[idx] & 0b1100_0000) == 0b1000_0000 {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Move `idx` forward until it sits on a UTF-8 char boundary (or hits `ceil`).
+fn snap_up(bytes: &[u8], mut idx: usize, ceil: usize) -> usize {
+    while idx < ceil && (bytes[idx] & 0b1100_0000) == 0b1000_0000 {
+        idx += 1;
+    }
+    idx
+}
+
+fn format_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}MB", bytes as f64 / MIB)
+    } else if bytes >= 1024 {
+        format!("{:.1}KB", bytes as f64 / KIB)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grep_bytes_caps_hits_and_records_omissions() {
+        let options = GrepOptions {
+            context: 0,
+            max_hits: Some(2),
+            max_bytes_per_hit: 200,
+        };
+        let result = grep_bytes(
+            "https://x.test/app.js",
+            b"algolia\nalgolia\nalgolia",
+            b"algolia",
+            &options,
+        );
+
+        assert_eq!(result.hits.len(), 2);
+        assert_eq!(result.omitted_hits, 1);
+        assert_eq!(result.omitted_files, 1);
+    }
+
+    #[test]
+    fn grep_bytes_centers_snippet_on_match_in_long_line() {
+        // Minified-style: one long line, match in the middle. Old behavior
+        // returned the file prefix; new behavior centers the window on the match.
+        let body = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAtargetBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let options = GrepOptions {
+            context: 2,
+            max_hits: Some(10),
+            max_bytes_per_hit: 16,
+        };
+        let result = grep_bytes("https://x.test/app.js", body, b"target", &options);
+
+        assert_eq!(result.hits.len(), 1);
+        let hit = &result.hits[0];
+        assert!(
+            hit.snippet.contains("target"),
+            "snippet should contain the match, got: {:?}",
+            hit.snippet
+        );
+        assert!(hit.snippet.starts_with('…') && hit.snippet.ends_with('…'));
+        assert_eq!(hit.column, 33);
+        assert_eq!(result.shortened_hits, 1);
+    }
+
+    #[test]
+    fn grep_bytes_snaps_window_to_utf8_boundaries() {
+        // The naive midpoint would split a multibyte char; snap_down / snap_up
+        // must keep the snippet decodable.
+        let body = "padding éééééé target éééééé padding".as_bytes();
+        let options = GrepOptions {
+            context: 0,
+            max_hits: Some(1),
+            max_bytes_per_hit: 12,
+        };
+        let result = grep_bytes("https://x.test/app.js", body, b"target", &options);
+
+        assert_eq!(result.hits.len(), 1);
+        // Just verifying it decodes cleanly and contains the match.
+        assert!(result.hits[0].snippet.contains("target"));
+    }
+
+    #[test]
+    fn all_disables_hit_cap() {
+        let options = GrepOptions {
+            context: 0,
+            max_hits: None,
+            max_bytes_per_hit: 200,
+        };
+        let result = grep_bytes("https://x.test/app.js", b"x\nx\nx", b"x", &options);
+
+        assert_eq!(result.hits.len(), 3);
+        assert_eq!(result.omitted_hits, 0);
+    }
+
+    #[test]
+    fn merge_chunk_enforces_global_cap() {
+        let mut result = GrepResult::default();
+        let chunk = grep_bytes(
+            "https://x.test/app.js",
+            b"x\nx\nx",
+            b"x",
+            &GrepOptions {
+                context: 0,
+                max_hits: Some(10),
+                max_bytes_per_hit: 200,
+            },
+        );
+
+        merge_chunk(&mut result, chunk, Some(2));
+
+        assert_eq!(result.hits.len(), 2);
+        assert_eq!(result.omitted_hits, 1);
+        assert_eq!(result.omitted_files, 1);
+    }
 }

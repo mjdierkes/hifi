@@ -6,7 +6,7 @@
 
 ```sh
 hifi <url> [--no-cache] [--no-daemon] [--flat|--json]
-hifi grep <url> <pattern> [-C N]
+hifi grep <url> <pattern> [-C N] [--max-hits N] [--max-bytes-per-hit N] [-a|--all]
 hifi serve
 ```
 
@@ -17,6 +17,8 @@ hifi example.com
 hifi https://api.example.com/v2 --json
 hifi grep example.com TODO -C 2
 ```
+
+`hifi grep` prints at most 50 hits by default and truncates each snippet to 200 bytes so noisy bundles stay readable. Use `--max-hits`, `--max-bytes-per-hit`, or `--all` to adjust that.
 
 By default, private and local network addresses are blocked. Set `HIFI_ALLOW_PRIVATE=1` when you intentionally want to scan local services.
 
