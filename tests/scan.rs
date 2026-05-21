@@ -1,4 +1,5 @@
 use hifi::scan::{scan_endpoints, ScanResult};
+
 #[rustfmt::skip]
 const API_CASES: &[(&str, &str, &str, &str)] = &[
     (r#"fetch("/api/users", {method:"POST", body:x, headers:{"Content-Type":"application/json"}})"#, "/api/users", "POST", "body,headers,json"),
@@ -12,20 +13,10 @@ const API_CASES: &[(&str, &str, &str, &str)] = &[
 fn api_shapes() {
     for &(src, url, methods, flags) in API_CASES {
         let result = scan(src);
-        let apis = result.api_map();
-        let shape = &apis[url];
+        let shape = &result.api_map()[url];
         assert_eq!(shape.methods_csv(), methods, "{url}");
         assert_eq!(shape.flags_csv(), flags, "{url}");
     }
-}
-
-#[test]
-fn ignores_non_urls_and_assets() {
-    let result =
-        scan(r#"map.get("session_id"); fetch("/images/LOGO.PNG?cache=1"); fetch("/api/users")"#);
-    let apis = result.api_map();
-    assert_eq!(apis.len(), 1);
-    assert!(apis.contains_key("/api/users"));
 }
 
 #[test]
@@ -38,16 +29,15 @@ fn candidates_cover_strings_templates_and_raw_literals() {
         self.__next_f.push([1,/api/raw,0]);
     "#,
     );
-    let candidates = result.candidate_map();
     for url in [
         "/api/users",
         "/graphql",
         "https://x.test/api/team",
         "/api/raw",
     ] {
-        assert!(candidates.contains_key(url), "{url}");
+        assert_candidate(&result, url);
     }
-    assert!(!candidates.contains_key("/api/users/"));
+    assert!(!result.candidate_map().contains_key("/api/users/"));
 }
 
 #[test]
@@ -62,79 +52,75 @@ fn routes_and_api_candidates_are_classified_separately() {
         const asset="/images/logo.png";
     "#,
     );
-    let routes = result.route_map();
     for url in [
         "/dashboard",
         "/pricing",
         "/blog/{dynamic}",
         "/settings/{dynamic}",
     ] {
-        assert!(routes.contains_key(url), "{url}");
+        assert_route(&result, url);
     }
-    assert!(result.candidate_map().contains_key("/api/team/{dynamic}"));
-    assert!(!routes.contains_key("/api/users"));
-    assert!(!routes.contains_key("/images/logo.png"));
+    assert_candidate(&result, "/api/team/{dynamic}");
+    assert_no_route(&result, "/api/users");
+    assert_no_route(&result, "/images/logo.png");
 }
 
 #[test]
-fn unresolved_leading_template_base_still_preserves_path() {
-    let result = scan(r#"fetch(`${base}/api/admin`);"#);
-
-    let apis = result.api_map();
-    assert!(!apis.contains_key("/api/admin"));
-    assert!(!apis.contains_key("{dynamic}/api/admin"));
-}
-
-#[test]
-fn url_consisting_only_of_dynamic_segments_is_ignored() {
-    // When the entire URL is interpolation (`/${id}`), the resolved literal
-    // collapses to `/{dynamic}` which carries no information.
+fn rejects_non_endpoint_noise() {
     let result = scan(
         r#"
-        const u = `/${id}`;
-        fetch(u, {method:"GET"});
-    "#,
-    );
-    assert!(!result.api_map().contains_key("/{dynamic}"));
-    assert!(!result.candidate_map().contains_key("/{dynamic}"));
-    assert!(!result.route_map().contains_key("/{dynamic}"));
-}
-
-#[test]
-fn wasm_assets_are_not_endpoints() {
-    let result = scan(
-        r#"
-        const u = "/assets/rnnoise.wasm";
-        fetch(u);
-    "#,
-    );
-    assert!(!result.api_map().contains_key("/assets/rnnoise.wasm"));
-}
-
-#[test]
-fn percent_encoded_svg_does_not_become_a_route() {
-    // Reproduces a real false-positive from Next.js's getImageBlurSvg, which
-    // emits literals like "...%3E%3CfeGaussianBlur stdDeviation='20'/%3E..."
-    let result = scan(
-        r#"
+        map.get("session_id");
+        fetch("/images/LOGO.PNG?cache=1");
+        fetch("/api/users");
+        fetch(`${base}/api/admin`);
+        const onlyDynamic = `/${id}`;
+        const wasm = "/assets/rnnoise.wasm";
+        fetch(wasm);
         let svg = "%3Csvg xmlns='http://www.w3.org/2000/svg' %3E%3Cfilter id='b'%3E%3CfeGaussianBlur stdDeviation='20'/%3E%3C/filter%3E%3C/svg%3E";
         router.push("/dashboard");
     "#,
     );
-    let routes = result.route_map();
-    assert!(routes.contains_key("/dashboard"));
-    for noise in [
+
+    assert_eq!(result.api_map().len(), 1);
+    assert_api(&result, "/api/users");
+    assert_route(&result, "/dashboard");
+    for url in ["/api/admin", "{dynamic}/api/admin", "/assets/rnnoise.wasm"] {
+        assert_no_api(&result, url);
+    }
+    for url in ["/{dynamic}"] {
+        assert_no_api(&result, url);
+        assert!(!result.candidate_map().contains_key(url));
+        assert_no_route(&result, url);
+    }
+    for route in [
         "/%3E%3CfeGaussianBlur",
         "/%3E%3C/filter%3E",
         "/%3E%3C/svg%3E",
     ] {
-        assert!(
-            !routes.contains_key(noise),
-            "encoded-markup leak became a route: {noise}"
-        );
+        assert_no_route(&result, route);
     }
 }
 
 fn scan(src: &str) -> ScanResult {
     scan_endpoints(src.as_bytes())
+}
+
+fn assert_api(result: &ScanResult, url: &str) {
+    assert!(result.api_map().contains_key(url), "{url}");
+}
+
+fn assert_no_api(result: &ScanResult, url: &str) {
+    assert!(!result.api_map().contains_key(url), "{url}");
+}
+
+fn assert_candidate(result: &ScanResult, url: &str) {
+    assert!(result.candidate_map().contains_key(url), "{url}");
+}
+
+fn assert_route(result: &ScanResult, url: &str) {
+    assert!(result.route_map().contains_key(url), "{url}");
+}
+
+fn assert_no_route(result: &ScanResult, url: &str) {
+    assert!(!result.route_map().contains_key(url), "{url}");
 }

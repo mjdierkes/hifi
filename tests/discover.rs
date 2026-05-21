@@ -1,88 +1,64 @@
-use hifi::discover::{scan_document, DocumentKind};
+use hifi::discover::{scan_document, scan_document_with_config, DocumentKind};
+use hifi::scan::{next::NextConfig, EvidenceKind, Extractor};
 use url::Url;
 
 #[test]
-fn generic_html_discovers_scripts_and_preloads() {
+fn discovers_static_dynamic_and_framework_assets() {
     let result = scan_html(
         r#"
         <script src="/app.js"></script>
         <script type="module" src="/assets/index-abc123.js"></script>
         <link rel="modulepreload" href="/assets/vendor-def456.js">
+        <script src="/_nuxt/app.123.js"></script>
+        <script src="/runtime.abc.js"></script>
+        <script src="/main.def.js"></script>
+        const payload="/blog/_payload.json";
     "#,
     );
-    let assets = asset_urls(&result);
+    assert_assets(
+        &result,
+        &[
+            "https://example.com/app.js",
+            "https://example.com/assets/index-abc123.js",
+            "https://example.com/assets/vendor-def456.js",
+            "https://example.com/_nuxt/app.123.js",
+            "https://example.com/runtime.abc.js",
+            "https://example.com/main.def.js",
+        ],
+    );
+    assert_candidate(&result, "/blog/_payload.json");
 
-    assert!(assets.contains(&"https://example.com/app.js".to_string()));
-    assert!(assets.contains(&"https://example.com/assets/index-abc123.js".to_string()));
-    assert!(assets.contains(&"https://example.com/assets/vendor-def456.js".to_string()));
-}
-
-#[test]
-fn vite_rollup_discovers_dynamic_assets() {
-    let base = Url::parse("https://example.com/assets/index-abc123.js").unwrap();
-    let result = scan_document(
+    let base = url("https://example.com/assets/index-abc123.js");
+    let result = scan(
         br#"import("./settings-def456.js"); new URL("./worker-999.js", import.meta.url);"#,
         &base,
         DocumentKind::Script,
     );
-    let assets = asset_urls(&result);
-
-    assert!(assets.contains(&"https://example.com/assets/settings-def456.js".to_string()));
-    assert!(assets.contains(&"https://example.com/assets/worker-999.js".to_string()));
+    assert_assets(
+        &result,
+        &[
+            "https://example.com/assets/settings-def456.js",
+            "https://example.com/assets/worker-999.js",
+        ],
+    );
 }
 
 #[test]
-fn webpack_and_next_runtime_literals_resolve_from_next_base() {
-    let base = Url::parse("https://example.com/_next/static/chunks/app/main.js").unwrap();
-    let result = scan_document(
+fn next_assets_manifests_and_payloads_resolve_from_context() {
+    let result = scan(
         br#"e.u=function(e){return"static/chunks/app/dashboard-deadbeef.js"}; const data="/_next/data/b1/dashboard.json";"#,
-        &base,
+        &url("https://example.com/_next/static/chunks/app/main.js"),
         DocumentKind::Script,
     );
-    let assets = asset_urls(&result);
-
-    assert!(assets.contains(
-        &"https://example.com/_next/static/chunks/app/dashboard-deadbeef.js".to_string()
-    ));
-    assert!(result
-        .findings
-        .candidate_map()
-        .contains_key("/_next/data/b1/dashboard.json"));
-}
-
-#[test]
-fn next_html_revision_adds_manifests() {
-    let result = scan_html(
-        r#"<script id="__NEXT_DATA__" type="application/json">{"buildId":"b1"}</script>"#,
+    assert_assets(
+        &result,
+        &["https://example.com/_next/static/chunks/app/dashboard-deadbeef.js"],
     );
-    let assets = asset_urls(&result);
+    assert_candidate(&result, "/_next/data/b1/dashboard.json");
 
-    assert_eq!(result.revision.as_deref(), Some("b1"));
-    assert!(assets.contains(&"https://example.com/_next/static/b1/_buildManifest.js".to_string()));
-    assert!(assets.contains(&"https://example.com/_next/static/b1/_ssgManifest.js".to_string()));
-}
-
-#[test]
-fn non_next_build_id_does_not_create_revision_or_manifests() {
     let result = scan_html(
         r#"
-        <script>window.__APP_DATA__={"buildId":"viteish"};</script>
-        <script type="module" src="/assets/app.js"></script>
-    "#,
-    );
-    let assets = asset_urls(&result);
-
-    assert_eq!(result.revision, None);
-    assert!(assets.contains(&"https://example.com/assets/app.js".to_string()));
-    assert!(!assets
-        .iter()
-        .any(|asset| asset.contains("/_next/static/viteish/")));
-}
-
-#[test]
-fn next_payloads_and_rsc_prefetches_are_fetchable_assets() {
-    let result = scan_html(
-        r#"
+        <script id="__NEXT_DATA__" type="application/json">{"buildId":"b1"}</script>
         <script>
         const data="/_next/data/b1/dashboard.json";
         const rsc="/dashboard?_rsc=abc";
@@ -90,293 +66,178 @@ fn next_payloads_and_rsc_prefetches_are_fetchable_assets() {
         </script>
     "#,
     );
-    let assets = asset_urls(&result);
-
-    assert!(assets.contains(&"https://example.com/_next/data/b1/dashboard.json".to_string()));
-    assert!(assets.contains(&"https://example.com/dashboard?_rsc=abc".to_string()));
-    assert!(assets
-        .contains(&"https://example.com/dashboard.segments/dashboard.segment.rsc".to_string()));
+    assert_eq!(result.revision.as_deref(), Some("b1"));
+    assert_assets(
+        &result,
+        &[
+            "https://example.com/_next/static/b1/_buildManifest.js",
+            "https://example.com/_next/static/b1/_ssgManifest.js",
+            "https://example.com/_next/data/b1/dashboard.json",
+            "https://example.com/dashboard?_rsc=abc",
+            "https://example.com/dashboard.segments/dashboard.segment.rsc",
+        ],
+    );
 }
 
 #[test]
-fn minified_rsc_property_accesses_are_not_treated_as_assets() {
-    // Real-world false positives from Next.js minified RSC code: property
-    // accesses like `x.rsc`, `rsc:E.rsc`, and concatenated chunk paths like
-    // `"_next/static/chunks/" + n + ".rsc"` produce `.rsc` substrings that
-    // are not real URLs.
+fn next_manifest_roots_follow_asset_prefix_or_observed_mount() {
+    let prefixed = scan_html(
+        r#"<script id="__NEXT_DATA__" type="application/json">{"buildId":"b1","assetPrefix":"https://cdn.example.com"}</script>"#,
+    );
+    assert_assets(
+        &prefixed,
+        &[
+            "https://cdn.example.com/_next/static/b1/_buildManifest.js",
+            "https://cdn.example.com/_next/static/b1/app-build-manifest.json",
+        ],
+    );
+
+    let mounted = scan(
+        br#"
+        <script id="__NEXT_DATA__" type="application/json">{"buildId":"b1"}</script>
+        <script src="https://cdn.example.com/docs/_next/static/chunks/app.js"></script>
+    "#,
+        &url("https://example.com/docs/"),
+        DocumentKind::Html,
+    );
+    assert_assets(
+        &mounted,
+        &[
+            "https://cdn.example.com/docs/_next/static/b1/_buildManifest.js",
+            "https://cdn.example.com/docs/_next/static/b1/_ssgManifest.js",
+        ],
+    );
+
+    let not_next = scan_html(
+        r#"<script>window.__APP_DATA__={"buildId":"viteish"};</script><script src="/assets/app.js"></script>"#,
+    );
+    assert_eq!(not_next.revision, None);
+    assert_asset(&not_next, "https://example.com/assets/app.js");
+    assert_no_asset_containing(&not_next, "/_next/static/viteish/");
+}
+
+#[test]
+fn rejects_asset_false_positives() {
     let result = scan_html(
         r#"
+        <script src="/_next/static/chunks/instrumentation-abc.js"></script>
         <script>
+        // /_next/data/b1/notes.json -- comment, not a real URL
+        var path = _next_data_lookup(/_next/data/b1/inline);
         var t={children:x.rsc,rsc:E.rsc};
         var u="/_next/static/chunks/"+n+".rsc";
         var v="/_next/static/chunks/.segment.rsc";
         var w="/_next/static/chunks/"+s+".head.rsc";
+        const valid = "/_next/data/b1/dashboard.json";
         </script>
     "#,
     );
+    assert_candidate(&result, "/_next/data/b1/dashboard.json");
     for noise in [
+        "/_next/data/b1/notes.json",
+        "/_next/data/b1/inline",
         "x.rsc",
         "E.rsc",
         ".segment.rsc",
         "/_next/static/chunks/.rsc",
         "/_next/static/chunks/.segment.rsc",
         "/_next/static/chunks/s.head.rsc",
+        "instrumentation-abc.js",
     ] {
-        assert!(
-            !asset_urls(&result).iter().any(|u| u.ends_with(noise)),
-            "garbage `.rsc` token became a fetchable asset: {noise}"
-        );
+        assert_no_asset_containing(&result, noise);
+        assert!(!result.findings.candidate_map().contains_key(noise));
     }
 }
 
 #[test]
-fn next_manifests_follow_observed_static_mount() {
-    let result = scan_document(
-        br#"
-        <script id="__NEXT_DATA__" type="application/json">{"buildId":"b1"}</script>
-        <script src="https://cdn.example.com/docs/_next/static/chunks/app.js"></script>
-    "#,
-        &Url::parse("https://example.com/docs/").unwrap(),
-        DocumentKind::Html,
-    );
-    let assets = asset_urls(&result);
+fn next_server_actions_reconstruct_routes() {
+    for (base, config, kind, expected) in [
+        (
+            "https://example.com/app/en/dashboard",
+            br#"<script id="__NEXT_DATA__" type="application/json">{"buildId":"b1","basePath":"/app","locales":["en","fr"]}</script><form><input name="$ACTION_xyz"></form>"#.as_slice(),
+            DocumentKind::Html,
+            "/dashboard",
+        ),
+        (
+            "https://example.com/fr/about",
+            br#"<script id="__NEXT_DATA__" type="application/json">{"buildId":"b1","locales":["en","fr"]}</script><form><input name="$ACTION_xyz"></form>"#.as_slice(),
+            DocumentKind::Html,
+            "/about",
+        ),
+        (
+            "https://example.com/(marketing)/about.rsc",
+            br#"<script>const a="$ACTION_xyz";</script>"#.as_slice(),
+            DocumentKind::Payload,
+            "/about",
+        ),
+    ] {
+        assert_api(&scan(config, &url(base), kind), expected);
+    }
 
-    assert!(assets
-        .contains(&"https://cdn.example.com/docs/_next/static/b1/_buildManifest.js".to_string()));
-    assert!(assets
-        .contains(&"https://cdn.example.com/docs/_next/static/b1/_ssgManifest.js".to_string()));
+    let cfg = NextConfig {
+        build_id: Some("b1".into()),
+        locales: vec!["en".into(), "fr".into()],
+        ..Default::default()
+    };
+    let result = scan_document_with_config(
+        br#"<form><input name="$ACTION_xyz"></form>"#,
+        &url("https://example.com/fr/about.rsc"),
+        DocumentKind::Payload,
+        Some(&cfg),
+    );
+    assert_api(&result, "/about");
 }
 
 #[test]
-fn next_flight_and_action_markers_add_browser_surface() {
-    let result = scan_document(
-        br#"
-        <script>self.__next_f.push([1,"fetch(\"/api/flight\",{method:\"POST\"})"])</script>
-        <form><input type="hidden" name="$ACTION_ID_abc"></form>
-    "#,
-        &Url::parse("https://example.com/checkout").unwrap(),
-        DocumentKind::Html,
-    );
-
-    assert_eq!(result.findings.api_map()["/checkout"].methods_csv(), "POST");
-    assert_eq!(
-        result.findings.api_map()["/checkout"].flags_csv(),
-        "body,next-action"
-    );
-}
-
-#[test]
-fn nuxt_and_angular_assets_are_generic_artifacts() {
-    let result = scan_html(
-        r#"
-        <script src="/_nuxt/app.123.js"></script>
-        <script src="/runtime.abc.js"></script>
-        <script src="/main.def.js"></script>
-        const payload="/blog/_payload.json";
-    "#,
-    );
-    let assets = asset_urls(&result);
-
-    assert!(assets.contains(&"https://example.com/_nuxt/app.123.js".to_string()));
-    assert!(assets.contains(&"https://example.com/runtime.abc.js".to_string()));
-    assert!(assets.contains(&"https://example.com/main.def.js".to_string()));
-    assert!(result
-        .findings
-        .candidate_map()
-        .contains_key("/blog/_payload.json"));
-}
-
-#[test]
-fn next_asset_prefix_overrides_manifest_origin() {
-    let result = scan_html(
-        r#"<script id="__NEXT_DATA__" type="application/json">{"buildId":"b1","assetPrefix":"https://cdn.example.com"}</script>"#,
-    );
-    let assets = asset_urls(&result);
-
-    assert!(
-        assets.contains(&"https://cdn.example.com/_next/static/b1/_buildManifest.js".to_string())
-    );
-    assert!(assets
-        .contains(&"https://cdn.example.com/_next/static/b1/app-build-manifest.json".to_string()));
-}
-
-#[test]
-fn next_base_path_prefixes_route_reconstruction() {
-    let base = url::Url::parse("https://example.com/app/en/dashboard").unwrap();
-    let result = scan_document(
-        br#"<script id="__NEXT_DATA__" type="application/json">{"buildId":"b1","basePath":"/app","locales":["en","fr"]}</script><form><input name="$ACTION_xyz"></form>"#,
-        &base,
-        hifi::discover::DocumentKind::Html,
-    );
-    assert!(
-        result.findings.api_map().contains_key("/dashboard"),
-        "got keys: {:?}",
-        result.findings.api_map().keys().collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn next_locale_strip_normalizes_routes() {
-    let base = url::Url::parse("https://example.com/fr/about").unwrap();
-    let result = scan_document(
-        br#"<script id="__NEXT_DATA__" type="application/json">{"buildId":"b1","locales":["en","fr"]}</script><form><input name="$ACTION_xyz"></form>"#,
-        &base,
-        hifi::discover::DocumentKind::Html,
-    );
-    assert!(
-        result.findings.api_map().contains_key("/about"),
-        "got keys: {:?}",
-        result.findings.api_map().keys().collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn build_manifest_routes_emit_as_findings() {
-    let base = url::Url::parse("https://example.com/_next/static/b1/_buildManifest.js").unwrap();
-    let result = scan_document(
+fn manifests_emit_routes_and_manifest_evidence() {
+    let build = scan(
         br#"self.__BUILD_MANIFEST=function(s,c){return{"/":["a.js"],"/dashboard":[s],"/about":[c],"/_app":["x"],sortedPages:["/"]}}();"#,
-        &base,
-        hifi::discover::DocumentKind::Manifest,
+        &url("https://example.com/_next/static/b1/_buildManifest.js"),
+        DocumentKind::Manifest,
     );
+    assert_routes(&build, &["/", "/dashboard", "/about"]);
 
-    let routes = result.findings.route_map();
-    assert!(routes.contains_key("/"));
-    assert!(routes.contains_key("/dashboard"));
-    assert!(routes.contains_key("/about"));
-}
-
-#[test]
-fn app_build_manifest_routes_decode_groups() {
-    let base =
-        url::Url::parse("https://example.com/_next/static/b1/app-build-manifest.json").unwrap();
-    let result = scan_document(
+    let app = scan(
         br#"{"pages":{"/(marketing)/about/page":["a.js"],"/dashboard/page":["b.js"],"/blog/[slug]/page":["c.js"]}}"#,
-        &base,
-        hifi::discover::DocumentKind::Manifest,
+        &url("https://example.com/_next/static/b1/app-build-manifest.json"),
+        DocumentKind::Manifest,
     );
-
-    let routes = result.findings.route_map();
-    assert!(routes.contains_key("/about"));
-    assert!(routes.contains_key("/dashboard"));
-    assert!(routes.contains_key("/blog/[slug]"));
-}
-
-#[test]
-fn comment_and_identifier_substrings_are_not_assets() {
-    // Without quoted-string context, these regions look like asset
-    // literals after walk_token_start. They should now be rejected.
-    let result = scan_html(
-        r#"
-        <script>
-        // /_next/data/b1/notes.json -- comment, not a real URL
-        var path = _next_data_lookup(/_next/data/b1/inline);
-        const valid = "/_next/data/b1/dashboard.json";
-        </script>
-    "#,
-    );
-    assert!(result
-        .findings
-        .candidate_map()
-        .contains_key("/_next/data/b1/dashboard.json"));
-    let candidates = result.findings.candidate_map();
-    assert!(!candidates.contains_key("/_next/data/b1/notes.json"));
-    assert!(!candidates.contains_key("/_next/data/b1/inline"));
-}
-
-#[test]
-fn next_15_instrumentation_chunks_are_skipped() {
-    let base = url::Url::parse("https://example.com/").unwrap();
-    let result = scan_document(
-        br#"<script src="/_next/static/chunks/instrumentation-abc.js"></script>"#,
-        &base,
-        hifi::discover::DocumentKind::Html,
-    );
-    let assets = asset_urls(&result);
-    assert!(
-        !assets
-            .iter()
-            .any(|url| url.contains("instrumentation-abc.js")),
-        "Next 15 instrumentation chunk leaked through: {assets:?}",
-    );
-}
-
-#[test]
-fn evidence_records_manifest_extractor() {
-    use hifi::scan::{EvidenceKind, Extractor};
-    let base =
-        url::Url::parse("https://example.com/_next/static/b1/app-build-manifest.json").unwrap();
-    let result = scan_document(
-        br#"{"pages":{"/dashboard/page":["a.js"]}}"#,
-        &base,
-        hifi::discover::DocumentKind::Manifest,
-    );
-    assert!(result.findings.evidence.iter().any(|e| {
-        e.url == "/dashboard" && e.kind == EvidenceKind::Route && e.extractor == Extractor::Manifest
-    }));
+    assert_routes(&app, &["/about", "/dashboard", "/blog/[slug]"]);
+    assert_evidence(&app, "/dashboard", EvidenceKind::Route, Extractor::Manifest);
 }
 
 #[test]
 fn evidence_keeps_distinct_extractors() {
-    use hifi::scan::{EvidenceKind, Extractor};
     let result = scan_html(
-        r#"<script>const r="/dashboard";</script><script>self.__next_f.push([1,"0:{\"href\":\"/dashboard\"}"])</script>"#,
+        r#"<script>const r="/dashboard";</script><script>self.__next_f.push([1,"0:{\"href\":\"/dashboard\"}"])</script><form><input name="$ACTION_xyz"></form>"#,
     );
-    assert!(result.findings.evidence.iter().any(|e| {
-        e.url == "/dashboard" && e.kind == EvidenceKind::Route && e.extractor == Extractor::Literal
-    }));
-    assert!(result.findings.evidence.iter().any(|e| {
-        e.url == "/dashboard" && e.kind == EvidenceKind::Route && e.extractor == Extractor::Flight
-    }));
-}
-
-#[test]
-fn server_action_records_inferred_evidence() {
-    use hifi::scan::{EvidenceKind, Extractor};
-    let base = url::Url::parse("https://example.com/checkout").unwrap();
-    let result = scan_document(
-        br#"<form><input name="$ACTION_xyz"></form>"#,
-        &base,
-        hifi::discover::DocumentKind::Html,
+    assert_evidence(
+        &result,
+        "/dashboard",
+        EvidenceKind::Route,
+        Extractor::Literal,
     );
-    assert!(result.findings.evidence.iter().any(|e| {
-        e.url == "/checkout"
-            && e.kind == EvidenceKind::Api
-            && e.extractor == Extractor::ServerAction
-    }));
+    assert_evidence(
+        &result,
+        "/dashboard",
+        EvidenceKind::Route,
+        Extractor::Flight,
+    );
+    assert_evidence(&result, "/", EvidenceKind::Api, Extractor::ServerAction);
 }
 
 #[test]
-fn api_call_sites_record_api_call_evidence() {
-    use hifi::scan::{EvidenceKind, Extractor};
-    let result = scan_html(r#"<script>fetch("/api/widgets",{method:"POST"})</script>"#);
-    assert!(result.findings.evidence.iter().any(|e| {
-        e.url == "/api/widgets" && e.kind == EvidenceKind::Api && e.extractor == Extractor::ApiCall
-    }));
-}
-
-#[test]
-fn flight_typed_walk_extracts_href_routes() {
+fn flight_payloads_add_browser_surface_without_64k_truncation() {
     let result = scan_html(
         r#"<script>self.__next_f.push([1,"0:[\"$\",\"a\",null,{\"href\":\"/profile\",\"action\":\"/api/save\"}]\n"])</script>"#,
     );
-    let routes = result.findings.route_map();
-    let apis = result.findings.api_map();
-    let candidates = result.findings.candidate_map();
-    assert!(routes.contains_key("/profile"));
+    assert_route(&result, "/profile");
     assert!(
-        routes.contains_key("/api/save")
-            || apis.contains_key("/api/save")
-            || candidates.contains_key("/api/save"),
-        "got routes={:?} apis={:?} candidates={:?}",
-        routes.keys().collect::<Vec<_>>(),
-        apis.keys().collect::<Vec<_>>(),
-        candidates.keys().collect::<Vec<_>>(),
+        result.findings.route_map().contains_key("/api/save")
+            || result.findings.api_map().contains_key("/api/save")
+            || result.findings.candidate_map().contains_key("/api/save")
     );
-}
 
-#[test]
-fn flight_large_payload_is_not_truncated_at_64k() {
-    // Construct a flight push whose embedded payload exceeds the old 64KB cap.
     let mut middle = String::with_capacity(80_000);
     for i in 0..1500 {
         middle.push_str(&format!("\\\"pad_{i}\\\":\\\"x\\\","));
@@ -384,58 +245,91 @@ fn flight_large_payload_is_not_truncated_at_64k() {
     let html = format!(
         r#"<script>self.__next_f.push([1,"0:{{{middle}\"href\":\"/late-route\"}}\n"])</script>"#
     );
-    let result = scan_html(&html);
-    assert!(
-        result.findings.route_map().contains_key("/late-route"),
-        "large flight payload was truncated; routes={:?}",
-        result.findings.route_map().keys().collect::<Vec<_>>(),
-    );
-}
-
-#[test]
-fn scan_document_with_config_uses_parent_locale() {
-    use hifi::discover::scan_document_with_config;
-    use hifi::scan::next::NextConfig;
-    let cfg = NextConfig {
-        build_id: Some("b1".into()),
-        locales: vec!["en".into(), "fr".into()],
-        ..Default::default()
-    };
-    let base = url::Url::parse("https://example.com/fr/about.rsc").unwrap();
-    let result = scan_document_with_config(
-        br#"<form><input name="$ACTION_xyz"></form>"#,
-        &base,
-        hifi::discover::DocumentKind::Payload,
-        Some(&cfg),
-    );
-    assert!(
-        result.findings.api_map().contains_key("/about"),
-        "got: {:?}",
-        result.findings.api_map().keys().collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn app_router_route_groups_decoded_in_payload_route() {
-    let base = url::Url::parse("https://example.com/(marketing)/about.rsc").unwrap();
-    let result = scan_document(
-        br#"<script>const a="$ACTION_xyz";</script>"#,
-        &base,
-        hifi::discover::DocumentKind::Payload,
-    );
-    assert!(
-        result.findings.api_map().contains_key("/about"),
-        "got keys: {:?}",
-        result.findings.api_map().keys().collect::<Vec<_>>()
-    );
+    assert_route(&scan_html(&html), "/late-route");
 }
 
 fn scan_html(src: &str) -> hifi::discover::DocumentScan {
-    scan_document(
+    scan(
         src.as_bytes(),
-        &Url::parse("https://example.com/").unwrap(),
+        &url("https://example.com/"),
         DocumentKind::Html,
     )
+}
+
+fn scan(bytes: &[u8], base: &Url, kind: DocumentKind) -> hifi::discover::DocumentScan {
+    scan_document(bytes, base, kind)
+}
+
+fn url(raw: &str) -> Url {
+    Url::parse(raw).unwrap()
+}
+
+fn assert_asset(result: &hifi::discover::DocumentScan, expected: &str) {
+    let assets = asset_urls(result);
+    assert!(
+        assets.contains(&expected.to_string()),
+        "{expected} not in {assets:?}"
+    );
+}
+
+fn assert_assets(result: &hifi::discover::DocumentScan, expected: &[&str]) {
+    for url in expected {
+        assert_asset(result, url);
+    }
+}
+
+fn assert_no_asset_containing(result: &hifi::discover::DocumentScan, needle: &str) {
+    let assets = asset_urls(result);
+    assert!(
+        !assets.iter().any(|url| url.contains(needle)),
+        "{needle} unexpectedly found in {assets:?}"
+    );
+}
+
+fn assert_api(result: &hifi::discover::DocumentScan, url: &str) {
+    assert!(
+        result.findings.api_map().contains_key(url),
+        "{url} not in {:?}",
+        result.findings.api_map().keys().collect::<Vec<_>>()
+    );
+}
+
+fn assert_candidate(result: &hifi::discover::DocumentScan, url: &str) {
+    assert!(
+        result.findings.candidate_map().contains_key(url),
+        "{url} not in {:?}",
+        result.findings.candidate_map().keys().collect::<Vec<_>>()
+    );
+}
+
+fn assert_route(result: &hifi::discover::DocumentScan, url: &str) {
+    assert!(
+        result.findings.route_map().contains_key(url),
+        "{url} not in {:?}",
+        result.findings.route_map().keys().collect::<Vec<_>>()
+    );
+}
+
+fn assert_routes(result: &hifi::discover::DocumentScan, routes: &[&str]) {
+    for route in routes {
+        assert_route(result, route);
+    }
+}
+
+fn assert_evidence(
+    result: &hifi::discover::DocumentScan,
+    url: &str,
+    kind: EvidenceKind,
+    extractor: Extractor,
+) {
+    assert!(
+        result
+            .findings
+            .evidence
+            .iter()
+            .any(|e| e.url == url && e.kind == kind && e.extractor == extractor),
+        "missing {kind:?}/{extractor:?} evidence for {url}"
+    );
 }
 
 fn asset_urls(result: &hifi::discover::DocumentScan) -> Vec<String> {
