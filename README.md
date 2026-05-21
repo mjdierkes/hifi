@@ -28,8 +28,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
+See [`docs/architecture.md`](docs/architecture.md) for the module map and scan lifecycle.
+
 Useful environment variables:
 
 - `HIFI_ALLOW_PRIVATE=1`: allow localhost, private IPs, and `.local` names.
 - `HIFI_CHUNK_CONCURRENCY=<n>`: tune concurrent chunk fetches. Values above the hard cap are clamped.
-

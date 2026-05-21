@@ -261,10 +261,15 @@ async fn fetch_asset_body(
     }
     let status = response.status();
     if status == StatusCode::NOT_MODIFIED {
+        // The cached scan result is still valid; callers refresh the validator
+        // sidecar timestamp without reparsing the asset body.
         return Ok(FetchedBody::NotModified);
     }
     if !status.is_success() {
         if asset.source == AssetSource::NextManifest {
+            // Next.js deployments commonly omit one of the optional manifests.
+            // Treat that as an empty document so a missing manifest does not
+            // make the whole scan look incomplete.
             return Ok(FetchedBody::Body(
                 DocumentScan::default(),
                 cache::AssetValidators::default(),

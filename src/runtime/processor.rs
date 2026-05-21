@@ -51,6 +51,10 @@ pub struct Output {
     pub candidates: CandidateMap,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+    // Public cache labels:
+    // - fresh/stale: processed output was reused before network I/O
+    // - hit: root page revision matched previously processed output
+    // - miss: scan work ran and produced new output
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cache: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -197,6 +201,9 @@ impl<'a> Processor<'a> {
         let status = if age < CACHE_FRESH_SECS {
             "fresh"
         } else {
+            // Stale processed output is returned immediately and refreshed in
+            // the background; callers get fast output without blocking on a
+            // full recursive asset scan.
             spawn_refresh(
                 self.client.clone(),
                 self.concurrency,
@@ -232,6 +239,9 @@ impl<'a> Processor<'a> {
             .clone()
             .or_else(|| Some(cache::fingerprint_assets(&initial_assets)));
 
+        // Revision hits happen after the page is read. The root HTML may be
+        // new enough to validate the asset graph, so we can reuse processed
+        // output without rescanning every static asset.
         if let (true, Some(revision), Some(t0)) = (use_cache, revision.as_deref(), t0) {
             if let Some(bytes) = cache::read_revision_bytes(&plan.cache_path, Some(revision)) {
                 return Ok(ScanOutcome {

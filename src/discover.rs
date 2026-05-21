@@ -35,6 +35,8 @@ const NEXT_SKIP_FRAGMENTS: &[&str] = &[
     "react-refresh",
     "next/dist/",
 ];
+const FRAMEWORK_DATA_MARKERS: &[&[u8]] = &[b"/_next/data/", b"/_payload.json", b"/__data.json"];
+const NEXT_MANIFESTS: &[&str] = &["_buildManifest.js", "_ssgManifest.js"];
 
 static ASSET_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
     AhoCorasick::builder()
@@ -227,7 +229,7 @@ fn scan_dynamic_assets(
 }
 
 fn push_framework_candidates(bytes: &[u8], findings: &mut ScanResult) {
-    for marker in [b"/_next/data/" as &[u8], b"/_payload.json", b"/__data.json"] {
+    for marker in FRAMEWORK_DATA_MARKERS {
         for pos in memchr::memmem::find_iter(bytes, marker) {
             let start = source::walk_token_start(bytes, pos);
             if let Some(raw) = source::token_string(bytes, start, TemplateMode::Preserve) {
@@ -239,10 +241,7 @@ fn push_framework_candidates(bytes: &[u8], findings: &mut ScanResult) {
 
 fn push_candidate(findings: &mut ScanResult, raw: &str) {
     let path = raw.split(['?', '#']).next().unwrap_or(raw);
-    let is_framework_data = raw.starts_with("/_next/data/")
-        || path.ends_with("/_payload.json")
-        || path.ends_with("/__data.json");
-    if is_framework_data && raw.len() <= 512 {
+    if is_framework_data(raw, path) && raw.len() <= 512 {
         findings.candidates.entry(raw.to_owned()).or_default();
     }
 }
@@ -253,7 +252,7 @@ fn push_next_manifests(
     seen: &mut FxHashSet<Url>,
     out: &mut Vec<AssetRef>,
 ) {
-    for name in ["_buildManifest.js", "_ssgManifest.js"] {
+    for name in NEXT_MANIFESTS {
         let Ok(url) = base.join(&format!("/_next/static/{revision}/{name}")) else {
             continue;
         };
@@ -305,21 +304,35 @@ fn classify_asset(raw: &str) -> Option<AssetKind> {
         .next()
         .unwrap_or(raw)
         .to_ascii_lowercase();
-    if path.ends_with("_buildmanifest.js") || path.ends_with("_ssgmanifest.js") {
+    if is_next_manifest(&path) {
         Some(AssetKind::Manifest)
-    } else if path.ends_with(".js") || path.ends_with(".mjs") {
+    } else if is_script_asset(&path) {
         Some(AssetKind::Script)
-    } else if path.ends_with(".json")
-        && (path.contains("/_next/data/")
-            || path.ends_with("/_payload.json")
-            || path.ends_with("/__data.json"))
-    {
+    } else if path.ends_with(".json") && is_framework_data(raw, &path) {
         Some(AssetKind::Payload)
     } else {
         None
     }
 }
 
+fn is_next_manifest(path: &str) -> bool {
+    path.ends_with("_buildmanifest.js") || path.ends_with("_ssgmanifest.js")
+}
+
+fn is_script_asset(path: &str) -> bool {
+    path.ends_with(".js") || path.ends_with(".mjs")
+}
+
+fn is_framework_data(raw: &str, path: &str) -> bool {
+    raw.starts_with("/_next/data/")
+        || path.contains("/_next/data/")
+        || path.ends_with("/_payload.json")
+        || path.ends_with("/__data.json")
+}
+
+// Bundlers often emit relative chunk names that are only meaningful in a
+// framework context. The Next.js branch rewrites `static/...` to `/_next/...`
+// only when the page or asset already proves that context.
 fn resolve_asset(base: &Url, raw: &str, next_context: bool) -> Option<Url> {
     let raw = raw.trim_matches('\\');
     if raw.is_empty() || raw.starts_with("data:") || raw.starts_with("blob:") {
@@ -355,6 +368,8 @@ fn is_next_context(bytes: &[u8], base: &Url) -> bool {
         || memchr::memmem::find(bytes, b"__NEXT_DATA__").is_some()
 }
 
+// Skip common framework runtime chunks. They are large, noisy, and usually do
+// not contain application API calls; scanning them makes output less focused.
 fn should_skip(url: &Url) -> bool {
     let path = url.path();
     path.contains("/_next/")
@@ -363,6 +378,9 @@ fn should_skip(url: &Url) -> bool {
             .any(|fragment| path.contains(fragment))
 }
 
+// Prefer explicit Next.js build IDs when present. Falling back to the
+// `/_next/static/<revision>/...` path keeps manifest discovery working for
+// pages that do not include inline `__NEXT_DATA__`.
 fn next_revision(bytes: &[u8]) -> Option<String> {
     let needle = br#""buildId":""#;
     if let Some(i) = memchr::memmem::find(bytes, needle) {

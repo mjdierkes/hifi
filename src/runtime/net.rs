@@ -40,6 +40,10 @@ pub fn validate_url(url: &Url, allow_private: bool) -> Result<(), NetError> {
     if allow_private {
         return Ok(());
     }
+    // This validates the URL host as written: literal private IPs and local
+    // names are blocked here. It does not resolve public hostnames and inspect
+    // their DNS answers; add resolver-level checks before relying on this as an
+    // SSRF boundary for hostile input.
     let Some(host) = url.host() else {
         return Err(NetError::PrivateAddress(url.to_string()));
     };
