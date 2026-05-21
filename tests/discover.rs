@@ -187,6 +187,92 @@ fn nuxt_and_angular_assets_are_generic_artifacts() {
         .contains_key("/blog/_payload.json"));
 }
 
+#[test]
+fn next_asset_prefix_overrides_manifest_origin() {
+    let result = scan_html(
+        r#"<script id="__NEXT_DATA__" type="application/json">{"buildId":"b1","assetPrefix":"https://cdn.example.com"}</script>"#,
+    );
+    let assets = asset_urls(&result);
+
+    assert!(assets
+        .contains(&"https://cdn.example.com/_next/static/b1/_buildManifest.js".to_string()));
+    assert!(assets
+        .contains(&"https://cdn.example.com/_next/static/b1/app-build-manifest.json".to_string()));
+}
+
+#[test]
+fn next_base_path_prefixes_route_reconstruction() {
+    let base = url::Url::parse("https://example.com/app/en/dashboard").unwrap();
+    let result = scan_document(
+        br#"<script id="__NEXT_DATA__" type="application/json">{"buildId":"b1","basePath":"/app","locales":["en","fr"]}</script><form><input name="$ACTION_xyz"></form>"#,
+        &base,
+        hifi::discover::DocumentKind::Html,
+    );
+    assert!(
+        result.findings.apis.contains_key("/dashboard"),
+        "got keys: {:?}",
+        result.findings.apis.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn next_locale_strip_normalizes_routes() {
+    let base = url::Url::parse("https://example.com/fr/about").unwrap();
+    let result = scan_document(
+        br#"<script id="__NEXT_DATA__" type="application/json">{"buildId":"b1","locales":["en","fr"]}</script><form><input name="$ACTION_xyz"></form>"#,
+        &base,
+        hifi::discover::DocumentKind::Html,
+    );
+    assert!(
+        result.findings.apis.contains_key("/about"),
+        "got keys: {:?}",
+        result.findings.apis.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn build_manifest_routes_emit_as_findings() {
+    let base = url::Url::parse("https://example.com/_next/static/b1/_buildManifest.js").unwrap();
+    let result = scan_document(
+        br#"self.__BUILD_MANIFEST=function(s,c){return{"/":["a.js"],"/dashboard":[s],"/about":[c],"/_app":["x"],sortedPages:["/"]}}();"#,
+        &base,
+        hifi::discover::DocumentKind::Manifest,
+    );
+
+    assert!(result.findings.routes.contains_key("/"));
+    assert!(result.findings.routes.contains_key("/dashboard"));
+    assert!(result.findings.routes.contains_key("/about"));
+}
+
+#[test]
+fn app_build_manifest_routes_decode_groups() {
+    let base = url::Url::parse("https://example.com/_next/static/b1/app-build-manifest.json").unwrap();
+    let result = scan_document(
+        br#"{"pages":{"/(marketing)/about/page":["a.js"],"/dashboard/page":["b.js"],"/blog/[slug]/page":["c.js"]}}"#,
+        &base,
+        hifi::discover::DocumentKind::Manifest,
+    );
+
+    assert!(result.findings.routes.contains_key("/about"));
+    assert!(result.findings.routes.contains_key("/dashboard"));
+    assert!(result.findings.routes.contains_key("/blog/[slug]"));
+}
+
+#[test]
+fn app_router_route_groups_decoded_in_payload_route() {
+    let base = url::Url::parse("https://example.com/(marketing)/about.rsc").unwrap();
+    let result = scan_document(
+        br#"<script>const a="$ACTION_xyz";</script>"#,
+        &base,
+        hifi::discover::DocumentKind::Payload,
+    );
+    assert!(
+        result.findings.apis.contains_key("/about"),
+        "got keys: {:?}",
+        result.findings.apis.keys().collect::<Vec<_>>()
+    );
+}
+
 fn scan_html(src: &str) -> hifi::discover::DocumentScan {
     scan_document(
         src.as_bytes(),

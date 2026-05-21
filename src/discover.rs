@@ -5,6 +5,7 @@
 //! chunk literals. It does not fetch anything; it only produces `AssetRef`s for
 //! the runtime to schedule and deduplicate.
 
+use crate::scan::next::{self, NextConfig};
 use crate::scan::{ScanResult, Shape};
 use crate::source::{self, TemplateMode};
 use aho_corasick::{AhoCorasick, MatchKind};
@@ -108,17 +109,32 @@ pub struct DocumentScan {
 }
 
 pub fn scan_document(bytes: &[u8], base: &Url, kind: DocumentKind) -> DocumentScan {
-    let next_context = is_next_context(bytes, base);
+    let next_config = if kind == DocumentKind::Html {
+        next::parse_next_data(bytes)
+    } else {
+        None
+    };
+    let next_context = next_config.is_some() || is_next_context(bytes, base);
+    let revision = next_config
+        .as_ref()
+        .and_then(|cfg| cfg.build_id.clone())
+        .or_else(|| next_revision(bytes, next_context));
     let mut out = DocumentScan {
         findings: crate::scan::scan_endpoints(bytes),
         assets: Vec::new(),
-        revision: next_revision(bytes, next_context),
+        revision,
     };
     let mut seen = FxHashSet::default();
 
+    if let Some(routes) = parse_manifest_routes(bytes, base, kind) {
+        for route in routes {
+            out.findings.routes.entry(route).or_default();
+        }
+    }
+
     push_framework_candidates(bytes, &mut out.findings);
     scan_next_flight(bytes, &mut out.findings);
-    scan_next_server_action(bytes, base, kind, &mut out.findings);
+    scan_next_server_action(bytes, base, kind, next_config.as_ref(), &mut out.findings);
     if kind == DocumentKind::Html {
         scan_html_assets(bytes, base, next_context, &mut seen, &mut out.assets);
     }
@@ -138,6 +154,7 @@ pub fn scan_document(bytes: &[u8], base: &Url, kind: DocumentKind) -> DocumentSc
                 bytes,
                 base,
                 revision,
+                next_config.as_ref(),
                 next_context,
                 &mut seen,
                 &mut out.assets,
@@ -146,6 +163,32 @@ pub fn scan_document(bytes: &[u8], base: &Url, kind: DocumentKind) -> DocumentSc
     }
 
     out
+}
+
+/// Parse JSON-style Next.js manifest documents into routes the runtime should
+/// crawl. Each branch checks for a marker that's both cheap to find and
+/// unambiguous, so non-manifest documents short-circuit immediately.
+fn parse_manifest_routes(bytes: &[u8], base: &Url, kind: DocumentKind) -> Option<Vec<String>> {
+    if !matches!(kind, DocumentKind::Manifest | DocumentKind::Payload) {
+        return None;
+    }
+    let path = base.path();
+    let routes = if path.ends_with("_buildManifest.js") {
+        next::parse_build_manifest_js(bytes)
+    } else if path.ends_with("app-build-manifest.json") {
+        next::parse_app_build_manifest(bytes)
+    } else if path.ends_with("middleware-manifest.json")
+        || path.ends_with("_middlewareManifest.json")
+    {
+        next::parse_middleware_manifest(bytes)
+    } else if path.ends_with("client-reference-manifest.json")
+        || path.ends_with("_clientReferenceManifest.json")
+    {
+        next::parse_client_reference_manifest(bytes)
+    } else {
+        return None;
+    };
+    (!routes.is_empty()).then_some(routes)
 }
 
 // HTML documents are the only place where tag structure is meaningful. Scripts,
@@ -264,13 +307,19 @@ fn push_next_manifests(
     bytes: &[u8],
     base: &Url,
     revision: &str,
+    config: Option<&NextConfig>,
     next_context: bool,
     seen: &mut FxHashSet<Url>,
     out: &mut Vec<AssetRef>,
 ) {
-    let root = next_static_mount(bytes, base, next_context)
+    let root = config
+        .and_then(|cfg| asset_prefix_root(cfg, base))
         .and_then(|url| url.join(&format!("{revision}/")).ok())
-        .or_else(|| base.join(&format!("/_next/static/{revision}/")).ok());
+        .or_else(|| next_static_mount(bytes, base, next_context).and_then(|url| url.join(&format!("{revision}/")).ok()))
+        .or_else(|| {
+            let prefix = config.and_then(|c| c.base_path.as_deref()).unwrap_or("");
+            base.join(&format!("{prefix}/_next/static/{revision}/")).ok()
+        });
     let Some(root) = root else {
         return;
     };
@@ -285,6 +334,37 @@ fn push_next_manifests(
             seen,
             out,
         );
+    }
+    // Also queue the App Router manifests when this looks like a Next 13+
+    // build. These live under the same `_next/static/<buildId>/` root and the
+    // runtime fetcher will skip them silently when they don't exist.
+    for name in &["app-build-manifest.json", "_clientReferenceManifest.json"] {
+        let Ok(url) = root.join(name) else { continue };
+        push_resolved_asset(
+            url,
+            AssetKind::Manifest,
+            AssetSource::NextManifest,
+            seen,
+            out,
+        );
+    }
+}
+
+fn asset_prefix_root(cfg: &NextConfig, base: &Url) -> Option<Url> {
+    let prefix = cfg.asset_prefix.as_deref()?.trim_end_matches('/');
+    if prefix.is_empty() {
+        return None;
+    }
+    let base_path = cfg.base_path.as_deref().unwrap_or("");
+    let is_absolute = prefix.starts_with("http://") || prefix.starts_with("https://");
+    if !is_absolute && !prefix.starts_with('/') {
+        return None;
+    }
+    let combined = format!("{prefix}{base_path}/_next/static/");
+    if is_absolute {
+        Url::parse(&combined).ok()
+    } else {
+        base.join(&combined).ok()
     }
 }
 
@@ -541,6 +621,7 @@ fn scan_next_server_action(
     bytes: &[u8],
     base: &Url,
     kind: DocumentKind,
+    config: Option<&NextConfig>,
     findings: &mut ScanResult,
 ) {
     if !matches!(kind, DocumentKind::Html | DocumentKind::Payload)
@@ -550,7 +631,7 @@ fn scan_next_server_action(
     {
         return;
     }
-    let Some(route) = next_route_from_payload(base) else {
+    let Some(route) = next_route_from_payload(base, config) else {
         return;
     };
     findings
@@ -560,7 +641,7 @@ fn scan_next_server_action(
         .merge(&Shape::next_server_action());
 }
 
-fn next_route_from_payload(base: &Url) -> Option<String> {
+fn next_route_from_payload(base: &Url, config: Option<&NextConfig>) -> Option<String> {
     let mut path = base.path().to_owned();
     if let Some(pos) = path.find("/_next/data/") {
         let prefix = &path[..pos];
@@ -578,6 +659,23 @@ fn next_route_from_payload(base: &Url) -> Option<String> {
     if path.is_empty() {
         path.push('/');
     }
+    if let Some(cfg) = config {
+        if let Some(base_path) = cfg.base_path.as_deref() {
+            if !base_path.is_empty() {
+                if let Some(stripped) = path.strip_prefix(base_path) {
+                    path = if stripped.is_empty() {
+                        "/".to_owned()
+                    } else {
+                        stripped.to_owned()
+                    };
+                }
+            }
+        }
+        if !cfg.locales.is_empty() {
+            path = next::strip_locale(&path, &cfg.locales);
+        }
+    }
+    path = next::normalize_app_route(&path);
     Some(path)
 }
 

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 mod classify;
 mod extract;
 mod literals;
+pub mod next;
 mod patterns;
 mod shape;
 

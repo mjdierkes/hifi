@@ -494,7 +494,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_manifest_seeds_extra_chunks() {
-        let addr = serve(4, |req| {
+        let addr = serve(6, |req| {
             if req.starts_with("GET /_next/static/b1/_buildManifest.js ") {
                 (
                     "200 OK",
@@ -502,7 +502,10 @@ mod tests {
                 )
             } else if req.starts_with("GET /_next/static/chunks/app-extra.js ") {
                 ("200 OK", r#"fetch("/api/from-chunk",{method:"POST"})"#)
-            } else if req.starts_with("GET /_next/static/b1/_ssgManifest.js ") {
+            } else if req.starts_with("GET /_next/static/b1/_ssgManifest.js ")
+                || req.starts_with("GET /_next/static/b1/app-build-manifest.json ")
+                || req.starts_with("GET /_next/static/b1/_clientReferenceManifest.json ")
+            {
                 ("404 Not Found", "")
             } else {
                 (
