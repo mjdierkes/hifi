@@ -1,3 +1,9 @@
+//! Grep subcommand.
+//!
+//! Grep reuses document discovery to find static assets, then searches the raw
+//! fetched bytes. It is intentionally separate from the endpoint scanner because
+//! callers expect grep-like text hits, not interpreted API shapes.
+
 use crate::app::{escape_terminal, normalize_url, AppError};
 use crate::discover::{self, AssetRef, DocumentKind};
 use crate::runtime::net;

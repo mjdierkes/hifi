@@ -1,7 +1,19 @@
+//! Endpoint and client-route scanner.
+//!
+//! This module turns source bytes into three buckets:
+//! - confirmed API calls with method/body/header hints,
+//! - API-like candidates that were seen as values rather than calls,
+//! - client routes that are useful context but not API endpoints.
+//!
+//! The scanner is intentionally anchor based. `DOCUMENT_PATTERNS` assigns each
+//! literal to a semantic `PatternKind`, and the dispatch below keeps that
+//! classification visible when adding new framework/client patterns.
+
 use self::literals::{
     BAD_EXTS, CALL_LITERALS, ROUTE_BAD_EXTS, ROUTE_CALL_LITERALS, ROUTE_START_LITERALS,
     ROUTE_VALUE_LITERALS,
 };
+use crate::source::{self, TemplateMode};
 use aho_corasick::{AhoCorasick, MatchKind};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -42,7 +54,24 @@ const CONTENT_TYPES: [(u8, &str); 4] = [
 const CANDIDATE_LITERALS: &[&str] = &["/api", "/graphql", "/trpc"];
 const SHAPE_WINDOW: usize = 400;
 
-static DOCUMENT_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PatternKind {
+    ApiCall,
+    ApiCandidate,
+    RouteCall,
+    RouteValue,
+    RouteStart,
+}
+
+// Each literal must declare the kind of evidence it represents. That keeps the
+// Aho-Corasick index from becoming hidden control flow.
+#[derive(Clone, Copy, Debug)]
+struct SearchPattern {
+    literal: &'static str,
+    kind: PatternKind,
+}
+
+static DOCUMENT_PATTERNS: LazyLock<Vec<SearchPattern>> = LazyLock::new(|| {
     let mut patterns = Vec::with_capacity(
         CALL_LITERALS.len()
             + CANDIDATE_LITERALS.len()
@@ -50,14 +79,33 @@ static DOCUMENT_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
             + ROUTE_VALUE_LITERALS.len()
             + ROUTE_START_LITERALS.len(),
     );
-    patterns.extend_from_slice(CALL_LITERALS);
-    patterns.extend_from_slice(CANDIDATE_LITERALS);
-    patterns.extend_from_slice(ROUTE_CALL_LITERALS);
-    patterns.extend_from_slice(ROUTE_VALUE_LITERALS);
-    patterns.extend_from_slice(ROUTE_START_LITERALS);
+    patterns.extend(CALL_LITERALS.iter().map(|literal| SearchPattern {
+        literal,
+        kind: PatternKind::ApiCall,
+    }));
+    patterns.extend(CANDIDATE_LITERALS.iter().map(|literal| SearchPattern {
+        literal,
+        kind: PatternKind::ApiCandidate,
+    }));
+    patterns.extend(ROUTE_CALL_LITERALS.iter().map(|literal| SearchPattern {
+        literal,
+        kind: PatternKind::RouteCall,
+    }));
+    patterns.extend(ROUTE_VALUE_LITERALS.iter().map(|literal| SearchPattern {
+        literal,
+        kind: PatternKind::RouteValue,
+    }));
+    patterns.extend(ROUTE_START_LITERALS.iter().map(|literal| SearchPattern {
+        literal,
+        kind: PatternKind::RouteStart,
+    }));
+    patterns
+});
+
+static DOCUMENT_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
     AhoCorasick::builder()
         .match_kind(MatchKind::LeftmostLongest)
-        .build(patterns)
+        .build(DOCUMENT_PATTERNS.iter().map(|pattern| pattern.literal))
         .expect("valid scan literals")
 });
 
@@ -166,52 +214,65 @@ impl Shape {
 
 pub fn scan_endpoints(bytes: &[u8]) -> ScanResult {
     let mut out = ScanResult::default();
-    let call_end = CALL_LITERALS.len();
-    let candidate_end = call_end + CANDIDATE_LITERALS.len();
-    let route_call_end = candidate_end + ROUTE_CALL_LITERALS.len();
-    let route_value_end = route_call_end + ROUTE_VALUE_LITERALS.len();
-    let route_start_end = route_value_end + ROUTE_START_LITERALS.len();
 
     for m in DOCUMENT_AC.find_iter(bytes) {
-        let pat = m.pattern().as_usize();
-        if pat < call_end {
-            if let Some((url, mut shape)) = scan_call(bytes, m.start(), m.end(), CALL_LITERALS[pat])
-            {
-                if is_url_like(&url) {
-                    if shape.methods == 0 {
-                        shape.methods = METHOD_GET;
-                    }
-                    apply_query_params(&mut shape, &url);
-                    let url = normalize_api_url(&url);
-                    out.apis.entry(url).or_default().merge(&shape);
-                }
+        let pattern = DOCUMENT_PATTERNS[m.pattern().as_usize()];
+        match pattern.kind {
+            PatternKind::ApiCall => {
+                record_api_call(bytes, m.start(), m.end(), pattern.literal, &mut out)
             }
-        } else if pat < candidate_end {
-            push_candidate(bytes, m.start(), &mut out);
-        } else if pat < route_call_end {
-            if let Some(url) = extract_url_arg(bytes, m.end()).filter(|url| is_client_route(url)) {
-                out.routes.entry(url).or_default();
+            PatternKind::ApiCandidate => {
+                push_candidate(bytes, m.start(), &mut out);
             }
-        } else if pat < route_value_end {
-            if is_identifier_boundary_before(bytes, m.start()) {
-                if let Some(url) =
-                    extract_value_after_anchor(bytes, m.end()).filter(|url| is_client_route(url))
-                {
-                    out.routes.entry(url.to_owned()).or_default();
-                }
-            }
-        } else if pat < route_start_end {
-            let slash = m.end().saturating_sub(1);
-            if !push_candidate(bytes, slash, &mut out) {
-                if let Some(url) = extract_route_at(bytes, slash) {
-                    out.routes.entry(url).or_default();
-                }
-            }
+            PatternKind::RouteCall => record_route_call(bytes, m.end(), &mut out),
+            PatternKind::RouteValue => record_route_value(bytes, m.start(), m.end(), &mut out),
+            PatternKind::RouteStart => record_route_start(bytes, m.end(), &mut out),
         }
     }
     out
 }
 
+fn record_api_call(bytes: &[u8], start: usize, after: usize, anchor: &str, out: &mut ScanResult) {
+    let Some((url, mut shape)) = scan_call(bytes, start, after, anchor) else {
+        return;
+    };
+    if !is_url_like(&url) {
+        return;
+    }
+    if shape.methods == 0 {
+        shape.methods = METHOD_GET;
+    }
+    apply_query_params(&mut shape, &url);
+    let url = normalize_api_url(&url);
+    out.apis.entry(url).or_default().merge(&shape);
+}
+
+fn record_route_call(bytes: &[u8], after: usize, out: &mut ScanResult) {
+    if let Some(url) = extract_url_arg(bytes, after).filter(|url| is_client_route(url)) {
+        out.routes.entry(url).or_default();
+    }
+}
+
+fn record_route_value(bytes: &[u8], start: usize, after: usize, out: &mut ScanResult) {
+    if !source::is_identifier_boundary_before(bytes, start) {
+        return;
+    }
+    if let Some(url) = extract_value_after_anchor(bytes, after).filter(|url| is_client_route(url)) {
+        out.routes.entry(url).or_default();
+    }
+}
+
+fn record_route_start(bytes: &[u8], after: usize, out: &mut ScanResult) {
+    let slash = after.saturating_sub(1);
+    if !push_candidate(bytes, slash, out) {
+        if let Some(url) = extract_route_at(bytes, slash) {
+            out.routes.entry(url).or_default();
+        }
+    }
+}
+
+// Shape extraction is deliberately heuristic. It should capture useful request
+// hints from nearby source without pretending to validate JavaScript semantics.
 fn scan_call(bytes: &[u8], start: usize, after: usize, anchor: &str) -> Option<(String, Shape)> {
     let url = extract_url_arg(bytes, after)?;
     let lo = statement_start(bytes, start);
@@ -231,23 +292,23 @@ fn shape_from_window(bytes: &[u8]) -> Shape {
     for method in memchr::memmem::find_iter(&lower, b"method") {
         shape.methods |= parse_method(&lower[method + 6..]);
     }
-    shape.has_body = contains(&lower, b"body") || contains(&lower, b"formdata(");
-    shape.has_headers = contains(&lower, b"headers")
-        || contains(&lower, b"content-type")
-        || contains(&lower, b"authorization");
-    shape.auth = contains(&lower, b"authorization") || contains(&lower, b"bearer");
-    if contains(&lower, b"application/json") {
+    shape.has_body = source::contains(&lower, b"body") || source::contains(&lower, b"formdata(");
+    shape.has_headers = source::contains(&lower, b"headers")
+        || source::contains(&lower, b"content-type")
+        || source::contains(&lower, b"authorization");
+    shape.auth = source::contains(&lower, b"authorization") || source::contains(&lower, b"bearer");
+    if source::contains(&lower, b"application/json") {
         shape.content_types |= CONTENT_JSON;
     }
-    if contains(&lower, b"multipart/form-data") || contains(&lower, b"formdata(") {
+    if source::contains(&lower, b"multipart/form-data") || source::contains(&lower, b"formdata(") {
         shape.content_types |= CONTENT_FORM;
     }
-    if contains(&lower, b"application/x-www-form-urlencoded")
-        || contains(&lower, b"urlsearchparams(")
+    if source::contains(&lower, b"application/x-www-form-urlencoded")
+        || source::contains(&lower, b"urlsearchparams(")
     {
         shape.content_types |= CONTENT_URLENCODED;
     }
-    if contains(&lower, b"text/plain") {
+    if source::contains(&lower, b"text/plain") {
         shape.content_types |= CONTENT_TEXT;
     }
     shape
@@ -282,77 +343,36 @@ fn parse_method(mut bytes: &[u8]) -> u8 {
     }
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    memchr::memmem::find(haystack, needle).is_some()
-}
-
 fn extract_url_arg(bytes: &[u8], start: usize) -> Option<String> {
     if start > 0 && matches!(bytes[start - 1], b'"' | b'\'' | b'`') {
-        return extract_quoted_url(bytes, start, bytes[start - 1]);
+        return source::quoted_string(
+            bytes,
+            start,
+            bytes[start - 1],
+            TemplateMode::ReplaceExpressions,
+        );
     }
-    let mut i = skip_ws(bytes, start);
+    let mut i = source::skip_ws(bytes, start);
     let quote = *bytes.get(i)?;
     if !matches!(quote, b'"' | b'\'' | b'`') {
         return None;
     }
     i += 1;
     if quote == b'`' && bytes.get(i..i + 2) == Some(b"${") {
-        i = skip_template_expr(bytes, i + 2);
+        i = source::skip_template_expr(bytes, i + 2);
     }
-    extract_quoted_url(bytes, i, quote)
-}
-
-fn extract_quoted_url(bytes: &[u8], start: usize, quote: u8) -> Option<String> {
-    let mut normalized = None;
-    let mut i = start;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            normalized
-                .get_or_insert_with(|| bytes[start..i].to_vec())
-                .push(bytes[i + 1]);
-            i += 2;
-        } else if quote == b'`' && bytes.get(i..i + 2) == Some(b"${") {
-            normalized
-                .get_or_insert_with(|| bytes[start..i].to_vec())
-                .extend_from_slice(b"{dynamic}");
-            i = skip_template_expr(bytes, i + 2);
-        } else if bytes[i] == quote {
-            return quoted_url_from_parts(bytes, start, i, normalized);
-        } else {
-            if let Some(out) = normalized.as_mut() {
-                out.push(bytes[i]);
-            }
-            i += 1;
-        }
-    }
-    quoted_url_from_parts(bytes, start, bytes.len(), normalized)
-}
-
-fn quoted_url_from_parts(
-    bytes: &[u8],
-    start: usize,
-    end: usize,
-    normalized: Option<Vec<u8>>,
-) -> Option<String> {
-    if let Some(out) = normalized {
-        return String::from_utf8(out)
-            .ok()
-            .map(|s| s.trim_matches('\\').to_string());
-    }
-    std::str::from_utf8(&bytes[start..end])
-        .ok()
-        .map(|s| s.trim_matches('\\').to_string())
+    source::quoted_string(bytes, i, quote, TemplateMode::ReplaceExpressions)
 }
 
 fn apply_second_arg_body_shape(bytes: &[u8], start: usize, shape: &mut Shape) {
-    let Some(first_end) = quoted_arg_end(bytes, start) else {
+    let Some(first_end) = source::quoted_arg_end(bytes, start) else {
         return;
     };
-    let mut i = skip_ws(bytes, first_end);
+    let mut i = source::skip_ws(bytes, first_end);
     if bytes.get(i) != Some(&b',') {
         return;
     }
-    i = skip_ws(bytes, i + 1);
+    i = source::skip_ws(bytes, i + 1);
     if matches!(bytes.get(i), None | Some(b')')) {
         return;
     }
@@ -363,27 +383,6 @@ fn apply_second_arg_body_shape(bytes: &[u8], start: usize, shape: &mut Shape) {
             push_unique_sorted(&mut shape.body_params, &key);
         }
     }
-}
-
-fn quoted_arg_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut i = skip_ws(bytes, start);
-    let quote = *bytes.get(i)?;
-    if !matches!(quote, b'"' | b'\'' | b'`') {
-        return None;
-    }
-    i += 1;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            i += 2;
-        } else if quote == b'`' && bytes.get(i..i + 2) == Some(b"${") {
-            i = skip_template_expr(bytes, i + 2);
-        } else if bytes[i] == quote {
-            return Some(i + 1);
-        } else {
-            i += 1;
-        }
-    }
-    Some(bytes.len())
 }
 
 fn object_keys(bytes: &[u8], start: usize) -> Option<Vec<String>> {
@@ -408,9 +407,9 @@ fn object_keys(bytes: &[u8], start: usize) -> Option<Vec<String>> {
             b'"' | b'\'' | b'`' => {
                 if depth == 1 && read_key {
                     let quote = bytes[i];
-                    if let Some(end) = quoted_end(bytes, i + 1, quote) {
+                    if let Some(end) = source::quoted_end(bytes, i + 1, quote) {
                         let key = std::str::from_utf8(&bytes[i + 1..end]).ok()?.to_string();
-                        let after = skip_ws(bytes, end + 1);
+                        let after = source::skip_ws(bytes, end + 1);
                         if bytes.get(after) == Some(&b':') {
                             keys.push(key);
                             read_key = false;
@@ -420,7 +419,7 @@ fn object_keys(bytes: &[u8], start: usize) -> Option<Vec<String>> {
                         return Some(keys);
                     }
                 } else {
-                    i = quoted_end(bytes, i + 1, bytes[i])
+                    i = source::quoted_end(bytes, i + 1, bytes[i])
                         .map(|end| end + 1)
                         .unwrap_or(bytes.len());
                 }
@@ -443,7 +442,7 @@ fn object_keys(bytes: &[u8], start: usize) -> Option<Vec<String>> {
                     i += 1;
                 }
                 let key = std::str::from_utf8(&bytes[key_start..i]).ok()?.to_string();
-                let after = skip_ws(bytes, i);
+                let after = source::skip_ws(bytes, i);
                 if matches!(bytes.get(after), Some(b':' | b',' | b'}')) {
                     keys.push(key);
                     read_key = !matches!(bytes.get(after), Some(b':'));
@@ -455,29 +454,16 @@ fn object_keys(bytes: &[u8], start: usize) -> Option<Vec<String>> {
     Some(keys)
 }
 
-fn quoted_end(bytes: &[u8], mut i: usize, quote: u8) -> Option<usize> {
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            i += 2;
-        } else if bytes[i] == quote {
-            return Some(i);
-        } else {
-            i += 1;
-        }
-    }
-    None
-}
-
 fn extract_value_after_anchor(bytes: &[u8], mut i: usize) -> Option<String> {
-    i = skip_ws(bytes, i);
+    i = source::skip_ws(bytes, i);
     if matches!(bytes.get(i), Some(b'"' | b'\'' | b'`')) {
         let quote = bytes[i];
-        i = skip_ws(bytes, i + 1);
+        i = source::skip_ws(bytes, i + 1);
         if bytes.get(i) == Some(&quote) {
             i += 1;
         }
     }
-    i = skip_ws(bytes, i);
+    i = source::skip_ws(bytes, i);
     if !matches!(bytes.get(i), Some(b':' | b'=')) {
         return None;
     }
@@ -494,101 +480,14 @@ fn push_candidate(bytes: &[u8], pos: usize, out: &mut ScanResult) -> bool {
 }
 
 fn extract_candidate_at(bytes: &[u8], pos: usize) -> Option<String> {
-    let start = walk_token_start(bytes, pos);
-    let url = token_string(bytes, start)?;
+    let start = source::walk_token_start(bytes, pos);
+    let url = source::token_string(bytes, start, TemplateMode::ReplaceExpressions)?;
     is_api_candidate(&url).then(|| normalize_api_url(&url))
 }
 
 fn extract_route_at(bytes: &[u8], pos: usize) -> Option<String> {
-    let url = token_string(bytes, pos)?;
+    let url = source::token_string(bytes, pos, TemplateMode::ReplaceExpressions)?;
     is_client_route(&url).then_some(url)
-}
-
-fn token_string(bytes: &[u8], start: usize) -> Option<String> {
-    let mut out = None;
-    let end = token_end(bytes, start, &mut out);
-    if let Some(out) = out {
-        return String::from_utf8(out)
-            .ok()
-            .map(|s| s.trim_matches('\\').to_string());
-    }
-    std::str::from_utf8(&bytes[start..end])
-        .ok()
-        .map(|s| s.trim_matches('\\').to_string())
-}
-
-fn token_end(bytes: &[u8], mut i: usize, normalized: &mut Option<Vec<u8>>) -> usize {
-    let start = i;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(b"{dynamic}") {
-            normalized
-                .get_or_insert_with(|| bytes[start..i].to_vec())
-                .extend_from_slice(b"{dynamic}");
-            i += b"{dynamic}".len();
-        } else if bytes.get(i..i + 2) == Some(b"${") {
-            normalized
-                .get_or_insert_with(|| bytes[start..i].to_vec())
-                .extend_from_slice(b"{dynamic}");
-            i = skip_template_expr(bytes, i + 2);
-        } else if is_token_delim(bytes[i]) {
-            break;
-        } else {
-            if let Some(out) = normalized {
-                out.push(bytes[i]);
-            }
-            i += 1;
-        }
-    }
-    i
-}
-
-fn walk_token_start(bytes: &[u8], pos: usize) -> usize {
-    let mut start = pos;
-    while start > 0 && !is_token_delim(bytes[start - 1]) {
-        start -= 1;
-    }
-    start
-}
-
-fn is_token_delim(b: u8) -> bool {
-    b.is_ascii_whitespace()
-        || matches!(
-            b,
-            b'"' | b'\''
-                | b'`'
-                | b'<'
-                | b'>'
-                | b'='
-                | b')'
-                | b'('
-                | b','
-                | b';'
-                | b'{'
-                | b'}'
-                | b'['
-                | b']'
-        )
-}
-
-fn skip_template_expr(bytes: &[u8], mut i: usize) -> usize {
-    let mut depth = 1;
-    while i < bytes.len() && depth > 0 {
-        match bytes[i] {
-            b'{' => depth += 1,
-            b'}' => depth -= 1,
-            b'\\' if i + 1 < bytes.len() => i += 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    i
-}
-
-fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
-    while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
-        i += 1;
-    }
-    i
 }
 
 fn statement_start(bytes: &[u8], pos: usize) -> usize {
@@ -696,14 +595,6 @@ fn bad_ext(s: &[u8], exts: &[&str], strip_fragment: bool) -> bool {
         path.len() >= ext.len()
             && path[path.len() - ext.len()..].eq_ignore_ascii_case(ext.as_bytes())
     })
-}
-
-fn is_identifier_boundary_before(bytes: &[u8], pos: usize) -> bool {
-    pos == 0
-        || !matches!(
-            bytes[pos - 1],
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$'
-        )
 }
 
 fn apply_query_params(shape: &mut Shape, url: &str) {

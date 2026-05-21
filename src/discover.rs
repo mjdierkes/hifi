@@ -1,4 +1,12 @@
+//! Static asset discovery.
+//!
+//! Discovery finds additional documents worth scanning: HTML script tags,
+//! preloads, framework manifests, payload JSON, dynamic imports, and bundled
+//! chunk literals. It does not fetch anything; it only produces `AssetRef`s for
+//! the runtime to schedule and deduplicate.
+
 use crate::scan::ScanResult;
+use crate::source::{self, TemplateMode};
 use aho_corasick::{AhoCorasick, MatchKind};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
@@ -123,6 +131,8 @@ pub fn scan_document(bytes: &[u8], base: &Url, kind: DocumentKind) -> DocumentSc
     out
 }
 
+// HTML documents are the only place where tag structure is meaningful. Scripts,
+// manifests, and payloads rely on literal and dynamic-reference discovery.
 fn scan_html_assets(
     bytes: &[u8],
     base: &Url,
@@ -178,8 +188,8 @@ fn scan_literal_assets(
     out: &mut Vec<AssetRef>,
 ) {
     for m in ASSET_AC.find_iter(bytes) {
-        let start = walk_token_start(bytes, m.start());
-        let Some(raw) = token_string(bytes, start) else {
+        let start = source::walk_token_start(bytes, m.start());
+        let Some(raw) = source::token_string(bytes, start, TemplateMode::Preserve) else {
             continue;
         };
         if raw.starts_with("/_next/data/") {
@@ -198,7 +208,7 @@ fn scan_dynamic_assets(
     out: &mut Vec<AssetRef>,
 ) {
     for pos in memchr::memmem::find_iter(bytes, b"import(") {
-        if let Some(raw) = quoted_arg(bytes, pos + b"import(".len()) {
+        if let Some(raw) = source::quoted_arg(bytes, pos + b"import(".len()) {
             push_asset(
                 base,
                 raw,
@@ -210,7 +220,7 @@ fn scan_dynamic_assets(
         }
     }
     for pos in memchr::memmem::find_iter(bytes, b"new URL(") {
-        if let Some(raw) = quoted_arg(bytes, pos + b"new URL(".len()) {
+        if let Some(raw) = source::quoted_arg(bytes, pos + b"new URL(".len()) {
             push_asset(base, raw, next_context, AssetSource::NewUrl, seen, out);
         }
     }
@@ -219,8 +229,8 @@ fn scan_dynamic_assets(
 fn push_framework_candidates(bytes: &[u8], findings: &mut ScanResult) {
     for marker in [b"/_next/data/" as &[u8], b"/_payload.json", b"/__data.json"] {
         for pos in memchr::memmem::find_iter(bytes, marker) {
-            let start = walk_token_start(bytes, pos);
-            if let Some(raw) = token_string(bytes, start) {
+            let start = source::walk_token_start(bytes, pos);
+            if let Some(raw) = source::token_string(bytes, start, TemplateMode::Preserve) {
                 push_candidate(findings, &raw);
             }
         }
@@ -403,82 +413,6 @@ fn attr_value<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a str> {
 
 fn is_attr_delim(b: u8) -> bool {
     b.is_ascii_whitespace() || matches!(b, b'<' | b'/' | b'"' | b'\'')
-}
-
-fn quoted_arg(bytes: &[u8], start: usize) -> Option<&str> {
-    let mut i = skip_ws(bytes, start);
-    let quote = *bytes.get(i)?;
-    if !matches!(quote, b'"' | b'\'' | b'`') {
-        return None;
-    }
-    i += 1;
-    let end = quoted_end(bytes, i, quote)?;
-    std::str::from_utf8(&bytes[i..end]).ok()
-}
-
-fn quoted_end(bytes: &[u8], mut i: usize, quote: u8) -> Option<usize> {
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            i += 2;
-        } else if bytes[i] == quote {
-            return Some(i);
-        } else {
-            i += 1;
-        }
-    }
-    None
-}
-
-fn token_string(bytes: &[u8], start: usize) -> Option<String> {
-    let end = token_end(bytes, start);
-    std::str::from_utf8(&bytes[start..end])
-        .ok()
-        .map(|s| s.trim_matches('\\').to_string())
-}
-
-fn token_end(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() {
-        if is_token_delim(bytes[i]) {
-            break;
-        }
-        i += 1;
-    }
-    i
-}
-
-fn walk_token_start(bytes: &[u8], pos: usize) -> usize {
-    let mut start = pos;
-    while start > 0 && !is_token_delim(bytes[start - 1]) {
-        start -= 1;
-    }
-    start
-}
-
-fn is_token_delim(b: u8) -> bool {
-    b.is_ascii_whitespace()
-        || matches!(
-            b,
-            b'"' | b'\''
-                | b'`'
-                | b'<'
-                | b'>'
-                | b'='
-                | b')'
-                | b'('
-                | b','
-                | b';'
-                | b'{'
-                | b'}'
-                | b'['
-                | b']'
-        )
-}
-
-fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
-    while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
-        i += 1;
-    }
-    i
 }
 
 fn matches_ignore_ascii_case(a: &str, b: &str) -> bool {

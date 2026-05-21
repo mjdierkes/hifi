@@ -1,3 +1,10 @@
+//! Scan lifecycle orchestration.
+//!
+//! `Processor` is the runtime boundary between network/cache concerns and pure
+//! scanning. The public flow is intentionally staged: plan the request, check
+//! processed cache, load the root page, scan the root document, recursively scan
+//! assets, then build display output.
+
 use crate::discover::{self, DocumentKind};
 use crate::scan::{ApiMap, CandidateMap, RouteMap};
 
@@ -94,6 +101,24 @@ pub struct Processor<'a> {
     cache: CacheContext,
 }
 
+struct RequestPlan {
+    original_base: Url,
+    request_base: Url,
+    cache_path: PathBuf,
+}
+
+struct LoadedPage {
+    html: bytes::Bytes,
+    final_base: Url,
+}
+
+// A scan may reuse a processed result either before network I/O (`fresh`/`stale`)
+// or after reading the root page when the page revision matches (`hit`).
+struct ScanOutcome {
+    output: Output,
+    used_revision_cache: bool,
+}
+
 impl<'a> Processor<'a> {
     pub fn new(client: &'a Client, concurrency: usize, cache: CacheContext) -> Self {
         Self {
@@ -109,98 +134,97 @@ impl<'a> Processor<'a> {
         no_cache: bool,
         t0: Instant,
     ) -> Result<Output> {
-        let no_cache_ctx;
-        let active_cache = if no_cache {
-            no_cache_ctx = CacheContext {
-                allow_private: self.cache.allow_private,
-                ..CacheContext::default()
-            };
-            &no_cache_ctx
-        } else {
-            &self.cache
-        };
-        let (base, cache_path, request_base) = request_parts(url, active_cache)?;
+        let active_cache = self.cache_for_request(no_cache);
+        let plan = RequestPlan::new(url, &active_cache)?;
 
-        if let Some((json, age)) = (!no_cache)
-            .then(|| cache::read_any_bytes(&cache_path))
-            .flatten()
-            .filter(|(_, age)| *age < CACHE_STALE_SECS)
-        {
-            let status = if age < CACHE_FRESH_SECS {
-                "fresh"
-            } else {
-                spawn_refresh(
-                    self.client.clone(),
-                    self.concurrency,
-                    url,
-                    (*active_cache).clone(),
-                );
-                "stale"
-            };
-            return Ok(serde_json::from_slice::<Output>(&json)?.mark(Some(t0), status, Some(age)));
+        if !no_cache {
+            if let Some(output) =
+                self.read_processed_cache(&plan.cache_path, url, t0, &active_cache)?
+            {
+                return Ok(output);
+            }
         }
 
-        let (out, cache_hit) = self
-            .collect(
-                &base,
-                &request_base,
-                (!no_cache).then_some(cache_path.as_path()),
-                Some(t0),
-                active_cache,
-            )
+        let outcome = self
+            .scan_request(&plan, !no_cache, Some(t0), &active_cache)
             .await?;
-
-        if !no_cache && !cache_hit {
-            write_caches(&cache_path, &out, url, self.cache.memory.clone())?;
+        if !no_cache && !outcome.used_revision_cache {
+            write_caches(
+                &plan.cache_path,
+                &outcome.output,
+                url,
+                active_cache.memory.clone(),
+            )?;
         }
-        Ok(out)
+        Ok(outcome.output)
     }
 
     pub async fn refresh(&self, url: &str) -> Result<()> {
-        let (base, cache_path, request_base) = request_parts(url, &self.cache)?;
-        let (out, _) = self
-            .collect(
-                &base,
-                &request_base,
-                Some(cache_path.as_path()),
-                None,
-                &self.cache,
-            )
-            .await?;
-        write_caches(&cache_path, &out, url, self.cache.memory.clone())
+        let plan = RequestPlan::new(url, &self.cache)?;
+        let outcome = self.scan_request(&plan, true, None, &self.cache).await?;
+        write_caches(
+            &plan.cache_path,
+            &outcome.output,
+            url,
+            self.cache.memory.clone(),
+        )
     }
 
-    async fn collect(
+    fn cache_for_request(&self, no_cache: bool) -> CacheContext {
+        if no_cache {
+            CacheContext {
+                allow_private: self.cache.allow_private,
+                ..CacheContext::default()
+            }
+        } else {
+            self.cache.clone()
+        }
+    }
+
+    fn read_processed_cache(
         &self,
-        original_base: &Url,
-        request_base: &Url,
-        cache_path: Option<&Path>,
+        cache_path: &Path,
+        url: &str,
+        t0: Instant,
+        cache_ctx: &CacheContext,
+    ) -> Result<Option<Output>> {
+        let Some((json, age)) =
+            cache::read_any_bytes(cache_path).filter(|(_, age)| *age < CACHE_STALE_SECS)
+        else {
+            return Ok(None);
+        };
+
+        let status = if age < CACHE_FRESH_SECS {
+            "fresh"
+        } else {
+            spawn_refresh(
+                self.client.clone(),
+                self.concurrency,
+                url,
+                cache_ctx.clone(),
+            );
+            "stale"
+        };
+
+        Ok(Some(serde_json::from_slice::<Output>(&json)?.mark(
+            Some(t0),
+            status,
+            Some(age),
+        )))
+    }
+
+    // This is the canonical scan pipeline. Keep cache lookup, page loading,
+    // asset recursion, and output construction as separate steps so each policy
+    // can be reasoned about independently.
+    async fn scan_request(
+        &self,
+        plan: &RequestPlan,
+        use_cache: bool,
         t0: Option<Instant>,
         cache_ctx: &CacheContext,
-    ) -> Result<(Output, bool)> {
-        let (html, final_base) = if let Some((body, final_base)) = cache_path
-            .is_some()
-            .then(|| cache::read_page(request_base))
-            .flatten()
-        {
-            (bytes::Bytes::from(body), final_base)
-        } else {
-            let response =
-                net::get_limited(self.client, request_base.clone(), cache_ctx.allow_private)
-                    .await?;
-            let final_base = response.url().clone();
-            remember_redirect(cache_ctx.redirects.as_ref(), original_base, &final_base);
-            let html = net::read_limited(response).await?;
-            if cache_path.is_some() {
-                cache::write_page(request_base, &final_base, &html);
-            }
-            (html, final_base)
-        };
-        let scan_base = final_base.clone();
-        let root_scan = tokio::task::spawn_blocking(move || {
-            discover::scan_document(&html, &scan_base, DocumentKind::Html)
-        })
-        .await?;
+    ) -> Result<ScanOutcome> {
+        let page = self.load_page(plan, use_cache, cache_ctx).await?;
+        let root_scan = scan_root_document(page.html, page.final_base).await?;
         let mut found = root_scan.findings;
         let mut initial_assets = root_scan.assets;
         let revision = root_scan
@@ -208,46 +232,32 @@ impl<'a> Processor<'a> {
             .clone()
             .or_else(|| Some(cache::fingerprint_assets(&initial_assets)));
 
-        if let (Some(path), Some(revision), Some(t0)) = (cache_path, revision.as_deref(), t0) {
-            if let Some(bytes) = cache::read_revision_bytes(path, Some(revision)) {
-                return Ok((
-                    serde_json::from_slice::<Output>(&bytes)?.mark(Some(t0), "hit", None),
-                    true,
-                ));
+        if let (true, Some(revision), Some(t0)) = (use_cache, revision.as_deref(), t0) {
+            if let Some(bytes) = cache::read_revision_bytes(&plan.cache_path, Some(revision)) {
+                return Ok(ScanOutcome {
+                    output: serde_json::from_slice::<Output>(&bytes)?.mark(Some(t0), "hit", None),
+                    used_revision_cache: true,
+                });
             }
         }
 
-        let asset_options = || fetch::AssetScanOptions {
-            concurrency: self.concurrency,
-            use_processed_cache: cache_path.is_some(),
-            cache_key: revision.clone(),
-            allow_private: cache_ctx.allow_private,
-            memory: cache_ctx.assets.clone(),
-        };
         let asset_stats = fetch::scan_assets(
             self.client.clone(),
             initial_assets.drain(..),
-            asset_options(),
+            fetch::AssetScanOptions {
+                concurrency: self.concurrency,
+                use_processed_cache: use_cache,
+                cache_key: revision.clone(),
+                allow_private: cache_ctx.allow_private,
+                memory: cache_ctx.assets.clone(),
+            },
             &mut found,
         )
         .await;
         found.finalize();
-        let mut warnings = Vec::new();
-        if asset_stats.failed > 0 {
-            warnings.push(format!(
-                "failed to read {} assets; results may be incomplete",
-                asset_stats.failed
-            ));
-        }
-        if asset_stats.capped {
-            warnings.push(format!(
-                "stopped after {} discovered assets; results may be incomplete",
-                asset_stats.discovered
-            ));
-        }
 
-        Ok((
-            Output {
+        Ok(ScanOutcome {
+            output: Output {
                 apis: found.apis,
                 routes: found.routes,
                 candidates: found.candidates,
@@ -255,11 +265,84 @@ impl<'a> Processor<'a> {
                 cache: "miss".into(),
                 cache_age_secs: None,
                 elapsed_us: t0.map(|t| t.elapsed().as_micros()),
-                warnings,
+                warnings: warnings_from_assets(&asset_stats),
             },
-            false,
-        ))
+            used_revision_cache: false,
+        })
     }
+
+    async fn load_page(
+        &self,
+        plan: &RequestPlan,
+        use_cache: bool,
+        cache_ctx: &CacheContext,
+    ) -> Result<LoadedPage> {
+        if use_cache {
+            if let Some((body, final_base)) = cache::read_page(&plan.request_base) {
+                return Ok(LoadedPage {
+                    html: bytes::Bytes::from(body),
+                    final_base,
+                });
+            }
+        }
+
+        let response = net::get_limited(
+            self.client,
+            plan.request_base.clone(),
+            cache_ctx.allow_private,
+        )
+        .await?;
+        let final_base = response.url().clone();
+        remember_redirect(
+            cache_ctx.redirects.as_ref(),
+            &plan.original_base,
+            &final_base,
+        );
+        let html = net::read_limited(response).await?;
+        if use_cache {
+            cache::write_page(&plan.request_base, &final_base, &html);
+        }
+        Ok(LoadedPage { html, final_base })
+    }
+}
+
+impl RequestPlan {
+    fn new(url: &str, cache: &CacheContext) -> Result<Self, url::ParseError> {
+        let original_base = Url::parse(url)?;
+        let request_base = redirected_base(cache.redirects.as_ref(), &original_base)
+            .unwrap_or_else(|| original_base.clone());
+        let cache_path = cache::path_for(&original_base);
+        Ok(Self {
+            original_base,
+            request_base,
+            cache_path,
+        })
+    }
+}
+
+async fn scan_root_document(html: bytes::Bytes, final_base: Url) -> Result<discover::DocumentScan> {
+    tokio::task::spawn_blocking(move || {
+        discover::scan_document(&html, &final_base, DocumentKind::Html)
+    })
+    .await
+    .map_err(RuntimeError::from)
+}
+
+fn warnings_from_assets(asset_stats: &fetch::AssetScanStats) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if asset_stats.failed > 0 {
+        warnings.push(format!(
+            "failed to read {} assets; results may be incomplete",
+            asset_stats.failed
+        ));
+    }
+    if asset_stats.capped {
+        warnings.push(format!(
+            "stopped after {} discovered assets; results may be incomplete",
+            asset_stats.discovered
+        ));
+    }
+    warnings
 }
 
 pub fn spawn_refresh(client: Client, concurrency: usize, url: &str, cache: CacheContext) {
@@ -295,14 +378,6 @@ fn redirected_base(redirects: Option<&RedirectMemory>, base: &Url) -> Option<Url
     out.set_query(base.query());
     out.set_fragment(base.fragment());
     Some(out)
-}
-
-fn request_parts(url: &str, cache: &CacheContext) -> Result<(Url, PathBuf, Url), url::ParseError> {
-    let base = Url::parse(url)?;
-    let request_base =
-        redirected_base(cache.redirects.as_ref(), &base).unwrap_or_else(|| base.clone());
-    let cache_path = cache::path_for(&base);
-    Ok((base, cache_path, request_base))
 }
 
 fn remember_redirect(redirects: Option<&RedirectMemory>, from: &Url, to: &Url) {

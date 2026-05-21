@@ -1,3 +1,9 @@
+//! Local daemon for warm scans.
+//!
+//! The daemon owns in-memory processed/asset/redirect caches and coalesces
+//! simultaneous requests for the same URL. The wire protocol is intentionally
+//! tiny because it is only used by this binary over a private Unix socket.
+
 use super::fetch;
 use super::processor::{
     memory_cache, read_memory, redirect_cache, spawn_refresh, write_memory, Body, CacheContext,
@@ -291,6 +297,8 @@ struct InflightGuard {
     owner: bool,
 }
 
+// Only one task computes a cold URL. Other callers wait on the owner and all
+// receive the same serialized body when the scan finishes.
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         if self.owner {

@@ -1,3 +1,9 @@
+//! Network policy and bounded response reads.
+//!
+//! Every outbound request should pass through this module so URL scheme checks,
+//! private-address policy, status handling, and response size limits remain
+//! consistent across page, asset, and grep fetches.
+
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use reqwest::{Client, Response};

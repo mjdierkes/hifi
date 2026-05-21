@@ -1,3 +1,12 @@
+//! Best-effort disk cache.
+//!
+//! Cache failures should not prevent a scan from succeeding. Reads return
+//! `Option` and writes intentionally swallow I/O errors; callers treat cache as
+//! an accelerator, not as required state.
+//!
+//! The cache stores three related artifacts: processed scan output, root pages
+//! plus final redirected URL, and per-asset scan data plus HTTP validators.
+
 use crate::discover::{AssetRef, DocumentScan};
 use serde::{Deserialize, Serialize};
 use std::{

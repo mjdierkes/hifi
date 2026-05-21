@@ -1,3 +1,9 @@
+//! CLI boundary for hifi.
+//!
+//! This module keeps command parsing, daemon selection, and output rendering
+//! separate from the scanner/runtime code. That gives the rest of the crate a
+//! typed request to execute instead of leaking argv shape through the system.
+
 use crate::grep;
 use crate::runtime::daemon;
 use crate::runtime::net;
@@ -79,31 +85,66 @@ impl OutputMode {
     }
 }
 
+#[derive(Debug)]
+enum Command {
+    Help,
+    Serve,
+    Grep(Vec<String>),
+    Scan(ScanArgs),
+}
+
+// Keep CLI state explicit. The scanner should not need to know whether a scan
+// came from argv, a daemon request, or a future library caller.
+#[derive(Debug)]
+struct ScanArgs {
+    url: String,
+    no_cache: bool,
+    no_daemon: bool,
+    mode: OutputMode,
+}
+
 pub async fn run(raw: Vec<String>) -> Result<i32, AppError> {
-    if raw.is_empty() {
-        print!("{HELP}");
-        return Ok(0);
-    }
-    if matches!(raw[0].as_str(), "-h" | "--help" | "help") {
-        print!("{HELP}");
-        return Ok(0);
-    }
+    let command = parse_command(&raw)?;
+    let (concurrency, client) = match command {
+        Command::Help => {
+            print!("{HELP}");
+            return Ok(0);
+        }
+        _ => runtime_client()?,
+    };
 
-    let concurrency = chunk_concurrency();
-    let client = make_client(concurrency)?;
-
-    if raw[0] == "grep" {
-        return grep::run(&raw[1..], client, concurrency).await;
+    match command {
+        Command::Help => unreachable!("handled before runtime setup"),
+        Command::Grep(args) => grep::run(&args, client, concurrency).await,
+        Command::Serve => {
+            daemon::serve(client, concurrency).await?;
+            Ok(0)
+        }
+        Command::Scan(args) => run_scan(args, client, concurrency).await,
     }
-    if raw[0] == "serve" {
-        daemon::serve(client, concurrency).await?;
-        return Ok(0);
-    }
+}
 
+fn parse_command(raw: &[String]) -> Result<Command, AppError> {
+    if raw.is_empty() || matches!(raw[0].as_str(), "-h" | "--help" | "help") {
+        return Ok(Command::Help);
+    }
+    match raw[0].as_str() {
+        "grep" => Ok(Command::Grep(raw[1..].to_vec())),
+        "serve" => {
+            if raw.len() > 1 {
+                return Err(format!("unexpected argument '{}' (try --help)", raw[1]).into());
+            }
+            Ok(Command::Serve)
+        }
+        _ => parse_scan_args(raw).map(Command::Scan),
+    }
+}
+
+fn parse_scan_args(raw: &[String]) -> Result<ScanArgs, AppError> {
     let mut url = None;
     let (mut no_cache, mut no_daemon) = (false, false);
     let mut mode = OutputMode::Auto;
-    for arg in &raw {
+    for arg in raw {
         match arg.as_str() {
             "--no-cache" => no_cache = true,
             "--no-daemon" => no_daemon = true,
@@ -119,8 +160,23 @@ pub async fn run(raw: Vec<String>) -> Result<i32, AppError> {
     let url = url.ok_or("missing URL (try --help)")?;
     let url = normalize_url(&url)?;
 
-    if !no_daemon {
-        if let Some(reply) = daemon_output(&url, no_cache, mode).await {
+    Ok(ScanArgs {
+        url,
+        no_cache,
+        no_daemon,
+        mode,
+    })
+}
+
+fn runtime_client() -> Result<(usize, Client), AppError> {
+    let concurrency = chunk_concurrency();
+    let client = make_client(concurrency)?;
+    Ok((concurrency, client))
+}
+
+async fn run_scan(args: ScanArgs, client: Client, concurrency: usize) -> Result<i32, AppError> {
+    if !args.no_daemon {
+        if let Some(reply) = daemon_output(&args.url, args.no_cache, args.mode).await {
             print!("{}", reply.stdout);
             eprint!("{}", reply.stderr);
             return Ok(reply.exit_code);
@@ -135,9 +191,9 @@ pub async fn run(raw: Vec<String>) -> Result<i32, AppError> {
             ..CacheContext::default()
         },
     )
-    .process_for_display(&url, no_cache, std::time::Instant::now())
+    .process_for_display(&args.url, args.no_cache, std::time::Instant::now())
     .await?;
-    render_processed(&out, mode)?;
+    render_processed(&out, args.mode)?;
     render_warnings(&out);
     Ok(0)
 }
@@ -306,4 +362,36 @@ pub fn escape_terminal(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_scan_command_normalizes_url_and_keeps_runtime_flags() {
+        let raw = args(["example.com", "--no-cache", "--no-daemon", "--json"]);
+
+        let Command::Scan(scan) = parse_command(&raw).unwrap() else {
+            panic!("expected scan command");
+        };
+
+        assert_eq!(scan.url, "https://example.com/");
+        assert!(scan.no_cache);
+        assert!(scan.no_daemon);
+        assert_eq!(scan.mode, OutputMode::Json);
+    }
+
+    #[test]
+    fn parse_subcommands_before_scan_flags() {
+        let grep = parse_command(&args(["grep", "example.com", "TODO"])).unwrap();
+        assert!(matches!(grep, Command::Grep(values) if values == args(["example.com", "TODO"])));
+
+        let serve = parse_command(&args(["serve"])).unwrap();
+        assert!(matches!(serve, Command::Serve));
+    }
+
+    fn args<const N: usize>(values: [&str; N]) -> Vec<String> {
+        values.into_iter().map(str::to_string).collect()
+    }
 }

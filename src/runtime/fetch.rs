@@ -1,3 +1,12 @@
+//! Recursive asset fetcher.
+//!
+//! The processor gives this module initial `AssetRef`s. Fetch keeps a bounded
+//! breadth-first queue, reads each static asset, scans it for more references,
+//! and merges findings back into the caller's `ScanResult`.
+//!
+//! Asset caching is revision-aware: the same URL can produce different scanned
+//! data across builds, so the processed asset cache is scoped by cache key.
+
 use crate::discover::{self, AssetRef, AssetSource, DocumentScan};
 use crate::scan::ScanResult;
 
@@ -111,6 +120,8 @@ pub async fn scan_assets(
     stats
 }
 
+// Keep recursive discovery bounded. The visited set is both a dedupe mechanism
+// and the cap counter, so cyclic chunk references cannot grow the queue forever.
 fn enqueue_assets(
     assets: impl IntoIterator<Item = AssetRef>,
     visited: &mut rustc_hash::FxHashSet<Url>,
