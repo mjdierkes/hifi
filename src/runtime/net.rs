@@ -27,12 +27,6 @@ pub enum NetError {
     Http(#[from] reqwest::Error),
 }
 
-pub fn allow_private_networks() -> bool {
-    std::env::var("HIFI_ALLOW_PRIVATE")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
 pub fn validate_url(url: &Url, allow_private: bool) -> Result<(), NetError> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(NetError::BadScheme(url.scheme().to_string()));

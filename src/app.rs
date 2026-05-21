@@ -5,6 +5,7 @@
 //! typed request to execute instead of leaking argv shape through the system.
 
 use crate::grep;
+use crate::runtime::config::RuntimeConfig;
 use crate::runtime::daemon;
 use crate::runtime::net;
 use crate::runtime::processor::{CacheContext, Output, Processor, CACHE_FRESH_SECS};
@@ -12,9 +13,6 @@ use reqwest::Client;
 use std::io::{self, Write};
 use std::time::Duration;
 use thiserror::Error;
-
-const MAX_CHUNK_CONCURRENCY: usize = 32;
-const HARD_MAX_CHUNK_CONCURRENCY: usize = 128;
 
 const HELP: &str = "\
 hifi — map an HTTP API surface
@@ -105,7 +103,7 @@ struct ScanArgs {
 
 pub async fn run(raw: Vec<String>) -> Result<i32, AppError> {
     let command = parse_command(&raw)?;
-    let (concurrency, client) = match command {
+    let (config, client) = match command {
         Command::Help => {
             print!("{HELP}");
             return Ok(0);
@@ -115,12 +113,12 @@ pub async fn run(raw: Vec<String>) -> Result<i32, AppError> {
 
     match command {
         Command::Help => unreachable!("handled before runtime setup"),
-        Command::Grep(args) => grep::run(&args, client, concurrency).await,
+        Command::Grep(args) => grep::run(&args, client, config).await,
         Command::Serve => {
-            daemon::serve(client, concurrency).await?;
+            daemon::serve(client, config).await?;
             Ok(0)
         }
-        Command::Scan(args) => run_scan(args, client, concurrency).await,
+        Command::Scan(args) => run_scan(args, client, config).await,
     }
 }
 
@@ -168,13 +166,13 @@ fn parse_scan_args(raw: &[String]) -> Result<ScanArgs, AppError> {
     })
 }
 
-fn runtime_client() -> Result<(usize, Client), AppError> {
-    let concurrency = chunk_concurrency();
-    let client = make_client(concurrency)?;
-    Ok((concurrency, client))
+fn runtime_client() -> Result<(RuntimeConfig, Client), AppError> {
+    let config = RuntimeConfig::from_env();
+    let client = make_client(config)?;
+    Ok((config, client))
 }
 
-async fn run_scan(args: ScanArgs, client: Client, concurrency: usize) -> Result<i32, AppError> {
+async fn run_scan(args: ScanArgs, client: Client, config: RuntimeConfig) -> Result<i32, AppError> {
     if !args.no_daemon {
         if let Some(reply) = daemon_output(&args.url, args.no_cache, args.mode).await {
             print!("{}", reply.stdout);
@@ -185,11 +183,8 @@ async fn run_scan(args: ScanArgs, client: Client, concurrency: usize) -> Result<
 
     let out = Processor::new(
         &client,
-        concurrency,
-        CacheContext {
-            allow_private: net::allow_private_networks(),
-            ..CacheContext::default()
-        },
+        config.chunk_concurrency,
+        CacheContext::for_config(config),
     )
     .process_for_display(&args.url, args.no_cache, std::time::Instant::now())
     .await?;
@@ -324,24 +319,15 @@ fn render_daemon_reply(reply: &mut daemon::DaemonReply, mode: OutputMode) {
     }
 }
 
-fn chunk_concurrency() -> usize {
-    std::env::var("HIFI_CHUNK_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .map(|v| v.min(HARD_MAX_CHUNK_CONCURRENCY))
-        .unwrap_or(MAX_CHUNK_CONCURRENCY)
-}
-
-fn make_client(chunk_concurrency: usize) -> reqwest::Result<Client> {
+fn make_client(config: RuntimeConfig) -> reqwest::Result<Client> {
     Client::builder()
-        .pool_max_idle_per_host(chunk_concurrency)
+        .pool_max_idle_per_host(config.chunk_concurrency)
         .pool_idle_timeout(Duration::from_secs(CACHE_FRESH_SECS))
         .tcp_keepalive(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(12))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if net::validate_url(attempt.url(), net::allow_private_networks()).is_ok() {
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if net::validate_url(attempt.url(), config.allow_private).is_ok() {
                 attempt.follow()
             } else {
                 attempt.error("blocked redirect to private or unsupported URL")

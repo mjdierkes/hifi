@@ -8,7 +8,7 @@
 use crate::discover::{self, DocumentKind};
 use crate::scan::{ApiMap, CandidateMap, RouteMap};
 
-use super::{cache, fetch, net};
+use super::{cache, config::RuntimeConfig, fetch, net};
 use lru::LruCache;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -51,12 +51,8 @@ pub struct Output {
     pub candidates: CandidateMap,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
-    // Public cache labels:
-    // - fresh/stale: processed output was reused before network I/O
-    // - hit: root page revision matched previously processed output
-    // - miss: scan work ran and produced new output
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub cache: String,
+    #[serde(default, skip_serializing_if = "CacheStatus::is_stored")]
+    pub cache: CacheStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_age_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -70,12 +66,32 @@ impl Output {
         Ok(serde_json::to_string(self)?)
     }
 
-    fn mark(mut self, t0: Option<Instant>, cache: &str, age_secs: Option<u64>) -> Self {
-        self.cache.clear();
-        self.cache.push_str(cache);
+    fn mark(mut self, t0: Option<Instant>, status: CacheStatus, age_secs: Option<u64>) -> Self {
+        self.cache = status;
         self.cache_age_secs = age_secs;
         self.elapsed_us = t0.map(|t| t.elapsed().as_micros());
         self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CacheStatus {
+    #[default]
+    #[serde(rename = "stored")]
+    Stored,
+    #[serde(rename = "fresh")]
+    Fresh,
+    #[serde(rename = "stale")]
+    Stale,
+    #[serde(rename = "hit")]
+    RevisionHit,
+    #[serde(rename = "miss")]
+    Miss,
+}
+
+impl CacheStatus {
+    fn is_stored(&self) -> bool {
+        *self == Self::Stored
     }
 }
 
@@ -85,6 +101,15 @@ pub struct CacheContext {
     pub assets: Option<fetch::AssetMemoryCache>,
     pub redirects: Option<RedirectMemory>,
     pub allow_private: bool,
+}
+
+impl CacheContext {
+    pub fn for_config(config: RuntimeConfig) -> Self {
+        Self {
+            allow_private: config.allow_private,
+            ..Self::default()
+        }
+    }
 }
 
 pub fn memory_cache() -> MemoryCache {
@@ -199,7 +224,7 @@ impl<'a> Processor<'a> {
         };
 
         let status = if age < CACHE_FRESH_SECS {
-            "fresh"
+            CacheStatus::Fresh
         } else {
             // Stale processed output is returned immediately and refreshed in
             // the background; callers get fast output without blocking on a
@@ -210,7 +235,7 @@ impl<'a> Processor<'a> {
                 url,
                 cache_ctx.clone(),
             );
-            "stale"
+            CacheStatus::Stale
         };
 
         Ok(Some(serde_json::from_slice::<Output>(&json)?.mark(
@@ -245,7 +270,11 @@ impl<'a> Processor<'a> {
         if let (true, Some(revision), Some(t0)) = (use_cache, revision.as_deref(), t0) {
             if let Some(bytes) = cache::read_revision_bytes(&plan.cache_path, Some(revision)) {
                 return Ok(ScanOutcome {
-                    output: serde_json::from_slice::<Output>(&bytes)?.mark(Some(t0), "hit", None),
+                    output: serde_json::from_slice::<Output>(&bytes)?.mark(
+                        Some(t0),
+                        CacheStatus::RevisionHit,
+                        None,
+                    ),
                     used_revision_cache: true,
                 });
             }
@@ -272,7 +301,7 @@ impl<'a> Processor<'a> {
                 routes: found.routes,
                 candidates: found.candidates,
                 revision,
-                cache: "miss".into(),
+                cache: CacheStatus::Miss,
                 cache_age_secs: None,
                 elapsed_us: t0.map(|t| t.elapsed().as_micros()),
                 warnings: warnings_from_assets(&asset_stats),
@@ -420,7 +449,7 @@ fn write_caches(
     url: &str,
     memory: Option<MemoryCache>,
 ) -> Result<()> {
-    let cached = out.clone().mark(None, "", None);
+    let cached = out.clone().mark(None, CacheStatus::Stored, None);
     cache::write_with_revision(cache_path, &cached, out.revision.as_deref());
     if let Some(memory) = memory {
         let body = Arc::from(out.to_json_string()?);

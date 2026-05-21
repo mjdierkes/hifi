@@ -6,6 +6,7 @@
 
 use crate::app::{escape_terminal, normalize_url, AppError};
 use crate::discover::{self, AssetRef, DocumentKind};
+use crate::runtime::config::RuntimeConfig;
 use crate::runtime::net;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
@@ -19,7 +20,7 @@ struct GrepResult {
     failed: usize,
 }
 
-pub async fn run(args: &[String], client: Client, concurrency: usize) -> Result<i32, AppError> {
+pub async fn run(args: &[String], client: Client, config: RuntimeConfig) -> Result<i32, AppError> {
     let mut url = None;
     let mut pattern = None;
     let mut context: usize = 2;
@@ -46,12 +47,12 @@ pub async fn run(args: &[String], client: Client, concurrency: usize) -> Result<
     let url = normalize_url(&url)?;
 
     let base = Url::parse(&url)?;
-    let response = net::get_limited(&client, base.clone(), net::allow_private_networks()).await?;
+    let response = net::get_limited(&client, base.clone(), config.allow_private).await?;
     let final_base = response.url().clone();
     let html = net::read_limited(response).await?;
     let assets = discover::scan_document(&html, &final_base, DocumentKind::Html).assets;
 
-    let result = grep_assets(client, assets.into_iter(), concurrency, &pattern, context).await;
+    let result = grep_assets(client, assets.into_iter(), config, &pattern, context).await;
     if result.failed > 0 {
         eprintln!(
             "hifi: warning: failed to read {} assets; results may be incomplete",
@@ -72,14 +73,22 @@ pub async fn run(args: &[String], client: Client, concurrency: usize) -> Result<
 async fn grep_assets(
     client: Client,
     assets: impl Iterator<Item = AssetRef>,
-    concurrency: usize,
+    config: RuntimeConfig,
     pattern: &str,
     context: usize,
 ) -> GrepResult {
     let pat = std::sync::Arc::new(pattern.to_string());
     let mut searched = stream::iter(assets)
-        .map(|asset| grep_one(client.clone(), asset, pat.clone(), context))
-        .buffer_unordered(concurrency);
+        .map(|asset| {
+            grep_one(
+                client.clone(),
+                asset,
+                pat.clone(),
+                context,
+                config.allow_private,
+            )
+        })
+        .buffer_unordered(config.chunk_concurrency);
 
     let mut result = GrepResult::default();
     while let Some(chunk) = searched.next().await {
@@ -96,8 +105,9 @@ async fn grep_one(
     asset: AssetRef,
     pattern: std::sync::Arc<String>,
     context: usize,
+    allow_private: bool,
 ) -> Result<Vec<Hit>, ()> {
-    let body = net::get_bytes_limited(&client, asset.url.clone(), net::allow_private_networks())
+    let body = net::get_bytes_limited(&client, asset.url.clone(), allow_private)
         .await
         .map_err(|_| ())?;
 

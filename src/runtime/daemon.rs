@@ -4,6 +4,7 @@
 //! simultaneous requests for the same URL. The wire protocol is intentionally
 //! tiny because it is only used by this binary over a private Unix socket.
 
+use super::config::RuntimeConfig;
 use super::fetch;
 use super::processor::{
     memory_cache, read_memory, redirect_cache, spawn_refresh, write_memory, Body, CacheContext,
@@ -51,6 +52,7 @@ pub struct DaemonReply {
 #[derive(Clone)]
 struct State {
     client: Client,
+    config: RuntimeConfig,
     memory: MemoryCache,
     assets: fetch::AssetMemoryCache,
     redirects: RedirectMemory,
@@ -58,9 +60,10 @@ struct State {
 }
 
 impl State {
-    fn new(client: Client) -> Self {
+    fn new(client: Client, config: RuntimeConfig) -> Self {
         Self {
             client,
+            config,
             memory: memory_cache(),
             assets: fetch::asset_memory_cache(),
             redirects: redirect_cache(),
@@ -73,7 +76,7 @@ impl State {
             memory: Some(self.memory.clone()),
             assets: Some(self.assets.clone()),
             redirects: Some(self.redirects.clone()),
-            allow_private: super::net::allow_private_networks(),
+            allow_private: self.config.allow_private,
         }
     }
 }
@@ -105,7 +108,7 @@ pub async fn request(url: &str, no_cache: bool) -> Option<DaemonReply> {
     serde_json::from_str(&body).ok()
 }
 
-pub async fn serve(client: Client, concurrency: usize) -> Result {
+pub async fn serve(client: Client, config: RuntimeConfig) -> Result {
     let path = socket_path();
     prepare_socket_dir(&path)?;
     let _ = std::fs::remove_file(&path);
@@ -113,12 +116,12 @@ pub async fn serve(client: Client, concurrency: usize) -> Result {
     set_socket_private(&path)?;
     eprintln!("hifi daemon listening on {}", path.display());
 
-    let state = State::new(client);
+    let state = State::new(client, config);
     loop {
         let (stream, _) = listener.accept().await?;
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, state, concurrency).await {
+            if let Err(e) = handle_conn(stream, state).await {
                 eprintln!("conn error: {e}");
             }
         });
@@ -168,7 +171,7 @@ fn prepare_socket_dir(path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
-async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -> Result {
+async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
     let t0 = Instant::now();
     let mut req = Vec::with_capacity(512);
     (&mut stream)
@@ -189,7 +192,7 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
     let no_cache = req.first() == Some(&b'1');
     let url = std::str::from_utf8(req.get(1..).unwrap_or_default())?;
     if let Ok(parsed) = url::Url::parse(url) {
-        if let Err(e) = super::net::validate_url(&parsed, super::net::allow_private_networks()) {
+        if let Err(e) = super::net::validate_url(&parsed, state.config.allow_private) {
             return reply(
                 &mut stream,
                 DaemonReply {
@@ -207,7 +210,12 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
         if let Some((body, age)) = read_memory(&state.memory, url) {
             if age < CACHE_STALE_SECS {
                 if age >= CACHE_FRESH_SECS {
-                    spawn_refresh(state.client.clone(), concurrency, url, state.cache());
+                    spawn_refresh(
+                        state.client.clone(),
+                        state.config.chunk_concurrency,
+                        url,
+                        state.cache(),
+                    );
                 }
                 return reply(
                     &mut stream,
@@ -240,7 +248,7 @@ async fn handle_conn(mut stream: UnixStream, state: State, concurrency: usize) -
         }
     }
 
-    let processed = Processor::new(&state.client, concurrency, state.cache())
+    let processed = Processor::new(&state.client, state.config.chunk_concurrency, state.cache())
         .process_for_display(url, no_cache, t0)
         .await;
     let out = match processed {
