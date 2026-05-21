@@ -9,7 +9,7 @@
 
 use crate::discover::{self, AssetRef, AssetSource, DocumentScan};
 use crate::framework::{self, FrameworkConfig};
-use crate::scan::{FindingSource, ScanResult};
+use crate::scan::ScanResult;
 
 use super::cache::{self, AssetData};
 use super::net;
@@ -69,7 +69,6 @@ pub(crate) enum FetchFailure {
 
 struct ScannedAsset {
     asset: Arc<AssetData>,
-    source: AssetSource,
     memory_hit: bool,
 }
 
@@ -116,10 +115,7 @@ pub async fn scan_assets(
                 if result.memory_hit {
                     stats.memory_hits += 1;
                 }
-                out.merge_findings_with_source(
-                    &result.asset.findings,
-                    finding_source_for_asset(result.source),
-                );
+                out.merge_findings(&result.asset.findings);
                 enqueue_assets(
                     result.asset.assets.iter().cloned(),
                     &mut visited,
@@ -174,7 +170,6 @@ async fn fetch_scan(
         if let Some(asset_data) = read_memory_asset(memory.as_ref(), &asset.url, cache_key) {
             return Ok(ScannedAsset {
                 asset: asset_data,
-                source: asset.source,
                 memory_hit: true,
             });
         }
@@ -184,7 +179,6 @@ async fn fetch_scan(
                 write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
                 return Ok(ScannedAsset {
                     asset: asset_data,
-                    source: asset.source,
                     memory_hit: false,
                 });
             }
@@ -215,7 +209,6 @@ async fn fetch_scan(
             write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
             Ok(ScannedAsset {
                 asset: asset_data,
-                source: asset.source,
                 memory_hit: false,
             })
         }
@@ -227,19 +220,8 @@ async fn fetch_scan(
             }
             Ok(ScannedAsset {
                 asset: asset_data,
-                source: asset.source,
                 memory_hit: false,
             })
-        }
-    }
-}
-
-fn finding_source_for_asset(source: AssetSource) -> FindingSource {
-    match source {
-        AssetSource::HtmlScript | AssetSource::HtmlPreload => FindingSource::HtmlTag,
-        AssetSource::NextManifest => FindingSource::ManifestParsed,
-        AssetSource::Literal | AssetSource::DynamicImport | AssetSource::NewUrl => {
-            FindingSource::Literal
         }
     }
 }
@@ -394,8 +376,9 @@ mod tests {
         )
         .await;
         assert_eq!(first_stats.discovered, 2);
-        assert!(first.apis.contains_key("/api/a"));
-        assert!(first.apis.contains_key("/api/b"));
+        let first_apis = first.api_map();
+        assert!(first_apis.contains_key("/api/a"));
+        assert!(first_apis.contains_key("/api/b"));
 
         let mut second = ScanResult::default();
         let second_stats = scan_assets(
@@ -414,8 +397,9 @@ mod tests {
         .await;
         assert_eq!(second_stats.discovered, 2);
         assert_eq!(second_stats.memory_hits, 2);
-        assert!(second.apis.contains_key("/api/a"));
-        assert!(second.apis.contains_key("/api/b"));
+        let second_apis = second.api_map();
+        assert!(second_apis.contains_key("/api/a"));
+        assert!(second_apis.contains_key("/api/b"));
     }
 
     #[tokio::test]
@@ -456,7 +440,7 @@ mod tests {
         .await;
 
         assert_eq!(stats.discovered, 6);
-        assert!(found.apis.contains_key("/api/f"));
+        assert!(found.api_map().contains_key("/api/f"));
     }
 
     fn script_asset(url: String) -> AssetRef {

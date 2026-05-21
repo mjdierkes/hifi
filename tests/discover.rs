@@ -46,7 +46,7 @@ fn webpack_and_next_runtime_literals_resolve_from_next_base() {
     ));
     assert!(result
         .findings
-        .candidates
+        .candidate_map()
         .contains_key("/_next/data/b1/dashboard.json"));
 }
 
@@ -158,10 +158,9 @@ fn next_flight_and_action_markers_add_browser_surface() {
         DocumentKind::Html,
     );
 
-    assert_eq!(result.findings.apis["/api/flight"].methods_csv(), "POST");
-    assert_eq!(result.findings.apis["/checkout"].methods_csv(), "POST");
+    assert_eq!(result.findings.api_map()["/checkout"].methods_csv(), "POST");
     assert_eq!(
-        result.findings.apis["/checkout"].flags_csv(),
+        result.findings.api_map()["/checkout"].flags_csv(),
         "body,next-action"
     );
 }
@@ -183,7 +182,7 @@ fn nuxt_and_angular_assets_are_generic_artifacts() {
     assert!(assets.contains(&"https://example.com/main.def.js".to_string()));
     assert!(result
         .findings
-        .candidates
+        .candidate_map()
         .contains_key("/blog/_payload.json"));
 }
 
@@ -194,8 +193,9 @@ fn next_asset_prefix_overrides_manifest_origin() {
     );
     let assets = asset_urls(&result);
 
-    assert!(assets
-        .contains(&"https://cdn.example.com/_next/static/b1/_buildManifest.js".to_string()));
+    assert!(
+        assets.contains(&"https://cdn.example.com/_next/static/b1/_buildManifest.js".to_string())
+    );
     assert!(assets
         .contains(&"https://cdn.example.com/_next/static/b1/app-build-manifest.json".to_string()));
 }
@@ -209,9 +209,9 @@ fn next_base_path_prefixes_route_reconstruction() {
         hifi::discover::DocumentKind::Html,
     );
     assert!(
-        result.findings.apis.contains_key("/dashboard"),
+        result.findings.api_map().contains_key("/dashboard"),
         "got keys: {:?}",
-        result.findings.apis.keys().collect::<Vec<_>>()
+        result.findings.api_map().keys().collect::<Vec<_>>()
     );
 }
 
@@ -224,9 +224,9 @@ fn next_locale_strip_normalizes_routes() {
         hifi::discover::DocumentKind::Html,
     );
     assert!(
-        result.findings.apis.contains_key("/about"),
+        result.findings.api_map().contains_key("/about"),
         "got keys: {:?}",
-        result.findings.apis.keys().collect::<Vec<_>>()
+        result.findings.api_map().keys().collect::<Vec<_>>()
     );
 }
 
@@ -239,23 +239,26 @@ fn build_manifest_routes_emit_as_findings() {
         hifi::discover::DocumentKind::Manifest,
     );
 
-    assert!(result.findings.routes.contains_key("/"));
-    assert!(result.findings.routes.contains_key("/dashboard"));
-    assert!(result.findings.routes.contains_key("/about"));
+    let routes = result.findings.route_map();
+    assert!(routes.contains_key("/"));
+    assert!(routes.contains_key("/dashboard"));
+    assert!(routes.contains_key("/about"));
 }
 
 #[test]
 fn app_build_manifest_routes_decode_groups() {
-    let base = url::Url::parse("https://example.com/_next/static/b1/app-build-manifest.json").unwrap();
+    let base =
+        url::Url::parse("https://example.com/_next/static/b1/app-build-manifest.json").unwrap();
     let result = scan_document(
         br#"{"pages":{"/(marketing)/about/page":["a.js"],"/dashboard/page":["b.js"],"/blog/[slug]/page":["c.js"]}}"#,
         &base,
         hifi::discover::DocumentKind::Manifest,
     );
 
-    assert!(result.findings.routes.contains_key("/about"));
-    assert!(result.findings.routes.contains_key("/dashboard"));
-    assert!(result.findings.routes.contains_key("/blog/[slug]"));
+    let routes = result.findings.route_map();
+    assert!(routes.contains_key("/about"));
+    assert!(routes.contains_key("/dashboard"));
+    assert!(routes.contains_key("/blog/[slug]"));
 }
 
 #[test]
@@ -273,10 +276,11 @@ fn comment_and_identifier_substrings_are_not_assets() {
     );
     assert!(result
         .findings
-        .candidates
+        .candidate_map()
         .contains_key("/_next/data/b1/dashboard.json"));
-    assert!(!result.findings.candidates.contains_key("/_next/data/b1/notes.json"));
-    assert!(!result.findings.candidates.contains_key("/_next/data/b1/inline"));
+    let candidates = result.findings.candidate_map();
+    assert!(!candidates.contains_key("/_next/data/b1/notes.json"));
+    assert!(!candidates.contains_key("/_next/data/b1/inline"));
 }
 
 #[test]
@@ -297,60 +301,57 @@ fn next_15_instrumentation_chunks_are_skipped() {
 }
 
 #[test]
-fn provenance_tags_distinguish_finding_sources() {
-    use hifi::scan::FindingSource;
-    let base = url::Url::parse("https://example.com/_next/static/b1/app-build-manifest.json")
-        .unwrap();
+fn evidence_records_manifest_extractor() {
+    use hifi::scan::{EvidenceKind, Extractor};
+    let base =
+        url::Url::parse("https://example.com/_next/static/b1/app-build-manifest.json").unwrap();
     let result = scan_document(
         br#"{"pages":{"/dashboard/page":["a.js"]}}"#,
         &base,
         hifi::discover::DocumentKind::Manifest,
     );
-    assert_eq!(
-        result.findings.provenance.get("/dashboard"),
-        Some(&FindingSource::ManifestParsed),
-    );
-    assert!(FindingSource::ManifestParsed.is_high_confidence());
-    assert!(!FindingSource::Literal.is_high_confidence());
+    assert!(result.findings.evidence.iter().any(|e| {
+        e.url == "/dashboard" && e.kind == EvidenceKind::Route && e.extractor == Extractor::Manifest
+    }));
 }
 
 #[test]
-fn provenance_promotes_to_highest_seen_source() {
-    use hifi::scan::FindingSource;
-    // The same route appears both as a literal-grep candidate and as a typed
-    // flight href. Provenance should reflect the higher-confidence source.
+fn evidence_keeps_distinct_extractors() {
+    use hifi::scan::{EvidenceKind, Extractor};
     let result = scan_html(
         r#"<script>const r="/dashboard";</script><script>self.__next_f.push([1,"0:{\"href\":\"/dashboard\"}"])</script>"#,
     );
-    assert_eq!(
-        result.findings.provenance.get("/dashboard"),
-        Some(&FindingSource::FlightTyped),
-    );
+    assert!(result.findings.evidence.iter().any(|e| {
+        e.url == "/dashboard" && e.kind == EvidenceKind::Route && e.extractor == Extractor::Literal
+    }));
+    assert!(result.findings.evidence.iter().any(|e| {
+        e.url == "/dashboard" && e.kind == EvidenceKind::Route && e.extractor == Extractor::Flight
+    }));
 }
 
 #[test]
-fn server_action_is_marked_high_confidence() {
-    use hifi::scan::FindingSource;
+fn server_action_records_inferred_evidence() {
+    use hifi::scan::{EvidenceKind, Extractor};
     let base = url::Url::parse("https://example.com/checkout").unwrap();
     let result = scan_document(
         br#"<form><input name="$ACTION_xyz"></form>"#,
         &base,
         hifi::discover::DocumentKind::Html,
     );
-    assert_eq!(
-        result.findings.provenance.get("/checkout"),
-        Some(&FindingSource::ServerAction),
-    );
+    assert!(result.findings.evidence.iter().any(|e| {
+        e.url == "/checkout"
+            && e.kind == EvidenceKind::Api
+            && e.extractor == Extractor::ServerAction
+    }));
 }
 
 #[test]
-fn api_call_sites_record_api_call_provenance() {
-    use hifi::scan::FindingSource;
+fn api_call_sites_record_api_call_evidence() {
+    use hifi::scan::{EvidenceKind, Extractor};
     let result = scan_html(r#"<script>fetch("/api/widgets",{method:"POST"})</script>"#);
-    assert_eq!(
-        result.findings.provenance.get("/api/widgets"),
-        Some(&FindingSource::ApiCall),
-    );
+    assert!(result.findings.evidence.iter().any(|e| {
+        e.url == "/api/widgets" && e.kind == EvidenceKind::Api && e.extractor == Extractor::ApiCall
+    }));
 }
 
 #[test]
@@ -358,15 +359,18 @@ fn flight_typed_walk_extracts_href_routes() {
     let result = scan_html(
         r#"<script>self.__next_f.push([1,"0:[\"$\",\"a\",null,{\"href\":\"/profile\",\"action\":\"/api/save\"}]\n"])</script>"#,
     );
-    assert!(result.findings.routes.contains_key("/profile"));
+    let routes = result.findings.route_map();
+    let apis = result.findings.api_map();
+    let candidates = result.findings.candidate_map();
+    assert!(routes.contains_key("/profile"));
     assert!(
-        result.findings.routes.contains_key("/api/save")
-            || result.findings.apis.contains_key("/api/save")
-            || result.findings.candidates.contains_key("/api/save"),
+        routes.contains_key("/api/save")
+            || apis.contains_key("/api/save")
+            || candidates.contains_key("/api/save"),
         "got routes={:?} apis={:?} candidates={:?}",
-        result.findings.routes.keys().collect::<Vec<_>>(),
-        result.findings.apis.keys().collect::<Vec<_>>(),
-        result.findings.candidates.keys().collect::<Vec<_>>(),
+        routes.keys().collect::<Vec<_>>(),
+        apis.keys().collect::<Vec<_>>(),
+        candidates.keys().collect::<Vec<_>>(),
     );
 }
 
@@ -382,9 +386,9 @@ fn flight_large_payload_is_not_truncated_at_64k() {
     );
     let result = scan_html(&html);
     assert!(
-        result.findings.routes.contains_key("/late-route"),
+        result.findings.route_map().contains_key("/late-route"),
         "large flight payload was truncated; routes={:?}",
-        result.findings.routes.keys().collect::<Vec<_>>(),
+        result.findings.route_map().keys().collect::<Vec<_>>(),
     );
 }
 
@@ -405,9 +409,9 @@ fn scan_document_with_config_uses_parent_locale() {
         Some(&cfg),
     );
     assert!(
-        result.findings.apis.contains_key("/about"),
+        result.findings.api_map().contains_key("/about"),
         "got: {:?}",
-        result.findings.apis.keys().collect::<Vec<_>>()
+        result.findings.api_map().keys().collect::<Vec<_>>()
     );
 }
 
@@ -420,9 +424,9 @@ fn app_router_route_groups_decoded_in_payload_route() {
         hifi::discover::DocumentKind::Payload,
     );
     assert!(
-        result.findings.apis.contains_key("/about"),
+        result.findings.api_map().contains_key("/about"),
         "got keys: {:?}",
-        result.findings.apis.keys().collect::<Vec<_>>()
+        result.findings.api_map().keys().collect::<Vec<_>>()
     );
 }
 

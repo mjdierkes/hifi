@@ -26,82 +26,60 @@ pub use shape::Shape;
 pub type ApiMap = FxHashMap<String, Shape>;
 pub type CandidateMap = FxHashMap<String, ()>;
 pub type RouteMap = FxHashMap<String, ()>;
-pub type ProvenanceMap = FxHashMap<String, FindingSource>;
 
-/// How a finding entered the result set. Used downstream to bucket findings
-/// into a high-confidence tier (parsed manifests, HTML attributes, typed RSC
-/// flight, explicit API calls) versus a best-effort tier (raw byte grep).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum FindingSource {
-    /// Default for legacy paths that grep raw bytes without structural context.
-    #[default]
+pub enum EvidenceKind {
+    Api,
+    Route,
+    Candidate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Extractor {
     Literal,
-    /// `<script src>`, `<link href>` etc. in an HTML document.
-    HtmlTag,
-    /// Pulled from a structurally parsed manifest (`_buildManifest.js`,
-    /// `app-build-manifest.json`, `middleware-manifest.json`,
-    /// `_clientReferenceManifest.json`).
-    ManifestParsed,
-    /// Walked from a typed React Flight payload line.
-    FlightTyped,
-    /// Identified at a call site like `fetch(...)`, `axios.get(...)`.
+    Manifest,
+    Flight,
     ApiCall,
-    /// Identified at a client-navigation call site like `router.push(...)`.
     RouteCall,
-    /// Inferred from a Next.js Server Action marker on an HTML or RSC payload.
     ServerAction,
 }
 
-impl FindingSource {
-    /// Provenance levels that are accurate enough to ship in a 99%-precision
-    /// output tier without manual triage.
-    pub fn is_high_confidence(self) -> bool {
-        self.confidence_tier() == ConfidenceTier::High
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    Observed,
+    Parsed,
+    Inferred,
+    Candidate,
+}
 
-    pub fn confidence_tier(self) -> ConfidenceTier {
+impl Extractor {
+    fn confidence(self) -> Confidence {
         match self {
-            Self::Literal => ConfidenceTier::Regular,
-            Self::HtmlTag
-            | Self::ManifestParsed
-            | Self::FlightTyped
-            | Self::ApiCall
-            | Self::RouteCall
-            | Self::ServerAction => ConfidenceTier::High,
-        }
-    }
-
-    /// When two emit sites disagree on a finding's provenance, keep the source
-    /// that carries the strongest evidence for downstream confidence filters.
-    fn merge_rank(self) -> u8 {
-        match self {
-            Self::Literal => 0,
-            Self::FlightTyped => 1,
-            Self::HtmlTag => 2,
-            Self::RouteCall => 3,
-            Self::ApiCall => 4,
-            Self::ServerAction => 5,
-            Self::ManifestParsed => 6,
+            Self::ApiCall | Self::RouteCall => Confidence::Observed,
+            Self::Manifest | Self::Flight => Confidence::Parsed,
+            Self::ServerAction => Confidence::Inferred,
+            Self::Literal => Confidence::Candidate,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConfidenceTier {
-    Regular,
-    High,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Evidence {
+    pub url: String,
+    pub kind: EvidenceKind,
+    pub extractor: Extractor,
+    pub confidence: Confidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<Shape>,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct ScanResult {
-    pub apis: ApiMap,
-    #[serde(default, skip_serializing_if = "RouteMap::is_empty")]
-    pub routes: RouteMap,
-    #[serde(default, skip_serializing_if = "CandidateMap::is_empty")]
-    pub candidates: CandidateMap,
-    #[serde(default, skip_serializing_if = "ProvenanceMap::is_empty")]
-    pub provenance: ProvenanceMap,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<Evidence>,
 }
 
 impl ScanResult {
@@ -110,81 +88,111 @@ impl ScanResult {
     }
 
     pub fn merge_findings(&mut self, other: &ScanResult) {
-        for (url, shape) in &other.apis {
-            self.apis.entry(url.clone()).or_default().merge(shape);
-        }
-        self.routes
-            .extend(other.routes.keys().map(|url| (url.clone(), ())));
-        self.candidates
-            .extend(other.candidates.keys().map(|url| (url.clone(), ())));
-        for (url, source) in &other.provenance {
-            self.bump_provenance(url.clone(), *source);
-        }
-    }
-
-    pub fn merge_findings_with_source(&mut self, other: &ScanResult, source: FindingSource) {
-        self.merge_findings(other);
-        for url in other
-            .apis
-            .keys()
-            .chain(other.routes.keys())
-            .chain(other.candidates.keys())
-        {
-            self.bump_provenance(url.clone(), source);
-        }
+        self.evidence.extend(other.evidence.iter().cloned());
+        self.compact();
     }
 
     pub fn finalize(&mut self) {
         self.canonicalize_routes();
-        for url in self.apis.keys() {
-            self.candidates.remove(url);
-            self.routes.remove(url);
-        }
-        for url in self.candidates.keys() {
-            self.routes.remove(url);
-        }
-        // Drop provenance for entries that were demoted out of the result.
-        let live: rustc_hash::FxHashSet<String> = self
-            .apis
-            .keys()
-            .chain(self.routes.keys())
-            .chain(self.candidates.keys())
-            .cloned()
-            .collect();
-        self.provenance.retain(|url, _| live.contains(url));
+        self.drop_demoted();
+        self.compact();
     }
 
-    // Collapse trailing-slash and query-string variants of the same client
-    // route into one entry. Scanners that walk bytes naturally pick up
-    // `/cart`, `/cart/`, `/cart?ref=`, and `/cart?ref` as separate strings,
-    // but for navigation purposes they're the same destination — emitting all
-    // four wastes signal and roughly doubles the route output on real sites.
-    // API entries keep their query strings (already handled by
-    // `normalize_api_url` at insertion) because query keys are part of the
-    // endpoint shape.
-    fn canonicalize_routes(&mut self) {
-        let original = std::mem::take(&mut self.routes);
-        for variant in original.into_keys() {
-            let canonical = canonicalize_route(&variant);
-            if canonical != variant {
-                if let Some(source) = self.provenance.remove(&variant) {
-                    let entry = self.provenance.entry(canonical.clone()).or_default();
-                    if source.merge_rank() > entry.merge_rank() {
-                        *entry = source;
-                    }
+    pub fn record_api(&mut self, url: String, shape: Shape, extractor: Extractor) {
+        self.evidence.push(Evidence {
+            url,
+            kind: EvidenceKind::Api,
+            extractor,
+            confidence: extractor.confidence(),
+            shape: Some(shape),
+        });
+        self.compact();
+    }
+
+    pub fn record_route(&mut self, url: String, extractor: Extractor) {
+        self.evidence.push(Evidence {
+            url,
+            kind: EvidenceKind::Route,
+            extractor,
+            confidence: extractor.confidence(),
+            shape: None,
+        });
+        self.compact();
+    }
+
+    pub fn record_candidate(&mut self, url: String, extractor: Extractor) {
+        self.evidence.push(Evidence {
+            url,
+            kind: EvidenceKind::Candidate,
+            extractor,
+            confidence: extractor.confidence(),
+            shape: None,
+        });
+        self.compact();
+    }
+
+    pub fn api_map(&self) -> ApiMap {
+        let mut out = ApiMap::default();
+        for evidence in &self.evidence {
+            if evidence.kind == EvidenceKind::Api {
+                if let Some(shape) = &evidence.shape {
+                    out.entry(evidence.url.clone()).or_default().merge(shape);
                 }
             }
-            self.routes.entry(canonical).or_default();
+        }
+        out
+    }
+
+    pub fn route_map(&self) -> RouteMap {
+        self.evidence
+            .iter()
+            .filter(|e| e.kind == EvidenceKind::Route)
+            .map(|e| (e.url.clone(), ()))
+            .collect()
+    }
+
+    pub fn candidate_map(&self) -> CandidateMap {
+        self.evidence
+            .iter()
+            .filter(|e| e.kind == EvidenceKind::Candidate)
+            .map(|e| (e.url.clone(), ()))
+            .collect()
+    }
+
+    fn canonicalize_routes(&mut self) {
+        for evidence in &mut self.evidence {
+            if evidence.kind == EvidenceKind::Route {
+                evidence.url = canonicalize_route(&evidence.url);
+            }
         }
     }
 
-    /// Record (or upgrade) the provenance for a finding. If we already saw
-    /// the same finding via a higher-confidence source, keep the higher one.
-    pub fn bump_provenance(&mut self, url: String, source: FindingSource) {
-        let entry = self.provenance.entry(url).or_default();
-        if source.merge_rank() > entry.merge_rank() {
-            *entry = source;
+    fn drop_demoted(&mut self) {
+        let apis = self.api_map();
+        let candidates = self.candidate_map();
+        self.evidence.retain(|e| match e.kind {
+            EvidenceKind::Api => true,
+            EvidenceKind::Candidate => !apis.contains_key(&e.url),
+            EvidenceKind::Route => !apis.contains_key(&e.url) && !candidates.contains_key(&e.url),
+        });
+    }
+
+    fn compact(&mut self) {
+        let mut compacted: Vec<Evidence> = Vec::with_capacity(self.evidence.len());
+        for evidence in self.evidence.drain(..) {
+            if let Some(existing) = compacted.iter_mut().find(|existing| {
+                existing.url == evidence.url
+                    && existing.kind == evidence.kind
+                    && existing.extractor == evidence.extractor
+            }) {
+                if let (Some(dst), Some(src)) = (&mut existing.shape, &evidence.shape) {
+                    dst.merge(src);
+                }
+            } else {
+                compacted.push(evidence);
+            }
         }
+        self.evidence = compacted;
     }
 }
 
@@ -231,14 +239,12 @@ fn record_api_call(bytes: &[u8], start: usize, after: usize, anchor: &str, out: 
     shape.ensure_default_method();
     shape.apply_query_params(&url);
     let url = classify::normalize_api_url(&url);
-    out.apis.entry(url.clone()).or_default().merge(&shape);
-    out.bump_provenance(url, FindingSource::ApiCall);
+    out.record_api(url, shape, Extractor::ApiCall);
 }
 
 fn record_route_call(bytes: &[u8], after: usize, out: &mut ScanResult) {
     if let Some(url) = extract::url_arg(bytes, after).filter(|url| classify::is_client_route(url)) {
-        out.routes.entry(url.clone()).or_default();
-        out.bump_provenance(url, FindingSource::RouteCall);
+        out.record_route(url, Extractor::RouteCall);
     }
 }
 
@@ -249,8 +255,7 @@ fn record_route_value(bytes: &[u8], start: usize, after: usize, out: &mut ScanRe
     if let Some(url) =
         extract::value_after_anchor(bytes, after).filter(|url| classify::is_client_route(url))
     {
-        out.routes.entry(url.clone()).or_default();
-        out.bump_provenance(url, FindingSource::Literal);
+        out.record_route(url, Extractor::Literal);
     }
 }
 
@@ -260,8 +265,7 @@ fn record_route_start(bytes: &[u8], after: usize, out: &mut ScanResult) {
         if let Some(url) =
             extract::token_at(bytes, slash).filter(|url| classify::is_client_route(url))
         {
-            out.routes.entry(url.clone()).or_default();
-            out.bump_provenance(url, FindingSource::Literal);
+            out.record_route(url, Extractor::Literal);
         }
     }
 }
@@ -275,7 +279,6 @@ fn push_candidate(bytes: &[u8], pos: usize, out: &mut ScanResult) -> bool {
     }
 
     let url = classify::normalize_api_url(&url);
-    out.candidates.entry(url.clone()).or_default();
-    out.bump_provenance(url, FindingSource::Literal);
+    out.record_candidate(url, Extractor::Literal);
     true
 }

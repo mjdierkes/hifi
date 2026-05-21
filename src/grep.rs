@@ -44,11 +44,11 @@ struct Hit {
 #[derive(Default)]
 struct GrepResult {
     hits: Vec<Hit>,
-    failed: usize,
-    omitted_hits: usize,
-    omitted_files: usize,
-    omitted_bytes: usize,
-    shortened_hits: usize,
+    files_failed: usize,
+    hits_not_printed: usize,
+    files_with_hits_not_printed: usize,
+    bytes_not_displayed_estimate: usize,
+    snippets_shortened: usize,
 }
 
 pub async fn run(args: &[String], client: Client, config: RuntimeConfig) -> Result<i32, AppError> {
@@ -99,20 +99,22 @@ pub async fn run(args: &[String], client: Client, config: RuntimeConfig) -> Resu
     let html = net::read_limited(response).await?;
     let assets = discover::scan_document(&html, &final_base, DocumentKind::Html).assets;
 
-    let result = grep_assets(client, assets.into_iter(), config, &pattern, options).await;
-    if result.failed > 0 {
+    let mut result = grep_bytes(final_base.as_str(), &html, pattern.as_bytes(), &options);
+    let assets = grep_assets(client, assets, config, &pattern, options.clone()).await;
+    merge_chunk(&mut result, assets, options.max_hits);
+    if result.files_failed > 0 {
         eprintln!(
-            "hifi: warning: failed to read {} assets; results may be incomplete",
-            result.failed
+            "hifi: warning: failed to read {} files; results incomplete",
+            result.files_failed
         );
     }
-    if result.omitted_hits > 0 || result.shortened_hits > 0 {
+    if result.hits_not_printed > 0 || result.snippets_shortened > 0 {
         eprintln!(
-            "hifi: ...truncated ({} more in {} files, {} omitted hits, {} shortened hits)",
-            format_bytes(result.omitted_bytes),
-            result.omitted_files,
-            result.omitted_hits,
-            result.shortened_hits
+            "hifi: ...truncated ({} not displayed, {} hits not printed in {} files, {} snippets shortened)",
+            format_bytes(result.bytes_not_displayed_estimate),
+            result.hits_not_printed,
+            result.files_with_hits_not_printed,
+            result.snippets_shortened
         );
     }
     eprintln!("{} hits", result.hits.len());
@@ -130,17 +132,18 @@ pub async fn run(args: &[String], client: Client, config: RuntimeConfig) -> Resu
 
 async fn grep_assets(
     client: Client,
-    assets: impl Iterator<Item = AssetRef>,
+    assets: Vec<AssetRef>,
     config: RuntimeConfig,
     pattern: &str,
     options: GrepOptions,
 ) -> GrepResult {
     let pat = Arc::new(pattern.to_string());
     let options = Arc::new(options);
-    let mut searched = stream::iter(assets)
-        .map(|asset| {
+    let mut searched = stream::iter(assets.into_iter().enumerate())
+        .map(|(idx, asset)| {
             grep_one(
                 client.clone(),
+                idx,
                 asset,
                 pat.clone(),
                 options.clone(),
@@ -149,21 +152,27 @@ async fn grep_assets(
         })
         .buffer_unordered(config.chunk_concurrency);
 
+    let mut chunks = Vec::new();
     let mut result = GrepResult::default();
     while let Some(chunk) = searched.next().await {
         match chunk {
-            Ok(chunk) => merge_chunk(&mut result, chunk, options.max_hits),
-            Err(()) => result.failed += 1,
+            Ok(chunk) => chunks.push(chunk),
+            Err(()) => result.files_failed += 1,
         }
+    }
+    chunks.sort_by_key(|(idx, _)| *idx);
+    for (_, chunk) in chunks {
+        merge_chunk(&mut result, chunk, options.max_hits);
     }
     result
 }
 
 fn merge_chunk(result: &mut GrepResult, mut chunk: GrepResult, max_hits: Option<usize>) {
-    result.omitted_hits += chunk.omitted_hits;
-    result.omitted_files += chunk.omitted_files;
-    result.omitted_bytes += chunk.omitted_bytes;
-    result.shortened_hits += chunk.shortened_hits;
+    result.hits_not_printed += chunk.hits_not_printed;
+    result.files_with_hits_not_printed += chunk.files_with_hits_not_printed;
+    result.bytes_not_displayed_estimate += chunk.bytes_not_displayed_estimate;
+    result.snippets_shortened += chunk.snippets_shortened;
+    result.files_failed += chunk.files_failed;
 
     let Some(max_hits) = max_hits else {
         result.hits.append(&mut chunk.hits);
@@ -176,30 +185,30 @@ fn merge_chunk(result: &mut GrepResult, mut chunk: GrepResult, max_hits: Option<
     }
 
     let omitted = chunk.hits.split_off(remaining);
-    result.omitted_hits += omitted.len();
-    result.omitted_bytes += omitted.iter().map(|hit| hit.snippet.len()).sum::<usize>();
-    if !omitted.is_empty() && chunk.omitted_files == 0 {
-        result.omitted_files += 1;
+    result.hits_not_printed += omitted.len();
+    result.bytes_not_displayed_estimate +=
+        omitted.iter().map(|hit| hit.snippet.len()).sum::<usize>();
+    if !omitted.is_empty() && chunk.files_with_hits_not_printed == 0 {
+        result.files_with_hits_not_printed += 1;
     }
     result.hits.append(&mut chunk.hits);
 }
 
 async fn grep_one(
     client: Client,
+    idx: usize,
     asset: AssetRef,
     pattern: Arc<String>,
     options: Arc<GrepOptions>,
     allow_private: bool,
-) -> Result<GrepResult, ()> {
+) -> Result<(usize, GrepResult), ()> {
     let body = net::get_bytes_limited(&client, asset.url.clone(), allow_private)
         .await
         .map_err(|_| ())?;
 
-    Ok(grep_bytes(
-        asset.url.as_str(),
-        &body,
-        pattern.as_bytes(),
-        &options,
+    Ok((
+        idx,
+        grep_bytes(asset.url.as_str(), &body, pattern.as_bytes(), &options),
     ))
 }
 
@@ -222,17 +231,23 @@ fn grep_bytes(url: &str, bytes: &[u8], pat_bytes: &[u8], options: &GrepOptions) 
         let lo = line_starts[lo_line];
         let hi = line_starts.get(hi_line).copied().unwrap_or(bytes.len());
         if result.hits.len() >= max_hits {
-            result.omitted_hits += 1;
-            result.omitted_bytes += hi.saturating_sub(lo);
+            result.hits_not_printed += 1;
+            result.bytes_not_displayed_estimate += hi.saturating_sub(lo);
             file_omitted = true;
             continue;
         }
-        let (snip_lo, snip_hi) =
-            snippet_window(bytes, lo, hi, abs, pat_bytes.len(), options.max_bytes_per_hit);
+        let (snip_lo, snip_hi) = snippet_window(
+            bytes,
+            lo,
+            hi,
+            abs,
+            pat_bytes.len(),
+            options.max_bytes_per_hit,
+        );
         let shortened = snip_lo > lo || snip_hi < hi;
         if shortened {
-            result.shortened_hits += 1;
-            result.omitted_bytes += (hi - lo) - (snip_hi - snip_lo);
+            result.snippets_shortened += 1;
+            result.bytes_not_displayed_estimate += (hi - lo) - (snip_hi - snip_lo);
         }
         let raw = String::from_utf8_lossy(&bytes[snip_lo..snip_hi])
             .trim_end_matches('\n')
@@ -253,7 +268,7 @@ fn grep_bytes(url: &str, bytes: &[u8], pat_bytes: &[u8], options: &GrepOptions) 
         });
     }
     if file_omitted {
-        result.omitted_files = 1;
+        result.files_with_hits_not_printed = 1;
     }
     result
 }
@@ -343,8 +358,8 @@ mod tests {
         );
 
         assert_eq!(result.hits.len(), 2);
-        assert_eq!(result.omitted_hits, 1);
-        assert_eq!(result.omitted_files, 1);
+        assert_eq!(result.hits_not_printed, 1);
+        assert_eq!(result.files_with_hits_not_printed, 1);
     }
 
     #[test]
@@ -368,7 +383,7 @@ mod tests {
         );
         assert!(hit.snippet.starts_with('…') && hit.snippet.ends_with('…'));
         assert_eq!(hit.column, 33);
-        assert_eq!(result.shortened_hits, 1);
+        assert_eq!(result.snippets_shortened, 1);
     }
 
     #[test]
@@ -398,7 +413,7 @@ mod tests {
         let result = grep_bytes("https://x.test/app.js", b"x\nx\nx", b"x", &options);
 
         assert_eq!(result.hits.len(), 3);
-        assert_eq!(result.omitted_hits, 0);
+        assert_eq!(result.hits_not_printed, 0);
     }
 
     #[test]
@@ -418,7 +433,7 @@ mod tests {
         merge_chunk(&mut result, chunk, Some(2));
 
         assert_eq!(result.hits.len(), 2);
-        assert_eq!(result.omitted_hits, 1);
-        assert_eq!(result.omitted_files, 1);
+        assert_eq!(result.hits_not_printed, 1);
+        assert_eq!(result.files_with_hits_not_printed, 1);
     }
 }

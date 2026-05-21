@@ -143,57 +143,6 @@ pub fn is_identifier_continue(b: u8) -> bool {
     b == b'_' || b == b'$' || b.is_ascii_alphanumeric()
 }
 
-pub fn latest_quoted_assignment(
-    bytes: &[u8],
-    ident: &[u8],
-    before: usize,
-    window: usize,
-    template_mode: TemplateMode,
-    skip_leading_template_expr: bool,
-    reject_dynamic: bool,
-) -> Option<String> {
-    let start = before.saturating_sub(window);
-    let mut search_from = start;
-    let mut latest = None;
-    while let Some(rel) = memchr::memmem::find(&bytes[search_from..before], ident) {
-        let match_pos = search_from + rel;
-        let after = match_pos + ident.len();
-        search_from = match_pos + 1;
-
-        if match_pos > 0 && is_identifier_continue(bytes[match_pos - 1]) {
-            continue;
-        }
-        if bytes.get(after).is_some_and(|b| is_identifier_continue(*b)) {
-            continue;
-        }
-
-        let mut j = skip_ws(bytes, after);
-        if bytes.get(j) != Some(&b'=') || bytes.get(j + 1) == Some(&b'=') {
-            continue;
-        }
-        j = skip_ws(bytes, j + 1);
-        let quote = match bytes.get(j) {
-            Some(&q) if matches!(q, b'"' | b'\'' | b'`') => q,
-            _ => continue,
-        };
-        let mut value_start = j + 1;
-        if skip_leading_template_expr
-            && quote == b'`'
-            && bytes.get(value_start..value_start + 2) == Some(b"${")
-        {
-            value_start = skip_template_expr(bytes, value_start + 2);
-        }
-        let Some(value) = quoted_string(bytes, value_start, quote, template_mode) else {
-            continue;
-        };
-        if reject_dynamic && (value.contains("{dynamic}") || value.contains("${")) {
-            continue;
-        }
-        latest = Some(value);
-    }
-    latest
-}
-
 pub fn skip_template_expr(bytes: &[u8], mut i: usize) -> usize {
     let mut depth = 1;
     while i < bytes.len() && depth > 0 {

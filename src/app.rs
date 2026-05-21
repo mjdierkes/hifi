@@ -301,27 +301,30 @@ fn render_warnings(out: &Output) {
 }
 
 fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
-    let mut keys: Vec<&String> = v.apis.keys().collect();
+    let apis = v.apis();
+    let mut keys: Vec<&String> = apis.keys().collect();
     keys.sort_unstable();
     for k in keys {
-        let shape = &v.apis[k];
+        let shape = &apis[k];
         writeln!(
             out,
-            "{}\t{}\t{}",
+            "{}\t{}\t{}\tobserved",
             shape.methods_csv(),
             escape_terminal(k),
             shape.flags_csv()
         )?;
     }
-    let mut keys: Vec<&String> = v.candidates.keys().collect();
+    let candidates = v.candidates();
+    let mut keys: Vec<&String> = candidates.keys().collect();
     keys.sort_unstable();
     for k in keys {
-        writeln!(out, "?\t{}\t", escape_terminal(k))?;
+        writeln!(out, "?\t{}\t\tcandidate", escape_terminal(k))?;
     }
-    let mut keys: Vec<&String> = v.routes.keys().collect();
+    let routes = v.routes();
+    let mut keys: Vec<&String> = routes.keys().collect();
     keys.sort_unstable();
     for k in keys {
-        writeln!(out, "route\t{}\t", escape_terminal(k))?;
+        writeln!(out, "route\t{}\t\tobserved", escape_terminal(k))?;
     }
     Ok(())
 }
@@ -410,24 +413,31 @@ fn browser_default_headers() -> HeaderMap {
     headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("navigate"));
     headers.insert("Sec-Fetch-User", HeaderValue::from_static("?1"));
     headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("document"));
-    headers.insert(
-        "Upgrade-Insecure-Requests",
-        HeaderValue::from_static("1"),
-    );
+    headers.insert("Upgrade-Insecure-Requests", HeaderValue::from_static("1"));
     headers
 }
 
 pub fn escape_terminal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
-        if ch.is_control() || ch == '\u{7f}' {
+        if ch.is_control() || ch == '\u{7f}' || is_visual_spoofing_char(ch) {
             use std::fmt::Write as _;
-            let _ = write!(out, "\\x{:02x}", ch as u32);
+            let _ = write!(out, "\\u{{{:x}}}", ch as u32);
         } else {
             out.push(ch);
         }
     }
     out
+}
+
+fn is_visual_spoofing_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+    )
 }
 
 fn parse_completions(rest: &[String]) -> Result<Shell, AppError> {

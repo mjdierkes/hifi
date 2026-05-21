@@ -43,13 +43,7 @@ const CONTENT_HINTS: &[(&[&[u8]], u8)] = &[
     (TEXT_HINTS, CONTENT_TEXT),
 ];
 
-// Request options are usually close to the URL literal in client bundles, but
-// minified code can make "the current call expression" expensive to identify
-// without a real parser. This window is intentionally local: broad enough to
-// catch common fetch/axios options, narrow enough to avoid unrelated calls.
-const SHAPE_WINDOW: usize = 400;
-
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct Shape {
     methods: u8,
     has_body: bool,
@@ -154,23 +148,51 @@ fn is_false(value: &bool) -> bool {
 // hints from nearby source without pretending to validate JavaScript semantics.
 pub(crate) fn scan_call(
     bytes: &[u8],
-    start: usize,
+    _start: usize,
     after: usize,
     anchor: &str,
 ) -> Option<(String, Shape)> {
     let url = extract::url_arg(bytes, after)?;
-    let lo = statement_start(bytes, start);
-    let hi = statement_end(bytes, after);
-    let mut shape = shape_from_window(&bytes[lo..hi]);
+    let mut shape = Shape::default();
     let hint = method_hint(anchor);
     shape.methods |= hint;
-    if method_allows_body(hint) {
+    if is_fetch_style(anchor) {
+        apply_fetch_options_shape(bytes, after, &mut shape);
+    } else if method_allows_body(hint) {
         apply_second_arg_body_shape(bytes, after, &mut shape);
     }
     Some((url, shape))
 }
 
-fn shape_from_window(bytes: &[u8]) -> Shape {
+fn apply_fetch_options_shape(bytes: &[u8], start: usize, shape: &mut Shape) {
+    let Some(first_end) = first_arg_end(bytes, start) else {
+        return;
+    };
+    let mut i = source::skip_ws(bytes, first_end);
+    if bytes.get(i) != Some(&b',') {
+        return;
+    }
+    i = source::skip_ws(bytes, i + 1);
+    if bytes.get(i) != Some(&b'{') {
+        return;
+    }
+    apply_options_object_shape(bytes, i, shape);
+}
+
+fn apply_options_object_shape(bytes: &[u8], start: usize, shape: &mut Shape) {
+    let Some(end) = object_end(bytes, start) else {
+        return;
+    };
+    let options = &bytes[start..=end];
+    let parsed = shape_from_object(options);
+    shape.methods |= parsed.methods;
+    shape.has_body |= parsed.has_body;
+    shape.has_headers |= parsed.has_headers;
+    shape.content_types |= parsed.content_types;
+    shape.auth |= parsed.auth;
+}
+
+fn shape_from_object(bytes: &[u8]) -> Shape {
     let lower = bytes.to_ascii_lowercase();
     let mut shape = Shape::default();
     for method in memchr::memmem::find_iter(&lower, b"method") {
@@ -315,33 +337,19 @@ fn object_keys(bytes: &[u8], start: usize) -> Option<Vec<String>> {
     Some(keys)
 }
 
-fn statement_start(bytes: &[u8], pos: usize) -> usize {
-    let start = pos.saturating_sub(SHAPE_WINDOW);
-    bytes[start..pos]
-        .iter()
-        .rposition(|b| matches!(*b, b';' | b'\n' | b'\r'))
-        .map(|rel| start + rel + 1)
-        .unwrap_or(start)
-}
-
-fn statement_end(bytes: &[u8], pos: usize) -> usize {
-    let end = (pos + SHAPE_WINDOW).min(bytes.len());
-    bytes[pos..end]
-        .iter()
-        .position(|b| matches!(*b, b';' | b'\n' | b'\r'))
-        .map(|rel| pos + rel)
-        .unwrap_or(end)
-}
-
 fn method_hint(anchor: &str) -> u8 {
     match anchor {
-        "axios.get(" | "ky.get(" | ".get(" => METHOD_GET,
-        "axios.post(" | "ky.post(" | ".post(" => METHOD_POST,
-        "axios.put(" | ".put(" => METHOD_PUT,
-        "axios.delete(" | ".delete(" => METHOD_DELETE,
-        "axios.patch(" | ".patch(" => METHOD_PATCH,
+        "axios.get(" | "ky.get(" => METHOD_GET,
+        "axios.post(" | "ky.post(" => METHOD_POST,
+        "axios.put(" | "ky.put(" => METHOD_PUT,
+        "axios.delete(" | "ky.delete(" => METHOD_DELETE,
+        "axios.patch(" | "ky.patch(" => METHOD_PATCH,
         _ => 0,
     }
+}
+
+fn is_fetch_style(anchor: &str) -> bool {
+    matches!(anchor, "fetch(" | "fetch (")
 }
 
 fn method_allows_body(method: u8) -> bool {
@@ -355,17 +363,30 @@ fn first_arg_end(bytes: &[u8], start: usize) -> Option<usize> {
     if let Some(end) = source::quoted_arg_end(bytes, start) {
         return Some(end);
     }
-    let i = source::skip_ws(bytes, start);
-    let first = *bytes.get(i)?;
-    if !(first == b'_' || first == b'$' || first.is_ascii_alphabetic()) {
-        return None;
+    None
+}
+
+fn object_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => {
+                i = source::quoted_end(bytes, i + 1, bytes[i])? + 1;
+                continue;
+            }
+            b'{' | b'[' | b'(' => depth += 1,
+            b'}' | b']' | b')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
     }
-    let end = bytes[i..]
-        .iter()
-        .position(|b| !(*b == b'_' || *b == b'$' || b.is_ascii_alphanumeric()))
-        .map(|rel| i + rel)
-        .unwrap_or(bytes.len());
-    Some(end)
+    None
 }
 
 fn push_unique_sorted(dst: &mut Vec<String>, value: &str) {

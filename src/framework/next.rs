@@ -2,7 +2,7 @@
 
 use crate::discover::{AssetKind, AssetRef, AssetSource, DocumentKind};
 use crate::scan::next::{self as parser, NextConfig};
-use crate::scan::{FindingSource, ScanResult, Shape};
+use crate::scan::{Extractor, ScanResult, Shape};
 use crate::source::{self, TemplateMode};
 use rustc_hash::FxHashSet;
 use url::Url;
@@ -21,9 +21,50 @@ const NEXT_SKIP_FRAGMENTS: &[&str] = &[
     "app-pages-internals-",
     "app-client-internals-",
 ];
-const NEXT_MANIFESTS: &[&str] = &["_buildManifest.js", "_ssgManifest.js"];
+const NEXT_ARTIFACTS: &[NextArtifact] = &[
+    NextArtifact {
+        name: "_buildManifest.js",
+        parser: ArtifactParser::BuildManifest,
+        discover: true,
+    },
+    NextArtifact {
+        name: "_ssgManifest.js",
+        parser: ArtifactParser::None,
+        discover: true,
+    },
+    NextArtifact {
+        name: "app-build-manifest.json",
+        parser: ArtifactParser::AppBuildManifest,
+        discover: true,
+    },
+    NextArtifact {
+        name: "_clientReferenceManifest.json",
+        parser: ArtifactParser::ClientReferenceManifest,
+        discover: true,
+    },
+    NextArtifact {
+        name: "client-reference-manifest.json",
+        parser: ArtifactParser::ClientReferenceManifest,
+        discover: false,
+    },
+];
 const NEXT_ACTION_MARKERS: &[&[u8]] = &[b"Next-Action", b"next-action", b"$ACTION_"];
 const NEXT_FLIGHT_MARKER: &[u8] = b"self.__next_f.push";
+
+#[derive(Clone, Copy)]
+struct NextArtifact {
+    name: &'static str,
+    parser: ArtifactParser,
+    discover: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ArtifactParser {
+    None,
+    BuildManifest,
+    AppBuildManifest,
+    ClientReferenceManifest,
+}
 
 pub fn parse_page_config(bytes: &[u8], kind: DocumentKind) -> Option<NextConfig> {
     (kind == DocumentKind::Html)
@@ -50,20 +91,12 @@ pub fn parse_manifest_routes(bytes: &[u8], base: &Url, kind: DocumentKind) -> Op
         return None;
     }
     let path = base.path();
-    let routes = if path.ends_with("_buildManifest.js") {
-        parser::parse_build_manifest_js(bytes)
-    } else if path.ends_with("app-build-manifest.json") {
-        parser::parse_app_build_manifest(bytes)
-    } else if path.ends_with("middleware-manifest.json")
-        || path.ends_with("_middlewareManifest.json")
-    {
-        parser::parse_middleware_manifest(bytes)
-    } else if path.ends_with("client-reference-manifest.json")
-        || path.ends_with("_clientReferenceManifest.json")
-    {
-        parser::parse_client_reference_manifest(bytes)
-    } else {
-        return None;
+    let artifact = artifact_for_path(path)?;
+    let routes = match artifact.parser {
+        ArtifactParser::None => Vec::new(),
+        ArtifactParser::BuildManifest => parser::parse_build_manifest_js(bytes),
+        ArtifactParser::AppBuildManifest => parser::parse_app_build_manifest(bytes),
+        ArtifactParser::ClientReferenceManifest => parser::parse_client_reference_manifest(bytes),
     };
     (!routes.is_empty()).then_some(routes)
 }
@@ -92,12 +125,8 @@ pub fn push_manifests(
     let Some(root) = root else {
         return;
     };
-    for name in NEXT_MANIFESTS
-        .iter()
-        .copied()
-        .chain(["app-build-manifest.json", "_clientReferenceManifest.json"])
-    {
-        let Ok(url) = root.join(name) else {
+    for artifact in NEXT_ARTIFACTS.iter().filter(|artifact| artifact.discover) {
+        let Ok(url) = root.join(artifact.name) else {
             continue;
         };
         push_resolved_asset(
@@ -138,7 +167,7 @@ pub fn should_skip(url: &Url) -> bool {
 }
 
 pub fn is_manifest(path: &str) -> bool {
-    path.ends_with("_buildmanifest.js") || path.ends_with("_ssgmanifest.js")
+    artifact_for_path(path).is_some()
 }
 
 pub fn is_payload(raw: &str, path: &str) -> bool {
@@ -151,8 +180,7 @@ pub fn is_payload(raw: &str, path: &str) -> bool {
 pub fn push_framework_candidate(findings: &mut ScanResult, raw: &str) {
     let path = raw.split(['?', '#']).next().unwrap_or(raw);
     if is_framework_data(raw, path) && raw.len() <= 512 {
-        findings.candidates.entry(raw.to_owned()).or_default();
-        findings.bump_provenance(raw.to_owned(), FindingSource::Literal);
+        findings.record_candidate(raw.to_owned(), Extractor::Literal);
     }
 }
 
@@ -160,39 +188,21 @@ pub fn scan_flight(bytes: &[u8], findings: &mut ScanResult) {
     for route in parser::extract_flight_routes(bytes) {
         if crate::scan::classify::is_api_candidate(&route) {
             let url = crate::scan::classify::normalize_api_url(&route);
-            findings.candidates.entry(url.clone()).or_default();
-            findings.bump_provenance(url, FindingSource::FlightTyped);
+            findings.record_candidate(url, Extractor::Flight);
             continue;
         }
         if !crate::scan::classify::is_client_route(&route) {
             continue;
         }
-        findings.routes.entry(route.clone()).or_default();
-        findings.bump_provenance(route, FindingSource::FlightTyped);
+        findings.record_route(route, Extractor::Flight);
     }
+}
 
-    for pos in memchr::memmem::find_iter(bytes, NEXT_FLIGHT_MARKER) {
-        let rest = &bytes[pos..];
-        let script_end = memchr::memmem::find(rest, b"</script>").unwrap_or(rest.len());
-        let window = &rest[..script_end];
-        let mut i = 0;
-        while i < window.len() {
-            let quote = window[i];
-            if !matches!(quote, b'"' | b'\'' | b'`') {
-                i += 1;
-                continue;
-            }
-            let Some(end) = source::quoted_end(window, i + 1, quote) else {
-                break;
-            };
-            if let Some(decoded) =
-                source::quoted_string(window, i + 1, quote, TemplateMode::ReplaceExpressions)
-            {
-                findings.merge(crate::scan::scan_endpoints(decoded.as_bytes()));
-            }
-            i = end + 1;
-        }
-    }
+fn artifact_for_path(path: &str) -> Option<&'static NextArtifact> {
+    let lower = path.to_ascii_lowercase();
+    NEXT_ARTIFACTS
+        .iter()
+        .find(|artifact| lower.ends_with(&artifact.name.to_ascii_lowercase()))
 }
 
 pub fn scan_server_action(
@@ -212,12 +222,7 @@ pub fn scan_server_action(
     let Some(route) = route_from_payload(base, config) else {
         return;
     };
-    findings
-        .apis
-        .entry(route.clone())
-        .or_default()
-        .merge(&Shape::next_server_action());
-    findings.bump_provenance(route, FindingSource::ServerAction);
+    findings.record_api(route, Shape::next_server_action(), Extractor::ServerAction);
 }
 
 pub fn is_rsc_payload(url: &Url) -> bool {

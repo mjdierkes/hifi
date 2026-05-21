@@ -8,7 +8,7 @@
 use crate::framework;
 use crate::framework::FrameworkConfig;
 use crate::scan::next::NextConfig;
-use crate::scan::{FindingSource, ScanResult};
+use crate::scan::{Extractor, ScanResult};
 use crate::source::{self, TemplateMode};
 use aho_corasick::{AhoCorasick, MatchKind};
 use rustc_hash::FxHashSet;
@@ -134,9 +134,7 @@ pub fn scan_document_with_config(
             if !crate::scan::classify::is_client_route(&route) {
                 continue;
             }
-            out.findings.routes.entry(route.clone()).or_default();
-            out.findings
-                .bump_provenance(route, FindingSource::ManifestParsed);
+            out.findings.record_route(route, Extractor::Manifest);
         }
     }
 

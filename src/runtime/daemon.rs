@@ -7,8 +7,8 @@
 use super::config::RuntimeConfig;
 use super::fetch;
 use super::processor::{
-    mark_cached_body, memory_cache, read_memory, redirect_cache, spawn_refresh, Body, CacheContext,
-    CacheStatus, MemoryCache, Processor, RedirectMemory, CACHE_FRESH_SECS, CACHE_STALE_SECS,
+    mark_cached_body, memory_cache, read_memory, Body, CacheContext, CacheStatus, MemoryCache,
+    Processor, CACHE_FRESH_SECS,
 };
 use reqwest::Client;
 use rustc_hash::FxHashMap;
@@ -26,7 +26,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{oneshot, Mutex};
 
 type Result<T = ()> = std::result::Result<T, DaemonError>;
-type Inflight = Arc<Mutex<FxHashMap<String, Vec<oneshot::Sender<Body>>>>>;
+type SharedScan = Arc<std::result::Result<Body, DaemonReply>>;
+type Inflight = Arc<Mutex<FxHashMap<String, Vec<oneshot::Sender<SharedScan>>>>>;
 const DAEMON_PROTOCOL: &str = "hifi-daemon-v1";
 const MAX_DAEMON_REQUEST_BYTES: usize = 8192;
 
@@ -42,7 +43,7 @@ pub enum DaemonError {
     Utf8(#[from] std::str::Utf8Error),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DaemonReply {
     pub exit_code: i32,
     pub stdout: String,
@@ -124,7 +125,6 @@ struct State {
     config: RuntimeConfig,
     memory: MemoryCache,
     assets: fetch::AssetMemoryCache,
-    redirects: RedirectMemory,
     inflight: Inflight,
 }
 
@@ -135,7 +135,6 @@ impl State {
             config,
             memory: memory_cache(),
             assets: fetch::asset_memory_cache(),
-            redirects: redirect_cache(),
             inflight: Arc::new(Mutex::new(FxHashMap::default())),
         }
     }
@@ -144,7 +143,6 @@ impl State {
         CacheContext {
             memory: Some(self.memory.clone()),
             assets: Some(self.assets.clone()),
-            redirects: Some(self.redirects.clone()),
             allow_private: self.config.allow_private,
         }
     }
@@ -407,19 +405,8 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
     let mut inflight_guard = None;
     if !no_cache {
         if let Some((body, age)) = read_memory(&state.memory, url) {
-            if age < CACHE_STALE_SECS {
-                let status = if age >= CACHE_FRESH_SECS {
-                    spawn_refresh(
-                        state.client.clone(),
-                        state.config.chunk_concurrency,
-                        url,
-                        state.cache(),
-                    );
-                    CacheStatus::Stale
-                } else {
-                    CacheStatus::Fresh
-                };
-                let body = mark_cached_body(&body, t0, status, age)?;
+            if age < CACHE_FRESH_SECS {
+                let body = mark_cached_body(&body, t0, CacheStatus::Fresh, age)?;
                 return reply(
                     &mut stream,
                     DaemonReply {
@@ -434,16 +421,21 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
 
         let mut guard = join_inflight(&state.inflight, url).await;
         if let Some(rx) = guard.waiter.take() {
-            if let Ok(body) = rx.await {
-                return reply(
-                    &mut stream,
-                    DaemonReply {
-                        exit_code: 0,
-                        stdout: body.to_string(),
-                        stderr: String::new(),
-                    },
-                )
-                .await;
+            if let Ok(shared) = rx.await {
+                return match &*shared {
+                    Ok(body) => {
+                        reply(
+                            &mut stream,
+                            DaemonReply {
+                                exit_code: 0,
+                                stdout: body.to_string(),
+                                stderr: String::new(),
+                            },
+                        )
+                        .await
+                    }
+                    Err(error) => reply(&mut stream, error.clone()).await,
+                };
             }
         }
         if guard.owner {
@@ -457,21 +449,22 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
     let out = match processed {
         Ok(out) => out,
         Err(e) => {
-            return reply(
-                &mut stream,
-                DaemonReply {
-                    exit_code: 2,
-                    stdout: String::new(),
-                    stderr: format!("hifi: {e}\n"),
-                },
-            )
-            .await;
+            let error = DaemonReply {
+                exit_code: 2,
+                stdout: String::new(),
+                stderr: format!("hifi: {e}\n"),
+            };
+            if !no_cache {
+                finish_inflight(&state.inflight, url, Arc::new(Err(error.clone()))).await;
+                drop(inflight_guard);
+            }
+            return reply(&mut stream, error).await;
         }
     };
     let body = out.to_json_string()?;
     if !no_cache {
         let body: Body = Arc::from(body);
-        finish_inflight(&state.inflight, url, body.clone()).await;
+        finish_inflight(&state.inflight, url, Arc::new(Ok(body.clone()))).await;
         drop(inflight_guard);
         return reply(
             &mut stream,
@@ -513,7 +506,7 @@ async fn reply_legacy(stream: &mut UnixStream, body: DaemonReply) -> Result {
 struct InflightGuard {
     inflight: Inflight,
     url: String,
-    waiter: Option<oneshot::Receiver<Body>>,
+    waiter: Option<oneshot::Receiver<SharedScan>>,
     owner: bool,
 }
 
@@ -553,9 +546,9 @@ async fn join_inflight(inflight: &Inflight, url: &str) -> InflightGuard {
     }
 }
 
-async fn finish_inflight(inflight: &Inflight, url: &str, body: Body) {
+async fn finish_inflight(inflight: &Inflight, url: &str, result: SharedScan) {
     for tx in inflight.lock().await.remove(url).unwrap_or_default() {
-        let _ = tx.send(body.clone());
+        let _ = tx.send(result.clone());
     }
 }
 

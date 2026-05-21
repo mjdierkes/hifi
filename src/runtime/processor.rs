@@ -6,7 +6,7 @@
 //! assets, then build display output.
 
 use crate::discover::{self, DocumentKind};
-use crate::scan::{ApiMap, CandidateMap, ProvenanceMap, RouteMap};
+use crate::scan::{ApiMap, CandidateMap, Evidence, RouteMap};
 
 use super::{cache, config::RuntimeConfig, fetch, net};
 use lru::LruCache;
@@ -28,7 +28,6 @@ const MEMORY_CACHE_MAX_ENTRIES: usize = 256;
 type Result<T, E = RuntimeError> = std::result::Result<T, E>;
 pub type Body = Arc<str>;
 pub type MemoryCache = Arc<RwLock<LruCache<String, (Body, Instant)>>>;
-pub type RedirectMemory = Arc<RwLock<LruCache<String, Url>>>;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -44,15 +43,8 @@ pub enum RuntimeError {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Output {
-    pub apis: ApiMap,
-    #[serde(default, skip_serializing_if = "RouteMap::is_empty")]
-    pub routes: RouteMap,
-    #[serde(default, skip_serializing_if = "CandidateMap::is_empty")]
-    pub candidates: CandidateMap,
-    /// Per-finding provenance: how each URL entered the result. Consumers can
-    /// filter to the high-confidence subset by inspecting `is_high_confidence`.
-    #[serde(default, skip_serializing_if = "ProvenanceMap::is_empty")]
-    pub provenance: ProvenanceMap,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<Evidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
     #[serde(default, skip_serializing_if = "CacheStatus::is_stored")]
@@ -66,31 +58,32 @@ pub struct Output {
 }
 
 impl Output {
-    /// Subset of `apis` derived from high-confidence provenance sources
-    /// (manifests, HTML attributes, typed flight, explicit call sites, server
-    /// actions). Useful when you want the precision-first slice without
-    /// post-processing.
-    pub fn high_confidence_apis(&self) -> ApiMap {
-        self.apis
+    pub fn apis(&self) -> ApiMap {
+        let mut out = ApiMap::default();
+        for evidence in &self.evidence {
+            if evidence.kind == crate::scan::EvidenceKind::Api {
+                if let Some(shape) = &evidence.shape {
+                    out.entry(evidence.url.clone()).or_default().merge(shape);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn routes(&self) -> RouteMap {
+        self.evidence
             .iter()
-            .filter(|(url, _)| self.is_high_confidence(url))
-            .map(|(url, shape)| (url.clone(), shape.clone()))
+            .filter(|e| e.kind == crate::scan::EvidenceKind::Route)
+            .map(|e| (e.url.clone(), ()))
             .collect()
     }
 
-    pub fn high_confidence_routes(&self) -> RouteMap {
-        self.routes
+    pub fn candidates(&self) -> CandidateMap {
+        self.evidence
             .iter()
-            .filter(|(url, _)| self.is_high_confidence(url))
-            .map(|(url, _)| (url.clone(), ()))
+            .filter(|e| e.kind == crate::scan::EvidenceKind::Candidate)
+            .map(|e| (e.url.clone(), ()))
             .collect()
-    }
-
-    fn is_high_confidence(&self, url: &str) -> bool {
-        self.provenance
-            .get(url)
-            .map(|source| source.is_high_confidence())
-            .unwrap_or(false)
     }
 }
 
@@ -137,7 +130,6 @@ impl CacheStatus {
 pub struct CacheContext {
     pub memory: Option<MemoryCache>,
     pub assets: Option<fetch::AssetMemoryCache>,
-    pub redirects: Option<RedirectMemory>,
     pub allow_private: bool,
 }
 
@@ -156,12 +148,6 @@ pub fn memory_cache() -> MemoryCache {
     )))
 }
 
-pub fn redirect_cache() -> RedirectMemory {
-    Arc::new(RwLock::new(LruCache::new(
-        NonZeroUsize::new(MEMORY_CACHE_MAX_ENTRIES).expect("nonzero cache size"),
-    )))
-}
-
 pub struct Processor<'a> {
     client: &'a Client,
     concurrency: usize,
@@ -170,7 +156,6 @@ pub struct Processor<'a> {
 
 struct RequestPlan {
     original_base: Url,
-    request_base: Url,
     cache_path: PathBuf,
 }
 
@@ -203,15 +188,6 @@ impl<'a> Processor<'a> {
     ) -> Result<Output> {
         let active_cache = self.cache_for_request(no_cache);
         let plan = RequestPlan::new(url, &active_cache)?;
-
-        if !no_cache {
-            if let Some(output) =
-                self.read_processed_cache(&plan.cache_path, url, t0, &active_cache)?
-            {
-                return Ok(output);
-            }
-        }
-
         let outcome = self
             .scan_request(&plan, !no_cache, Some(t0), &active_cache)
             .await?;
@@ -226,17 +202,6 @@ impl<'a> Processor<'a> {
         Ok(outcome.output)
     }
 
-    pub async fn refresh(&self, url: &str) -> Result<()> {
-        let plan = RequestPlan::new(url, &self.cache)?;
-        let outcome = self.scan_request(&plan, true, None, &self.cache).await?;
-        write_caches(
-            &plan.cache_path,
-            &outcome.output,
-            url,
-            self.cache.memory.clone(),
-        )
-    }
-
     fn cache_for_request(&self, no_cache: bool) -> CacheContext {
         if no_cache {
             CacheContext {
@@ -246,41 +211,6 @@ impl<'a> Processor<'a> {
         } else {
             self.cache.clone()
         }
-    }
-
-    fn read_processed_cache(
-        &self,
-        cache_path: &Path,
-        url: &str,
-        t0: Instant,
-        cache_ctx: &CacheContext,
-    ) -> Result<Option<Output>> {
-        let Some((json, age)) =
-            cache::read_any_bytes(cache_path).filter(|(_, age)| *age < CACHE_STALE_SECS)
-        else {
-            return Ok(None);
-        };
-
-        let status = if age < CACHE_FRESH_SECS {
-            CacheStatus::Fresh
-        } else {
-            // Stale processed output is returned immediately and refreshed in
-            // the background; callers get fast output without blocking on a
-            // full recursive asset scan.
-            spawn_refresh(
-                self.client.clone(),
-                self.concurrency,
-                url,
-                cache_ctx.clone(),
-            );
-            CacheStatus::Stale
-        };
-
-        Ok(Some(serde_json::from_slice::<Output>(&json)?.mark(
-            Some(t0),
-            status,
-            Some(age),
-        )))
     }
 
     // This is the canonical scan pipeline. Keep cache lookup, page loading,
@@ -297,10 +227,7 @@ impl<'a> Processor<'a> {
         let root_scan = scan_root_document(page.html, page.final_base).await?;
         let mut found = root_scan.findings;
         let mut initial_assets = root_scan.assets;
-        let revision = root_scan
-            .revision
-            .clone()
-            .or_else(|| Some(cache::fingerprint_assets(&initial_assets)));
+        let revision = root_scan.revision.clone();
 
         // Revision hits happen after the page is read. The root HTML may be
         // new enough to validate the asset graph, so we can reuse processed
@@ -336,10 +263,7 @@ impl<'a> Processor<'a> {
 
         Ok(ScanOutcome {
             output: Output {
-                apis: found.apis,
-                routes: found.routes,
-                candidates: found.candidates,
-                provenance: found.provenance,
+                evidence: found.evidence,
                 revision,
                 cache: CacheStatus::Miss,
                 cache_age_secs: None,
@@ -356,31 +280,15 @@ impl<'a> Processor<'a> {
         use_cache: bool,
         cache_ctx: &CacheContext,
     ) -> Result<LoadedPage> {
-        if use_cache {
-            if let Some((body, final_base)) = cache::read_page(&plan.request_base) {
-                return Ok(LoadedPage {
-                    html: bytes::Bytes::from(body),
-                    final_base,
-                });
-            }
-        }
-
         let response = net::get_limited(
             self.client,
-            plan.request_base.clone(),
+            plan.original_base.clone(),
             cache_ctx.allow_private,
         )
         .await?;
         let final_base = response.url().clone();
-        remember_redirect(
-            cache_ctx.redirects.as_ref(),
-            &plan.original_base,
-            &final_base,
-        );
         let html = net::read_limited(response).await?;
-        if use_cache {
-            cache::write_page(&plan.request_base, &final_base, &html);
-        }
+        let _ = use_cache;
         Ok(LoadedPage { html, final_base })
     }
 }
@@ -388,12 +296,10 @@ impl<'a> Processor<'a> {
 impl RequestPlan {
     fn new(url: &str, cache: &CacheContext) -> Result<Self, url::ParseError> {
         let original_base = Url::parse(url)?;
-        let request_base = redirected_base(cache.redirects.as_ref(), &original_base)
-            .unwrap_or_else(|| original_base.clone());
         let cache_path = cache::path_for(&original_base);
+        let _ = cache;
         Ok(Self {
             original_base,
-            request_base,
             cache_path,
         })
     }
@@ -435,15 +341,6 @@ fn warnings_from_assets(asset_stats: &fetch::AssetScanStats) -> Vec<String> {
     warnings
 }
 
-pub fn spawn_refresh(client: Client, concurrency: usize, url: &str, cache: CacheContext) {
-    let url = url.to_string();
-    tokio::spawn(async move {
-        let _ = Processor::new(&client, concurrency, cache)
-            .refresh(&url)
-            .await;
-    });
-}
-
 pub fn read_memory(memory: &MemoryCache, url: &str) -> Option<(Body, u64)> {
     memory
         .write()
@@ -469,39 +366,6 @@ pub fn mark_cached_body(
 ) -> Result<Body> {
     let output = serde_json::from_str::<Output>(body)?.mark(Some(t0), status, Some(age_secs));
     Ok(Arc::from(output.to_json_string()?))
-}
-
-fn redirected_base(redirects: Option<&RedirectMemory>, base: &Url) -> Option<Url> {
-    let target = redirects?.write().ok()?.get(&origin_key(base)?).cloned()?;
-    let mut out = target;
-    out.set_path(base.path());
-    out.set_query(base.query());
-    out.set_fragment(base.fragment());
-    Some(out)
-}
-
-fn remember_redirect(redirects: Option<&RedirectMemory>, from: &Url, to: &Url) {
-    let (Some(from_key), Some(to_key)) = (origin_key(from), origin_key(to)) else {
-        return;
-    };
-    if from_key == to_key {
-        return;
-    }
-    if let Some(redirects) = redirects {
-        if let Ok(mut entries) = redirects.write() {
-            if let Ok(to_origin) = Url::parse(&format!("{to_key}/")) {
-                entries.put(from_key, to_origin);
-            }
-        }
-    }
-}
-
-fn origin_key(url: &Url) -> Option<String> {
-    let host = url.host_str()?;
-    match url.port() {
-        Some(port) => Some(format!("{}://{}:{}", url.scheme(), host, port)),
-        None => Some(format!("{}://{}", url.scheme(), host)),
-    }
 }
 
 fn write_caches(
@@ -578,8 +442,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(out.apis.contains_key("/api/from-chunk"));
-        assert!(out.candidates.contains_key("/api/from-manifest"));
+        assert!(out.apis().contains_key("/api/from-chunk"));
+        assert!(out.candidates().contains_key("/api/from-manifest"));
     }
 
     #[tokio::test]
@@ -611,12 +475,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(out.apis.contains_key("/api/from-generic-script"));
-        assert!(out.candidates.contains_key("/api/from-html-asset"));
-        assert_eq!(
-            out.provenance.get("/api/from-html-asset"),
-            Some(&crate::scan::FindingSource::HtmlTag),
-        );
+        assert!(out.apis().contains_key("/api/from-generic-script"));
+        assert!(out.candidates().contains_key("/api/from-html-asset"));
     }
 
     #[test]
@@ -627,10 +487,7 @@ mod tests {
             std::env::temp_dir().join(format!("hifi-cache-regression-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let out = Output {
-            apis: ApiMap::default(),
-            routes: RouteMap::default(),
-            candidates: CandidateMap::default(),
-            provenance: ProvenanceMap::default(),
+            evidence: Vec::new(),
             revision: None,
             cache: CacheStatus::Miss,
             cache_age_secs: None,
@@ -678,7 +535,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(out.apis.contains_key("/api/ok"));
+        assert!(out.apis().contains_key("/api/ok"));
         assert_eq!(
             out.warnings,
             vec!["failed to read 1 assets; results may be incomplete"]
@@ -713,9 +570,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(first.apis.contains_key("/api/first"));
-        assert!(second.apis.contains_key("/api/second"));
-        assert!(!second.apis.contains_key("/api/first"));
+        assert!(first.apis().contains_key("/api/first"));
+        assert!(second.apis().contains_key("/api/second"));
+        assert!(!second.apis().contains_key("/api/first"));
     }
 
     async fn serve(

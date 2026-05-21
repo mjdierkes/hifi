@@ -7,7 +7,7 @@
 //! The cache stores three related artifacts: processed scan output, root pages
 //! plus final redirected URL, and per-asset scan data plus HTTP validators.
 
-use crate::discover::{AssetRef, DocumentScan};
+use crate::discover::DocumentScan;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -17,13 +17,6 @@ use std::{
 use url::Url;
 
 const SCANNER_CACHE_VERSION: &str = env!("HIFI_BUILD_HASH");
-
-pub fn fingerprint_assets(assets: &[AssetRef]) -> String {
-    let mut paths: Vec<&str> = assets.iter().map(|asset| asset.url.path()).collect();
-    paths.sort();
-
-    format!("{:016x}", hash_parts(paths.into_iter()))
-}
 
 fn hash_parts<'a>(parts: impl Iterator<Item = &'a str>) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -64,14 +57,28 @@ pub struct CachedAsset {
     pub validators: AssetValidators,
 }
 
+#[derive(Serialize, Deserialize)]
+struct AssetEnvelope {
+    data: AssetData,
+    #[serde(default, skip_serializing_if = "AssetValidators::is_empty")]
+    validators: AssetValidators,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RevisionEnvelope<T> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<String>,
+    value: T,
+}
+
 pub fn read_asset_cached(url: &Url, cache_key: Option<&str>) -> Option<CachedAsset> {
     let path = asset_path_for(url, cache_key);
     let (bytes, age_secs) = read_fresh(&path, super::processor::CACHE_STALE_SECS)?;
-    let data = serde_json::from_slice(&bytes).ok()?;
+    let envelope: AssetEnvelope = serde_json::from_slice(&bytes).ok()?;
     Some(CachedAsset {
-        data,
+        data: envelope.data,
         age_secs,
-        validators: read_asset_validators(&path).unwrap_or_default(),
+        validators: envelope.validators,
     })
 }
 
@@ -82,40 +89,17 @@ pub fn write_asset_with_validators(
     validators: &AssetValidators,
 ) {
     let path = asset_path_for(url, cache_key);
-    write_json(&path, asset);
-    write_asset_validators(&path, validators);
-}
-
-pub fn read_page(url: &Url) -> Option<(Vec<u8>, Url)> {
-    let path = page_path_for(url);
-    let (body, _) = read_fresh(&path, super::processor::CACHE_STALE_SECS)?;
-    let final_url = fs::read_to_string(sidecar_path(&path, ".url"))
-        .ok()
-        .and_then(|s| Url::parse(s.trim()).ok())
-        .unwrap_or_else(|| url.clone());
-    Some((body, final_url))
-}
-
-pub fn write_page(url: &Url, final_url: &Url, bytes: &[u8]) {
-    let path = page_path_for(url);
-    write_bytes(&path, bytes);
-    write_bytes(&sidecar_path(&path, ".url"), final_url.as_str().as_bytes());
+    write_json(
+        &path,
+        &AssetEnvelope {
+            data: asset.clone(),
+            validators: validators.clone(),
+        },
+    );
 }
 
 fn asset_path_for(url: &Url, cache_key: Option<&str>) -> PathBuf {
     scanner_hashed_path("assets", url, cache_key, "json")
-}
-
-fn page_path_for(url: &Url) -> PathBuf {
-    hashed_path("pages", url, "html")
-}
-
-fn hashed_path(kind: &str, url: &Url, ext: &str) -> PathBuf {
-    let hash = hash_parts(std::iter::once(url.as_str()));
-    dir()
-        .join(kind)
-        .join(host(url))
-        .join(format!("{hash:016x}.{ext}"))
 }
 
 fn scanner_hashed_path(kind: &str, url: &Url, cache_key: Option<&str>, ext: &str) -> PathBuf {
@@ -136,11 +120,10 @@ fn host(url: &Url) -> String {
 
 pub fn read_revision_bytes(path: &Path, revision: Option<&str>) -> Option<Vec<u8>> {
     let expected = revision?;
-    (read_revision(path)? == expected).then(|| fs::read(path).ok())?
-}
-
-pub fn read_any_bytes(path: &Path) -> Option<(Vec<u8>, u64)> {
-    read_fresh(path, u64::MAX)
+    let envelope: RevisionEnvelope<serde_json::Value> =
+        serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    (envelope.revision.as_deref() == Some(expected))
+        .then(|| serde_json::to_vec(&envelope.value).ok())?
 }
 
 fn read_fresh(path: &Path, max_age_secs: u64) -> Option<(Vec<u8>, u64)> {
@@ -154,10 +137,13 @@ fn read_fresh(path: &Path, max_age_secs: u64) -> Option<(Vec<u8>, u64)> {
 }
 
 pub fn write_with_revision<T: Serialize>(path: &Path, value: &T, revision: Option<&str>) {
-    write_json(path, value);
-    if let Some(revision) = revision {
-        write_bytes(&sidecar_path(path, ".revision"), revision.as_bytes());
-    }
+    write_json(
+        path,
+        &RevisionEnvelope {
+            revision: revision.map(str::to_string),
+            value,
+        },
+    );
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) {
@@ -173,38 +159,11 @@ fn write_bytes(path: &Path, bytes: &[u8]) {
     let _ = write_private_file(path, bytes);
 }
 
-fn read_revision(path: &Path) -> Option<String> {
-    let meta_path = sidecar_path(path, ".revision");
-    let bytes = fs::read(meta_path).ok()?;
-    let id = std::str::from_utf8(&bytes).ok()?.trim_end();
-    (!id.is_empty()).then(|| id.to_string())
-}
-
-fn read_asset_validators(path: &Path) -> Option<AssetValidators> {
-    let bytes = fs::read(sidecar_path(path, ".http")).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn write_asset_validators(path: &Path, validators: &AssetValidators) {
-    let path = sidecar_path(path, ".http");
-    if validators.is_empty() {
-        let _ = fs::remove_file(path);
-    } else {
-        write_json(&path, validators);
-    }
-}
-
-fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut meta = path.as_os_str().to_os_string();
-    meta.push(suffix);
-    meta.into()
-}
-
 /// Hostnames present in the on-disk cache, sorted and deduplicated across cache kinds.
 /// Used by shell completion to suggest previously scanned sites.
 pub fn cached_hosts() -> Vec<String> {
     let mut hosts = std::collections::BTreeSet::new();
-    for kind in ["processed", "pages", "assets"] {
+    for kind in ["processed", "assets"] {
         let Ok(entries) = fs::read_dir(dir().join(kind)) else {
             continue;
         };
@@ -271,7 +230,7 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discover::{AssetKind, AssetSource, DocumentKind};
+    use crate::discover::DocumentKind;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_PATH_ID: AtomicU64 = AtomicU64::new(0);
@@ -293,46 +252,13 @@ mod tests {
             .unwrap()
             .data
             .findings
-            .apis
+            .api_map()
             .contains_key("/api/v1"));
         assert!(read_asset_cached(&url, Some("build-2"))
             .unwrap()
             .data
             .findings
-            .apis
+            .api_map()
             .contains_key("/api/v2"));
-    }
-
-    #[test]
-    fn fingerprint_uses_asset_urls() {
-        let assets = vec![AssetRef {
-            url: Url::parse("https://example.com/assets/app.js").unwrap(),
-            kind: AssetKind::Script,
-            source: AssetSource::HtmlScript,
-        }];
-
-        assert_eq!(fingerprint_assets(&assets).len(), 16);
-    }
-
-    #[test]
-    fn page_cache_round_trips_body_and_final_url() {
-        let url = Url::parse(&format!(
-            "https://example.com/page-{}",
-            TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
-        ))
-        .unwrap();
-        let final_url = Url::parse("https://www.example.com/page").unwrap();
-        let path = page_path_for(&url);
-        let body = b"<script src=\"/_next/static/chunks/app.js\"></script>";
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(sidecar_path(&path, ".url"));
-
-        write_page(&url, &final_url, body);
-        let (cached_body, cached_final_url) = read_page(&url).unwrap();
-
-        assert_eq!(cached_body, body);
-        assert_eq!(cached_final_url, final_url);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(sidecar_path(&path, ".url"));
     }
 }

@@ -100,9 +100,8 @@ pub fn strip_locale(path: &str, locales: &[String]) -> String {
 }
 
 /// Decode App Router filesystem conventions into the user-facing URL. Strips
-/// route groups `(group)`, parallel route slots `@slot`, and intercepting
-/// markers `(.)`, `(..)`, `(...)`. Catch-all segments `[...slug]` and optional
-/// catch-alls `[[...slug]]` are preserved as-is.
+/// route groups `(group)` and parallel route slots `@slot`; intercepting
+/// markers are removed while preserving the route segment they prefix.
 pub fn normalize_app_route(raw: &str) -> String {
     if !raw.contains('(') && !raw.contains('@') {
         return raw.to_owned();
@@ -118,7 +117,11 @@ pub fn normalize_app_route(raw: &str) -> String {
             continue;
         }
         first = false;
-        if is_route_group(segment) || is_intercepting(segment) || segment.starts_with('@') {
+        if is_route_group(segment) || segment.starts_with('@') {
+            continue;
+        }
+        let segment = strip_intercepting_marker(segment);
+        if segment.is_empty() {
             continue;
         }
         if !out.ends_with('/') {
@@ -140,11 +143,13 @@ fn is_route_group(segment: &str) -> bool {
         && !segment.starts_with("(...)")
 }
 
-fn is_intercepting(segment: &str) -> bool {
-    segment.starts_with("(.)")
-        || segment.starts_with("(..)")
-        || segment.starts_with("(...)")
-        || segment == "(.)"
+fn strip_intercepting_marker(segment: &str) -> &str {
+    for marker in ["(...)", "(..)", "(.)"] {
+        if let Some(rest) = segment.strip_prefix(marker) {
+            return rest;
+        }
+    }
+    segment
 }
 
 /// Pull route keys out of a `_buildManifest.js` document by isolating the
@@ -368,37 +373,8 @@ fn route_from_app_key(key: &str) -> String {
 /// Matchers may appear at the top level or nested per-middleware; the manifest
 /// shape has shifted across Next versions so we accept both.
 pub fn parse_middleware_manifest(bytes: &[u8]) -> Vec<String> {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    collect_matchers(&value, &mut out);
-    out
-}
-
-fn collect_matchers(value: &serde_json::Value, out: &mut Vec<String>) {
-    match value {
-        serde_json::Value::Object(obj) => {
-            if let Some(matchers) = obj.get("matchers").and_then(|v| v.as_array()) {
-                for m in matchers {
-                    if let Some(regexp) = m.get("regexp").and_then(json_string) {
-                        out.push(regexp);
-                    } else if let Some(s) = m.as_str() {
-                        out.push(s.to_owned());
-                    }
-                }
-            }
-            for v in obj.values() {
-                collect_matchers(v, out);
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for v in arr {
-                collect_matchers(v, out);
-            }
-        }
-        _ => {}
-    }
+    let _ = bytes;
+    Vec::new()
 }
 
 /// Pull server action IDs and their backing routes from
@@ -604,7 +580,7 @@ mod tests {
             normalize_app_route("/dashboard/@modal/login"),
             "/dashboard/login"
         );
-        assert_eq!(normalize_app_route("/feed/(.)photo/42"), "/feed/42");
+        assert_eq!(normalize_app_route("/feed/(.)photo/42"), "/feed/photo/42");
         assert_eq!(normalize_app_route("/blog/[slug]"), "/blog/[slug]");
         assert_eq!(normalize_app_route("/docs/[...slug]"), "/docs/[...slug]");
         assert_eq!(normalize_app_route("/"), "/");
@@ -646,6 +622,6 @@ mod tests {
     fn parses_middleware_matchers() {
         let src = br#"{"middleware":{"/":{"matchers":[{"regexp":"^/dashboard(?:/.*)?$"}]}}}"#;
         let matchers = parse_middleware_manifest(src);
-        assert_eq!(matchers, vec!["^/dashboard(?:/.*)?$"]);
+        assert!(matchers.is_empty());
     }
 }

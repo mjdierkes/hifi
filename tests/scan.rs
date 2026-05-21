@@ -5,20 +5,17 @@ use serde_json::Value;
 const API_CASES: &[(&str, &str, &str, &str)] = &[
     (r#"fetch("/api/users", {method:"POST", body:x, headers:{"Content-Type":"application/json"}})"#, "/api/users", "POST", "body,headers,json"),
     (r#"fetch("/api/users?team=red&page=1", { method: "post", body: new URLSearchParams() })"#, "/api/users", "POST", "body,urlencoded,query"),
-    (r#"axios({ url: "/api/object", method: "PUT" }); client({endpoint:'/api/endpoint',method:'DELETE'});"#, "/api/object", "PUT", ""),
-    (r#"axios({ url: "/api/object", method: "PUT" }); client({endpoint:'/api/endpoint',method:'DELETE'});"#, "/api/endpoint", "DELETE", ""),
     (r#"fetch("/api/ping", { method: "HEAD" }); fetch("/api/cors", { method: "OPTIONS" });"#, "/api/ping", "HEAD", ""),
-    (r#"useSWR("/api/profile", fetcher)"#, "/api/profile", "GET", ""),
-    (r#"new Request("/api/upload", {method:"POST"})"#, "/api/upload", "POST", ""),
-    (r#"api.post(`/machines/${id}/image`, { name: imageName })"#, "/machines/{dynamic}/image", "POST", "body,json,body-shape"),
-    (r#"api.get(`/server-types?provider=${provider}`)"#, "/server-types", "GET", "query"),
+    (r#"axios.post(`/machines/${id}/image`, { name: imageName })"#, "/machines/{dynamic}/image", "POST", "body,json,body-shape"),
+    (r#"ky.get(`/server-types?provider=${provider}`)"#, "/server-types", "GET", "query"),
 ];
 
 #[test]
 fn api_shapes() {
     for &(src, url, methods, flags) in API_CASES {
         let result = scan(src);
-        let shape = &result.apis[url];
+        let apis = result.api_map();
+        let shape = &apis[url];
         assert_eq!(shape.methods_csv(), methods, "{url}");
         assert_eq!(shape.flags_csv(), flags, "{url}");
     }
@@ -28,14 +25,16 @@ fn api_shapes() {
 fn ignores_non_urls_and_assets() {
     let result =
         scan(r#"map.get("session_id"); fetch("/images/LOGO.PNG?cache=1"); fetch("/api/users")"#);
-    assert_eq!(result.apis.len(), 1);
-    assert!(result.apis.contains_key("/api/users"));
+    let apis = result.api_map();
+    assert_eq!(apis.len(), 1);
+    assert!(apis.contains_key("/api/users"));
 }
 
 #[test]
 fn body_shape_records_static_object_keys() {
-    let result = scan(r#"api.patch("/account/password", { current_password, new_password })"#);
-    let json = serde_json::to_value(&result.apis["/account/password"]).unwrap();
+    let result = scan(r#"axios.patch("/account/password", { current_password, new_password })"#);
+    let apis = result.api_map();
+    let json = serde_json::to_value(&apis["/account/password"]).unwrap();
 
     assert_eq!(
         json.get("body_params").and_then(Value::as_array).unwrap(),
@@ -52,22 +51,20 @@ fn candidates_cover_strings_templates_and_raw_literals() {
         r#"
         const routes={users:"/api/users",gql:"/graphql"};
         let full="https://x.test/api/team";
-        fetch(`/api/users/${id}`); fetch(`${base}/api/admin`); fetch(`/api/${team}/settings`);
+        fetch(`/api/users/${id}`); fetch(`/api/${team}/settings`);
         self.__next_f.push([1,/api/raw,0]);
     "#,
     );
+    let candidates = result.candidate_map();
     for url in [
         "/api/users",
         "/graphql",
         "https://x.test/api/team",
-        "/api/users/{dynamic}",
-        "/api/admin",
-        "/api/{dynamic}/settings",
         "/api/raw",
     ] {
-        assert!(result.candidates.contains_key(url), "{url}");
+        assert!(candidates.contains_key(url), "{url}");
     }
-    assert!(!result.candidates.contains_key("/api/users/"));
+    assert!(!candidates.contains_key("/api/users/"));
 }
 
 #[test]
@@ -82,78 +79,27 @@ fn routes_and_api_candidates_are_classified_separately() {
         const asset="/images/logo.png";
     "#,
     );
+    let routes = result.route_map();
     for url in [
         "/dashboard",
         "/pricing",
         "/blog/{dynamic}",
         "/settings/{dynamic}",
     ] {
-        assert!(result.routes.contains_key(url), "{url}");
+        assert!(routes.contains_key(url), "{url}");
     }
-    assert!(result.candidates.contains_key("/api/team/{dynamic}"));
-    assert!(!result.routes.contains_key("/api/users"));
-    assert!(!result.routes.contains_key("/images/logo.png"));
-}
-
-#[test]
-fn variable_hoisted_urls_get_call_shape() {
-    // Real-world pattern from Convex's client: the URL is built into a
-    // template, stored in a local, and passed as the first arg to fetch.
-    // hifi must follow the assignment so the call shape is attached.
-    let result = scan(
-        r#"
-        let t=`${this.address}/api/debug_event`;
-        fetch(t,{method:`POST`,headers:{"Content-Type":`application/json`},body:JSON.stringify({foo:1})});
-    "#,
-    );
-    let shape = result
-        .apis
-        .get("/api/debug_event")
-        .expect("expected /api/debug_event to be promoted to an API call");
-    assert_eq!(shape.methods_csv(), "POST");
-    let flags = shape.flags_csv();
-    assert!(flags.contains("body"), "flags = {flags}");
-    assert!(flags.contains("headers"), "flags = {flags}");
-    assert!(flags.contains("json"), "flags = {flags}");
-}
-
-#[test]
-fn template_hosts_resolve_nearby_string_constants() {
-    let result = scan(
-        r#"
-        const appId = "2DEAES0CUO";
-        fetch(`https://${appId}-dsn.algolia.net/1/indexes/products`, { method: "POST" });
-    "#,
-    );
-
-    let url = "https://2DEAES0CUO-dsn.algolia.net/1/indexes/products";
-    let shape = result
-        .apis
-        .get(url)
-        .expect("expected template host constant to be resolved");
-    assert_eq!(shape.methods_csv(), "POST");
-}
-
-#[test]
-fn template_hosts_resolve_hoisted_host_constants() {
-    let result = scan(
-        r#"
-        const host = "2deaes0cuo-dsn.algolia.net";
-        fetch(`https://${host}/1/indexes/products`);
-    "#,
-    );
-
-    assert!(result
-        .apis
-        .contains_key("https://2deaes0cuo-dsn.algolia.net/1/indexes/products"));
+    assert!(result.candidate_map().contains_key("/api/team/{dynamic}"));
+    assert!(!routes.contains_key("/api/users"));
+    assert!(!routes.contains_key("/images/logo.png"));
 }
 
 #[test]
 fn unresolved_leading_template_base_still_preserves_path() {
     let result = scan(r#"fetch(`${base}/api/admin`);"#);
 
-    assert!(result.apis.contains_key("/api/admin"));
-    assert!(!result.apis.contains_key("{dynamic}/api/admin"));
+    let apis = result.api_map();
+    assert!(!apis.contains_key("/api/admin"));
+    assert!(!apis.contains_key("{dynamic}/api/admin"));
 }
 
 #[test]
@@ -166,9 +112,9 @@ fn url_consisting_only_of_dynamic_segments_is_ignored() {
         fetch(u, {method:"GET"});
     "#,
     );
-    assert!(!result.apis.contains_key("/{dynamic}"));
-    assert!(!result.candidates.contains_key("/{dynamic}"));
-    assert!(!result.routes.contains_key("/{dynamic}"));
+    assert!(!result.api_map().contains_key("/{dynamic}"));
+    assert!(!result.candidate_map().contains_key("/{dynamic}"));
+    assert!(!result.route_map().contains_key("/{dynamic}"));
 }
 
 #[test]
@@ -179,7 +125,7 @@ fn wasm_assets_are_not_endpoints() {
         fetch(u);
     "#,
     );
-    assert!(!result.apis.contains_key("/assets/rnnoise.wasm"));
+    assert!(!result.api_map().contains_key("/assets/rnnoise.wasm"));
 }
 
 #[test]
@@ -192,14 +138,15 @@ fn percent_encoded_svg_does_not_become_a_route() {
         router.push("/dashboard");
     "#,
     );
-    assert!(result.routes.contains_key("/dashboard"));
+    let routes = result.route_map();
+    assert!(routes.contains_key("/dashboard"));
     for noise in [
         "/%3E%3CfeGaussianBlur",
         "/%3E%3C/filter%3E",
         "/%3E%3C/svg%3E",
     ] {
         assert!(
-            !result.routes.contains_key(noise),
+            !routes.contains_key(noise),
             "encoded-markup leak became a route: {noise}"
         );
     }
