@@ -1,26 +1,26 @@
 //! CLI boundary for hifi.
 //!
-//! This module keeps command parsing, daemon selection, and output rendering
-//! separate from the scanner/runtime code. That gives the rest of the crate a
-//! typed request to execute instead of leaking argv shape through the system.
+//! This module keeps command parsing and command dispatch separate from scanner
+//! and runtime internals. Formatting, HTTP client setup, and completion scripts
+//! live in focused submodules so the command flow stays easy to scan.
 
+mod client;
+mod completions;
+mod render;
+
+use self::client::runtime_client;
+use self::completions::{completion_script, parse_completions, print_host_completions, Shell};
+pub use self::render::escape_terminal;
+use self::render::{render_daemon_reply, render_processed, render_warnings};
 use crate::grep;
-use crate::runtime::cache;
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::daemon;
 use crate::runtime::net;
-use crate::runtime::processor::{CacheContext, Output, Processor, CACHE_FRESH_SECS};
-use reqwest::header::{HeaderMap, HeaderValue};
+use crate::runtime::processor::{CacheContext, Processor};
 use reqwest::Client;
-use std::io::{self, Write};
+use std::io;
 use std::time::Duration;
 use thiserror::Error;
-
-// Many CDNs (notably Cloudflare) block obvious bot UAs with 403 before we ever
-// see the page. hifi crawls publicly-served content the way a browser does, so
-// presenting as one removes a class of "site unreachable" failures.
-const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 const HELP: &str = "\
 hifi — map an HTTP API surface
@@ -114,13 +114,6 @@ enum Command {
     CompleteHosts(String),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Shell {
-    Bash,
-    Zsh,
-    Fish,
-}
-
 // Keep CLI state explicit. The scanner should not need to know whether a scan
 // came from argv, a daemon request, or a future library caller.
 #[derive(Debug)]
@@ -210,12 +203,6 @@ fn parse_scan_args(raw: &[String]) -> Result<ScanArgs, AppError> {
     })
 }
 
-fn runtime_client() -> Result<(RuntimeConfig, Client), AppError> {
-    let config = RuntimeConfig::from_env();
-    let client = make_client(config)?;
-    Ok((config, client))
-}
-
 async fn run_scan(args: ScanArgs, client: Client, config: RuntimeConfig) -> Result<i32, AppError> {
     if !args.no_daemon {
         if let Some(reply) = daemon_output(&args.url, args.no_cache, args.mode).await {
@@ -256,100 +243,6 @@ pub fn normalize_url(url: &str) -> Result<String, AppError> {
     }
 }
 
-pub fn render_json_mode(json: &str, mode: OutputMode) -> String {
-    match mode.for_stdout() {
-        OutputMode::Json => {
-            let mut out = String::with_capacity(json.len() + 1);
-            out.push_str(json);
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out
-        }
-        OutputMode::Flat | OutputMode::Auto => render_flat(json),
-    }
-}
-
-fn render_processed(out: &Output, mode: OutputMode) -> Result<(), AppError> {
-    let stdout = io::stdout();
-    let mut stdout = io::BufWriter::new(stdout.lock());
-    match mode.for_stdout() {
-        OutputMode::Json => {
-            serde_json::to_writer(&mut stdout, &out)?;
-            stdout.write_all(b"\n")?;
-        }
-        OutputMode::Flat | OutputMode::Auto => render_flat_output(out, &mut stdout)?,
-    }
-    Ok(())
-}
-
-pub fn warning_text(out: &Output) -> String {
-    out.warnings
-        .iter()
-        .map(|w| format!("hifi: warning: {w}\n"))
-        .collect()
-}
-
-pub fn warning_text_from_json(json: &str) -> String {
-    serde_json::from_str::<Output>(json)
-        .map(|out| warning_text(&out))
-        .unwrap_or_default()
-}
-
-fn render_warnings(out: &Output) {
-    eprint!("{}", warning_text(out));
-}
-
-fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
-    let mut rows: Vec<_> = v.evidence.iter().collect();
-    rows.sort_by_key(|e| (e.kind, e.url.as_str(), e.extractor));
-    for evidence in rows {
-        match evidence.kind {
-            crate::scan::EvidenceKind::Api => {
-                let Some(shape) = &evidence.shape else {
-                    continue;
-                };
-                writeln!(
-                    out,
-                    "{}\t{}\t{}\t{:?}",
-                    shape.methods_csv(),
-                    escape_terminal(&evidence.url),
-                    shape.flags_csv(),
-                    evidence.confidence
-                )?;
-            }
-            crate::scan::EvidenceKind::Candidate => {
-                writeln!(
-                    out,
-                    "?\t{}\t\t{:?}",
-                    escape_terminal(&evidence.url),
-                    evidence.confidence
-                )?;
-            }
-            crate::scan::EvidenceKind::Route => {
-                writeln!(
-                    out,
-                    "route\t{}\t\t{:?}",
-                    escape_terminal(&evidence.url),
-                    evidence.confidence
-                )?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn render_flat(json: &str) -> String {
-    let Ok(v) = serde_json::from_str::<Output>(json) else {
-        return format!("{json}\n");
-    };
-    let mut out = Vec::new();
-    if render_flat_output(&v, &mut out).is_err() {
-        return format!("{json}\n");
-    }
-    String::from_utf8(out).unwrap_or_else(|_| format!("{json}\n"))
-}
-
 async fn daemon_output(url: &str, no_cache: bool, mode: OutputMode) -> Option<daemon::DaemonReply> {
     match daemon::request(url, no_cache).await {
         daemon::DaemonRequest::Reply(mut out) => {
@@ -372,197 +265,6 @@ async fn daemon_output(url: &str, no_cache: bool, mode: OutputMode) -> Option<da
     }
     None
 }
-
-fn render_daemon_reply(reply: &mut daemon::DaemonReply, mode: OutputMode) {
-    if reply.exit_code == 0 {
-        reply
-            .stderr
-            .push_str(&warning_text_from_json(&reply.stdout));
-        reply.stdout = render_json_mode(&reply.stdout, mode);
-    }
-}
-
-fn make_client(config: RuntimeConfig) -> reqwest::Result<Client> {
-    Client::builder()
-        .pool_max_idle_per_host(config.chunk_concurrency)
-        .pool_idle_timeout(Duration::from_secs(CACHE_FRESH_SECS))
-        .tcp_keepalive(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(12))
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if net::validate_url(attempt.url(), config.allow_private).is_ok() {
-                attempt.follow()
-            } else {
-                attempt.error("blocked redirect to private or unsupported URL")
-            }
-        }))
-        .user_agent(DEFAULT_USER_AGENT)
-        .default_headers(browser_default_headers())
-        .build()
-}
-
-// Cloudflare bot-management 403s any request that looks programmatic — UA alone
-// isn't enough. Real browsers always send Accept, Accept-Language, and the
-// Sec-Fetch-* hints; sending the same set lets us through without TLS
-// fingerprinting tricks. Sec-Fetch-Dest is left as "document" for all requests
-// because the alternative (per-asset variation) buys us nothing past the root.
-fn browser_default_headers() -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        reqwest::header::ACCEPT,
-        HeaderValue::from_static(
-            "text/html,application/xhtml+xml,application/xml;q=0.9,\
-             image/avif,image/webp,*/*;q=0.8",
-        ),
-    );
-    headers.insert(
-        reqwest::header::ACCEPT_LANGUAGE,
-        HeaderValue::from_static("en-US,en;q=0.9"),
-    );
-    headers.insert("Sec-Fetch-Site", HeaderValue::from_static("none"));
-    headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("navigate"));
-    headers.insert("Sec-Fetch-User", HeaderValue::from_static("?1"));
-    headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("document"));
-    headers.insert("Upgrade-Insecure-Requests", HeaderValue::from_static("1"));
-    headers
-}
-
-pub fn escape_terminal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        if ch.is_control() || ch == '\u{7f}' || is_visual_spoofing_char(ch) {
-            use std::fmt::Write as _;
-            let _ = write!(out, "\\u{{{:x}}}", ch as u32);
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-fn is_visual_spoofing_char(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{206f}'
-            | '\u{feff}'
-    )
-}
-
-fn parse_completions(rest: &[String]) -> Result<Shell, AppError> {
-    let shell = rest
-        .first()
-        .ok_or("completions requires a shell (bash, zsh, or fish)")?;
-    if rest.len() > 1 {
-        return Err(format!("unexpected argument '{}' (try --help)", rest[1]).into());
-    }
-    match shell.as_str() {
-        "bash" => Ok(Shell::Bash),
-        "zsh" => Ok(Shell::Zsh),
-        "fish" => Ok(Shell::Fish),
-        other => Err(format!("unsupported shell '{other}' (use bash, zsh, or fish)").into()),
-    }
-}
-
-fn print_host_completions(prefix: &str) {
-    let stdout = io::stdout();
-    let mut stdout = io::BufWriter::new(stdout.lock());
-    for host in cache::cached_hosts() {
-        if host.starts_with(prefix) {
-            let _ = writeln!(stdout, "{host}");
-        }
-    }
-}
-
-fn completion_script(shell: Shell) -> &'static str {
-    match shell {
-        Shell::Bash => BASH_COMPLETION,
-        Shell::Zsh => ZSH_COMPLETION,
-        Shell::Fish => FISH_COMPLETION,
-    }
-}
-
-const BASH_COMPLETION: &str = r#"_hifi() {
-    local cur prev words cword
-    _init_completion || return
-    local subcommands="grep serve completions help"
-    local flags="--no-cache --no-daemon --flat --json -h --help"
-
-    if [[ ${cword} -eq 1 ]]; then
-        local hosts
-        hosts=$(hifi __complete "${cur}" 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${hosts} ${subcommands}" -- "${cur}") )
-        return
-    fi
-
-    case "${words[1]}" in
-        completions)
-            COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") )
-            return
-            ;;
-        grep)
-            if [[ ${cword} -eq 2 ]]; then
-                local hosts
-                hosts=$(hifi __complete "${cur}" 2>/dev/null)
-                COMPREPLY=( $(compgen -W "${hosts}" -- "${cur}") )
-                return
-            fi
-            ;;
-    esac
-
-    COMPREPLY=( $(compgen -W "${flags}" -- "${cur}") )
-}
-complete -F _hifi hifi
-"#;
-
-const ZSH_COMPLETION: &str = r#"#compdef hifi
-_hifi() {
-    local -a hosts subs
-    subs=(grep serve completions help)
-    if (( CURRENT == 2 )); then
-        hosts=("${(@f)$(hifi __complete "${words[CURRENT]}" 2>/dev/null)}")
-        _describe -t hosts 'cached host' hosts
-        _describe -t commands 'command' subs
-        _arguments '*:flag:(--no-cache --no-daemon --flat --json -h --help)'
-        return
-    fi
-    case "${words[2]}" in
-        completions)
-            _values 'shell' bash zsh fish
-            return
-            ;;
-        grep)
-            if (( CURRENT == 3 )); then
-                hosts=("${(@f)$(hifi __complete "${words[CURRENT]}" 2>/dev/null)}")
-                _describe -t hosts 'cached host' hosts
-                return
-            fi
-            ;;
-    esac
-    _arguments '*:flag:(--no-cache --no-daemon --flat --json -h --help)'
-}
-compdef _hifi hifi
-"#;
-
-const FISH_COMPLETION: &str = r#"function __hifi_hosts
-    hifi __complete (commandline -ct) 2>/dev/null
-end
-
-complete -c hifi -f
-complete -c hifi -n '__fish_use_subcommand' -a '(__hifi_hosts)' -d 'cached host'
-complete -c hifi -n '__fish_use_subcommand' -a 'grep' -d 'grep a URL'
-complete -c hifi -n '__fish_use_subcommand' -a 'serve' -d 'run the daemon'
-complete -c hifi -n '__fish_use_subcommand' -a 'completions' -d 'print shell completions'
-complete -c hifi -n '__fish_use_subcommand' -a 'help' -d 'show help'
-complete -c hifi -n '__fish_seen_subcommand_from grep' -a '(__hifi_hosts)' -d 'cached host'
-complete -c hifi -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'
-complete -c hifi -l no-cache -d 'bypass cached results'
-complete -c hifi -l no-daemon -d 'skip the background daemon'
-complete -c hifi -l flat -d 'tab-separated output'
-complete -c hifi -l json -d 'JSON output'
-complete -c hifi -s h -l help -d 'show help'
-"#;
 
 #[cfg(test)]
 mod tests {
