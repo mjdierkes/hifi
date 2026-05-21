@@ -7,6 +7,7 @@
 use crate::app::{escape_terminal, normalize_url, AppError};
 use crate::discover::{self, AssetRef, DocumentKind};
 use crate::runtime::config::RuntimeConfig;
+use crate::runtime::fetch::MAX_TOTAL_ASSETS;
 use crate::runtime::net;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
@@ -97,11 +98,20 @@ pub async fn run(args: &[String], client: Client, config: RuntimeConfig) -> Resu
     let response = net::get_limited(&client, base.clone(), config.allow_private).await?;
     let final_base = response.url().clone();
     let html = net::read_limited(response).await?;
-    let assets = discover::scan_document(&html, &final_base, DocumentKind::Html).assets;
+    let mut assets = discover::scan_document(&html, &final_base, DocumentKind::Html).assets;
+    let assets_capped = assets.len() > MAX_TOTAL_ASSETS;
+    if assets_capped {
+        assets.truncate(MAX_TOTAL_ASSETS);
+    }
 
     let mut result = grep_bytes(final_base.as_str(), &html, pattern.as_bytes(), &options);
     let assets = grep_assets(client, assets, config, &pattern, options.clone()).await;
     merge_chunk(&mut result, assets, options.max_hits);
+    if assets_capped {
+        eprintln!(
+            "hifi: warning: stopped after {MAX_TOTAL_ASSETS} discovered assets; results incomplete"
+        );
+    }
     if result.files_failed > 0 {
         eprintln!(
             "hifi: warning: failed to read {} files; results incomplete",
@@ -254,11 +264,11 @@ fn grep_bytes(url: &str, bytes: &[u8], pat_bytes: &[u8], options: &GrepOptions) 
             .replace('\n', " ");
         let mut snippet = String::new();
         if snip_lo > lo {
-            snippet.push_str("…");
+            snippet.push('…');
         }
         snippet.push_str(&raw);
         if snip_hi < hi {
-            snippet.push_str("…");
+            snippet.push('…');
         }
         result.hits.push(Hit {
             url: url.to_string(),

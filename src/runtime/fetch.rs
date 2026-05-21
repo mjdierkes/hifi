@@ -27,7 +27,7 @@ use std::{
 use url::Url;
 
 const ASSET_MEMORY_CACHE_MAX_ENTRIES: usize = 1024;
-const MAX_TOTAL_ASSETS: usize = 2048;
+pub const MAX_TOTAL_ASSETS: usize = 2048;
 static FIRST_ASSET_RESPONSE_TRACED: AtomicBool = AtomicBool::new(false);
 
 pub type AssetMemoryCache = Arc<RwLock<LruCache<String, (Arc<AssetData>, Instant)>>>;
@@ -73,7 +73,7 @@ struct ScannedAsset {
 }
 
 enum FetchedBody {
-    Body(DocumentScan, cache::AssetValidators),
+    Body(Box<DocumentScan>, cache::AssetValidators),
     NotModified,
 }
 
@@ -213,7 +213,7 @@ async fn fetch_scan(
             })
         }
         FetchedBody::Body(scan, validators) => {
-            let asset_data = Arc::new(scan);
+            let asset_data = Arc::new(*scan);
             if use_cache {
                 cache::write_asset_with_validators(&asset.url, &asset_data, cache_key, &validators);
                 write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
@@ -269,23 +269,44 @@ async fn fetch_asset_body(
     validators: Option<&cache::AssetValidators>,
     framework_config: FrameworkConfig,
 ) -> Result<FetchedBody, FetchFailure> {
-    net::validate_url(&asset.url, allow_private).map_err(|_| FetchFailure::Other)?;
-    let mut request = client.get(asset.url.clone());
-    for (name, value) in framework::request_headers(&asset.url) {
-        request = request.header(name, value);
-    }
-    if let Some(validators) = validators {
-        if let Some(etag) = &validators.etag {
-            request = request.header(IF_NONE_MATCH, etag);
+    let mut current_url = asset.url.clone();
+    let mut redirects = 0;
+    let response = loop {
+        net::validate_request_url(&current_url, allow_private)
+            .await
+            .map_err(|_| FetchFailure::Other)?;
+        let mut request = client.get(current_url.clone());
+        for (name, value) in framework::request_headers(&current_url) {
+            request = request.header(name, value);
         }
-        if let Some(last_modified) = &validators.last_modified {
-            request = request.header(IF_MODIFIED_SINCE, last_modified);
+        if let Some(validators) = validators {
+            if let Some(etag) = &validators.etag {
+                request = request.header(IF_NONE_MATCH, etag);
+            }
+            if let Some(last_modified) = &validators.last_modified {
+                request = request.header(IF_MODIFIED_SINCE, last_modified);
+            }
         }
-    }
 
-    let response = request.send().await.map_err(|_| FetchFailure::Other)?;
+        let response = request.send().await.map_err(|_| FetchFailure::Other)?;
+        if response.status().is_redirection() {
+            if redirects >= net::MAX_REDIRECTS {
+                return Err(FetchFailure::Other);
+            }
+            let Some(next) = net::redirect_target(&response) else {
+                break response;
+            };
+            if current_url == next {
+                return Err(FetchFailure::Other);
+            }
+            redirects += 1;
+            current_url = next;
+            continue;
+        }
+        break response;
+    };
     if !FIRST_ASSET_RESPONSE_TRACED.swap(true, Ordering::Relaxed) {
-        net::trace_response_version("asset", &asset.url, &response);
+        net::trace_response_version("asset", &current_url, &response);
     }
     let status = response.status();
     if status == StatusCode::NOT_MODIFIED {
@@ -299,7 +320,7 @@ async fn fetch_asset_body(
             // Treat that as an empty document so a missing manifest does not
             // make the whole scan look incomplete.
             return Ok(FetchedBody::Body(
-                DocumentScan::default(),
+                Box::default(),
                 cache::AssetValidators::default(),
             ));
         }
@@ -313,14 +334,14 @@ async fn fetch_asset_body(
     let body = net::read_limited(response)
         .await
         .map_err(|_| FetchFailure::Other)?;
-    let scan_url = asset.url.clone();
+    let scan_url = current_url;
     let kind = asset.document_kind();
     let scan = tokio::task::spawn_blocking(move || {
         discover::scan_document_with_config(&body, &scan_url, kind, framework_config.as_next())
     })
     .await
     .map_err(|_| FetchFailure::Other)?;
-    Ok(FetchedBody::Body(scan, validators))
+    Ok(FetchedBody::Body(Box::new(scan), validators))
 }
 
 fn asset_validators(headers: &HeaderMap) -> cache::AssetValidators {

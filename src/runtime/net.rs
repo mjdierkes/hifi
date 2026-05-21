@@ -6,12 +6,13 @@
 
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
-use reqwest::{Client, Response};
-use std::net::IpAddr;
+use reqwest::{header::LOCATION, Client, Response};
+use std::{io, net::IpAddr};
 use thiserror::Error;
 use url::{Host, Url};
 
 pub const MAX_RESPONSE_BYTES: u64 = 50 * 1024 * 1024;
+pub const MAX_REDIRECTS: usize = 10;
 
 #[derive(Debug, Error)]
 pub enum NetError {
@@ -23,6 +24,10 @@ pub enum NetError {
     PrivateAddress(String),
     #[error("response too large: {actual} bytes exceeds {limit} bytes")]
     ResponseTooLarge { actual: u64, limit: u64 },
+    #[error("failed to resolve '{0}': {1}")]
+    Resolve(String, io::Error),
+    #[error("too many redirects for '{0}'")]
+    TooManyRedirects(String),
     #[error(transparent)]
     Http(#[from] reqwest::Error),
 }
@@ -53,13 +58,45 @@ pub fn validate_url(url: &Url, allow_private: bool) -> Result<(), NetError> {
     }
 }
 
+pub async fn validate_request_url(url: &Url, allow_private: bool) -> Result<(), NetError> {
+    validate_url(url, allow_private)?;
+    if allow_private {
+        return Ok(());
+    }
+
+    let Some(Host::Domain(host)) = url.host() else {
+        return Ok(());
+    };
+    let port = url.port_or_known_default().unwrap_or(80);
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| NetError::Resolve(url.to_string(), e))?;
+    for addr in addrs {
+        if is_private_ip(addr.ip()) {
+            return Err(NetError::PrivateAddress(url.to_string()));
+        }
+    }
+    Ok(())
+}
+
 pub async fn get_limited(
     client: &Client,
     url: Url,
     allow_private: bool,
 ) -> Result<Response, NetError> {
-    validate_url(&url, allow_private)?;
-    Ok(client.get(url).send().await?.error_for_status()?)
+    let mut current = url;
+    for _ in 0..MAX_REDIRECTS {
+        validate_request_url(&current, allow_private).await?;
+        let response = client.get(current.clone()).send().await?;
+        if response.status().is_redirection() {
+            if let Some(next) = redirect_target(&response) {
+                current = next;
+                continue;
+            }
+        }
+        return Ok(response.error_for_status()?);
+    }
+    Err(NetError::TooManyRedirects(current.to_string()))
 }
 
 pub async fn read_limited(response: Response) -> Result<Bytes, NetError> {
@@ -96,6 +133,11 @@ pub async fn get_bytes_limited(
     allow_private: bool,
 ) -> Result<Bytes, NetError> {
     read_limited(get_limited(client, url, allow_private).await?).await
+}
+
+pub fn redirect_target(response: &Response) -> Option<Url> {
+    let location = response.headers().get(LOCATION)?.to_str().ok()?;
+    response.url().join(location).ok()
 }
 
 pub fn trace_response_version(label: &str, url: &Url, response: &Response) {
