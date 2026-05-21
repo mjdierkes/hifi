@@ -182,8 +182,9 @@ pub fn cached_hosts() -> Vec<String> {
 }
 
 fn dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".cache/hifi")
+    directories::ProjectDirs::from("", "", "hifi")
+        .map(|dirs| dirs.cache_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(".").join(".cache").join("hifi"))
 }
 
 #[cfg(unix)]

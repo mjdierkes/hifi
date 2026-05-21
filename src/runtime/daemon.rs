@@ -5,31 +5,43 @@
 //! tiny because it is only used by this binary over a private Unix socket.
 
 use super::config::RuntimeConfig;
+#[cfg(unix)]
 use super::fetch;
+#[cfg(unix)]
 use super::processor::{
     mark_cached_body, memory_cache, read_memory, Body, CacheContext, CacheStatus, MemoryCache,
     Processor, CACHE_FRESH_SECS,
 };
 use reqwest::Client;
+#[cfg(unix)]
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use std::io;
+#[cfg(unix)]
 use std::{
-    io,
     path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
     time::Instant,
 };
 use thiserror::Error;
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(unix)]
 use tokio::sync::{oneshot, Mutex};
 
 type Result<T = ()> = std::result::Result<T, DaemonError>;
+#[cfg(unix)]
 type SharedScan = Arc<std::result::Result<Body, DaemonReply>>;
+#[cfg(unix)]
 type Inflight = Arc<Mutex<FxHashMap<String, Vec<oneshot::Sender<SharedScan>>>>>;
+#[cfg(unix)]
 const DAEMON_PROTOCOL: &str = "hifi-daemon-v1";
+#[cfg(unix)]
 const MAX_DAEMON_REQUEST_BYTES: usize = 8192;
+const MAX_DAEMON_REPLY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -41,6 +53,9 @@ pub enum DaemonError {
     Runtime(#[from] super::processor::RuntimeError),
     #[error(transparent)]
     Utf8(#[from] std::str::Utf8Error),
+    #[cfg(not(unix))]
+    #[error("daemon is unsupported on this platform; run scans without the daemon")]
+    UnsupportedPlatform,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -58,12 +73,14 @@ pub enum DaemonRequest {
     Unavailable,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct DaemonIdentity {
     version: String,
     build: String,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 struct WireRequest {
     protocol: String,
@@ -72,6 +89,7 @@ struct WireRequest {
     url: String,
 }
 
+#[cfg(unix)]
 impl WireRequest {
     fn scan(url: &str, no_cache: bool) -> Self {
         Self {
@@ -83,6 +101,7 @@ impl WireRequest {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 struct WireReply {
     protocol: String,
@@ -92,6 +111,7 @@ struct WireReply {
     reply: Option<DaemonReply>,
 }
 
+#[cfg(unix)]
 impl WireReply {
     fn ok(reply: DaemonReply) -> Self {
         Self {
@@ -112,6 +132,7 @@ impl WireReply {
     }
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WireStatus {
@@ -119,6 +140,7 @@ enum WireStatus {
     VersionMismatch,
 }
 
+#[cfg(unix)]
 #[derive(Clone)]
 struct State {
     client: Client,
@@ -128,6 +150,7 @@ struct State {
     inflight: Inflight,
 }
 
+#[cfg(unix)]
 impl State {
     fn new(client: Client, config: RuntimeConfig) -> Self {
         Self {
@@ -164,6 +187,11 @@ pub fn start() -> bool {
         .is_some()
 }
 
+#[cfg(not(unix))]
+pub fn start() -> bool {
+    false
+}
+
 #[cfg(unix)]
 fn detach_daemon(command: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -182,6 +210,7 @@ fn detach_daemon(command: &mut Command) {
 #[cfg(not(unix))]
 fn detach_daemon(_command: &mut Command) {}
 
+#[cfg(unix)]
 pub async fn request(url: &str, no_cache: bool) -> DaemonRequest {
     let mut stream = match UnixStream::connect(socket_path()).await {
         Ok(stream) => stream,
@@ -197,7 +226,15 @@ pub async fn request(url: &str, no_cache: bool) -> DaemonRequest {
     }
 
     let mut buf = Vec::with_capacity(4096);
-    if stream.read_to_end(&mut buf).await.is_err() {
+    if (&mut stream)
+        .take(MAX_DAEMON_REPLY_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .await
+        .is_err()
+    {
+        return DaemonRequest::Unavailable;
+    }
+    if buf.len() > MAX_DAEMON_REPLY_BYTES {
         return DaemonRequest::Unavailable;
     }
     let reply = match serde_json::from_slice::<WireReply>(&buf) {
@@ -220,6 +257,12 @@ pub async fn request(url: &str, no_cache: bool) -> DaemonRequest {
     }
 }
 
+#[cfg(not(unix))]
+pub async fn request(_url: &str, _no_cache: bool) -> DaemonRequest {
+    DaemonRequest::Unavailable
+}
+
+#[cfg(unix)]
 pub async fn serve(client: Client, config: RuntimeConfig) -> Result {
     let path = socket_path();
     prepare_socket_dir(&path)?;
@@ -240,6 +283,12 @@ pub async fn serve(client: Client, config: RuntimeConfig) -> Result {
     }
 }
 
+#[cfg(not(unix))]
+pub async fn serve(_client: Client, _config: RuntimeConfig) -> Result {
+    Err(DaemonError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
 fn socket_path() -> PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -247,6 +296,7 @@ fn socket_path() -> PathBuf {
     dir.join("hifi.sock")
 }
 
+#[cfg(unix)]
 fn current_identity() -> DaemonIdentity {
     DaemonIdentity {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -254,10 +304,12 @@ fn current_identity() -> DaemonIdentity {
     }
 }
 
+#[cfg(unix)]
 fn client_matches_daemon(client: &DaemonIdentity) -> bool {
     *client == current_identity()
 }
 
+#[cfg(unix)]
 fn retire_daemon(peer_pid: Option<u32>) {
     if let Some(pid) = peer_pid.filter(|pid| *pid != std::process::id()) {
         terminate_process(pid);
@@ -309,11 +361,7 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
     (ok && pid > 0).then_some(pid as u32)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-fn peer_pid(_stream: &UnixStream) -> Option<u32> {
-    None
-}
-
+#[cfg(unix)]
 fn private_runtime_dir() -> PathBuf {
     let uid = user_id();
     std::env::temp_dir().join(format!("hifi-{uid}"))
@@ -322,13 +370,6 @@ fn private_runtime_dir() -> PathBuf {
 #[cfg(unix)]
 fn user_id() -> String {
     unsafe { libc::getuid() }.to_string()
-}
-
-#[cfg(not(unix))]
-fn user_id() -> String {
-    std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| std::process::id().to_string())
 }
 
 #[cfg(unix)]
@@ -342,14 +383,7 @@ fn prepare_socket_dir(path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn prepare_socket_dir(path: &std::path::Path) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    Ok(())
-}
-
+#[cfg(unix)]
 async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
     let t0 = Instant::now();
     let mut req = Vec::with_capacity(512);
@@ -487,22 +521,26 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
     .await
 }
 
+#[cfg(unix)]
 async fn reply(stream: &mut UnixStream, body: DaemonReply) -> Result {
     reply_wire(stream, WireReply::ok(body)).await
 }
 
+#[cfg(unix)]
 async fn reply_wire(stream: &mut UnixStream, body: WireReply) -> Result {
     let body = serde_json::to_string(&body)?;
     stream.write_all(body.as_bytes()).await?;
     Ok(())
 }
 
+#[cfg(unix)]
 async fn reply_legacy(stream: &mut UnixStream, body: DaemonReply) -> Result {
     let body = serde_json::to_string(&body)?;
     stream.write_all(body.as_bytes()).await?;
     Ok(())
 }
 
+#[cfg(unix)]
 struct InflightGuard {
     inflight: Inflight,
     url: String,
@@ -512,6 +550,7 @@ struct InflightGuard {
 
 // Only one task computes a cold URL. Other callers wait on the owner and all
 // receive the same serialized body when the scan finishes.
+#[cfg(unix)]
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         if self.owner {
@@ -524,6 +563,7 @@ impl Drop for InflightGuard {
     }
 }
 
+#[cfg(unix)]
 async fn join_inflight(inflight: &Inflight, url: &str) -> InflightGuard {
     let mut in_flight = inflight.lock().await;
     if let Some(waiters) = in_flight.get_mut(url) {
@@ -546,6 +586,7 @@ async fn join_inflight(inflight: &Inflight, url: &str) -> InflightGuard {
     }
 }
 
+#[cfg(unix)]
 async fn finish_inflight(inflight: &Inflight, url: &str, result: SharedScan) {
     for tx in inflight.lock().await.remove(url).unwrap_or_default() {
         let _ = tx.send(result.clone());
@@ -563,15 +604,7 @@ fn set_socket_private(path: &std::path::Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
-#[cfg(not(unix))]
-fn set_socket_private(path: &std::path::Path) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let _ = path;
-    Ok(())
-}
-
+#[cfg(unix)]
 #[cfg(test)]
 mod tests {
     use super::*;
