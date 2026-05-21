@@ -10,17 +10,24 @@ use crate::runtime::config::RuntimeConfig;
 use crate::runtime::daemon;
 use crate::runtime::net;
 use crate::runtime::processor::{CacheContext, Output, Processor, CACHE_FRESH_SECS};
+use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::Client;
 use std::io::{self, Write};
 use std::time::Duration;
 use thiserror::Error;
+
+// Many CDNs (notably Cloudflare) block obvious bot UAs with 403 before we ever
+// see the page. hifi crawls publicly-served content the way a browser does, so
+// presenting as one removes a class of "site unreachable" failures.
+const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 const HELP: &str = "\
 hifi — map an HTTP API surface
 
 USAGE:
     hifi <url> [--no-cache] [--no-daemon] [--flat|--json]
-    hifi grep <url> <pattern> [-C N]
+    hifi grep <url> <pattern> [-C N] [--max-hits N] [--max-bytes-per-hit N] [-a|--all]
     hifi serve
     hifi completions <bash|zsh|fish>
 
@@ -35,6 +42,12 @@ FLAGS:
         --no-daemon   skip the background daemon
         --flat        print tab-separated output
         --json        print machine-readable JSON
+
+GREP FLAGS:
+    -C, --context N              include N lines around each hit
+        --max-hits N             cap printed hits (default: 50)
+        --max-bytes-per-hit N    cap each printed snippet (default: 200)
+    -a, --all                    print all hits
 
 SHELL COMPLETION:
     Tab-complete cached hosts. Install with:
@@ -370,8 +383,38 @@ fn make_client(config: RuntimeConfig) -> reqwest::Result<Client> {
                 attempt.error("blocked redirect to private or unsupported URL")
             }
         }))
-        .user_agent("hifi/0.1")
+        .user_agent(DEFAULT_USER_AGENT)
+        .default_headers(browser_default_headers())
         .build()
+}
+
+// Cloudflare bot-management 403s any request that looks programmatic — UA alone
+// isn't enough. Real browsers always send Accept, Accept-Language, and the
+// Sec-Fetch-* hints; sending the same set lets us through without TLS
+// fingerprinting tricks. Sec-Fetch-Dest is left as "document" for all requests
+// because the alternative (per-asset variation) buys us nothing past the root.
+fn browser_default_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT,
+        HeaderValue::from_static(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,\
+             image/avif,image/webp,*/*;q=0.8",
+        ),
+    );
+    headers.insert(
+        reqwest::header::ACCEPT_LANGUAGE,
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
+    headers.insert("Sec-Fetch-Site", HeaderValue::from_static("none"));
+    headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("navigate"));
+    headers.insert("Sec-Fetch-User", HeaderValue::from_static("?1"));
+    headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("document"));
+    headers.insert(
+        "Upgrade-Insecure-Requests",
+        HeaderValue::from_static("1"),
+    );
+    headers
 }
 
 pub fn escape_terminal(s: &str) -> String {

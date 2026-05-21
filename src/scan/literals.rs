@@ -31,6 +31,13 @@ pub const CALL_LITERALS: &[&str] = &[
     "useSWRMutation(",
     "useSWRInfinite(",
     "new Request(",
+    // SDK fetch wrappers that consistently take `(url, options)` like fetch
+    // itself. These show up frequently in shipped bundles (Auth0, custom
+    // API clients) and otherwise hide the URL from shape extraction.
+    "fetchWithAuth(",
+    "apiFetch(",
+    "authFetch(",
+    "httpFetch(",
 ];
 
 pub const ROUTE_CALL_LITERALS: &[&str] = &[
@@ -48,10 +55,10 @@ pub const ROUTE_START_LITERALS: &[&str] = &["\"/", "'/", "`/", "\\\"/", "\\'/"];
 #[rustfmt::skip]
 pub const ROUTE_BAD_EXTS: &[&str] = &[
     ".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf",
-    ".ico", ".webp", ".mp4", ".webm", ".map", ".json", ".txt", ".xml", ".wasm",
+    ".ico", ".webp", ".avif", ".mp4", ".webm", ".map", ".json", ".txt", ".xml", ".wasm",
 ];
 #[rustfmt::skip]
 pub const BAD_EXTS: &[&str] = &[
     ".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf",
-    ".ico", ".webp", ".mp4", ".webm", ".map", ".wasm",
+    ".ico", ".webp", ".avif", ".mp4", ".webm", ".map", ".wasm",
 ];

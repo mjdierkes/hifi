@@ -14,7 +14,7 @@ use patterns::{PatternKind, DOCUMENT_AC, DOCUMENT_PATTERNS};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-mod classify;
+pub mod classify;
 mod extract;
 mod literals;
 pub mod next;
@@ -109,6 +109,7 @@ impl ScanResult {
     }
 
     pub fn finalize(&mut self) {
+        self.canonicalize_routes();
         for url in self.apis.keys() {
             self.candidates.remove(url);
             self.routes.remove(url);
@@ -127,6 +128,30 @@ impl ScanResult {
         self.provenance.retain(|url, _| live.contains(url));
     }
 
+    // Collapse trailing-slash and query-string variants of the same client
+    // route into one entry. Scanners that walk bytes naturally pick up
+    // `/cart`, `/cart/`, `/cart?ref=`, and `/cart?ref` as separate strings,
+    // but for navigation purposes they're the same destination — emitting all
+    // four wastes signal and roughly doubles the route output on real sites.
+    // API entries keep their query strings (already handled by
+    // `normalize_api_url` at insertion) because query keys are part of the
+    // endpoint shape.
+    fn canonicalize_routes(&mut self) {
+        let original = std::mem::take(&mut self.routes);
+        for variant in original.into_keys() {
+            let canonical = canonicalize_route(&variant);
+            if canonical != variant {
+                if let Some(source) = self.provenance.remove(&variant) {
+                    let entry = self.provenance.entry(canonical.clone()).or_default();
+                    if source.rank() > entry.rank() {
+                        *entry = source;
+                    }
+                }
+            }
+            self.routes.entry(canonical).or_default();
+        }
+    }
+
     /// Record (or upgrade) the provenance for a finding. If we already saw
     /// the same finding via a higher-confidence source, keep the higher one.
     pub fn bump_provenance(&mut self, url: String, source: FindingSource) {
@@ -134,6 +159,18 @@ impl ScanResult {
         if source.rank() > entry.rank() {
             *entry = source;
         }
+    }
+}
+
+fn canonicalize_route(s: &str) -> String {
+    // Strip fragment and query; for navigation routes the path is canonical.
+    let path = s.split(['?', '#']).next().unwrap_or(s);
+    // Strip trailing slash but preserve root.
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_owned()
+    } else {
+        trimmed.to_owned()
     }
 }
 

@@ -361,10 +361,12 @@ fn flight_typed_walk_extracts_href_routes() {
     assert!(result.findings.routes.contains_key("/profile"));
     assert!(
         result.findings.routes.contains_key("/api/save")
-            || result.findings.apis.contains_key("/api/save"),
-        "got routes={:?} apis={:?}",
+            || result.findings.apis.contains_key("/api/save")
+            || result.findings.candidates.contains_key("/api/save"),
+        "got routes={:?} apis={:?} candidates={:?}",
         result.findings.routes.keys().collect::<Vec<_>>(),
         result.findings.apis.keys().collect::<Vec<_>>(),
+        result.findings.candidates.keys().collect::<Vec<_>>(),
     );
 }
 

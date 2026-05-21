@@ -3,7 +3,7 @@ use super::literals::{BAD_EXTS, ROUTE_BAD_EXTS};
 // API candidates are values that look useful but were not observed as a call
 // target. They stay separate from confirmed APIs so output can preserve
 // evidence quality instead of merging every URL-shaped string together.
-pub(crate) fn is_api_candidate(s: &str) -> bool {
+pub fn is_api_candidate(s: &str) -> bool {
     is_url_like(s)
         && (s.starts_with("/api")
             || s.starts_with("/graphql")
@@ -16,13 +16,56 @@ pub(crate) fn is_api_candidate(s: &str) -> bool {
 
 // Client routes are navigation targets, not HTTP endpoints. Keeping them in a
 // separate bucket gives context without polluting the API surface.
-pub(crate) fn is_client_route(s: &str) -> bool {
+pub fn is_client_route(s: &str) -> bool {
+    // Root is a real route (home page) but is otherwise filtered out by the
+    // length/segment checks below. Whitelist it explicitly.
+    if s == "/" {
+        return true;
+    }
     is_route_like(s)
         && !s.starts_with("/api")
         && !s.starts_with("/graphql")
         && !s.starts_with("/trpc")
         && !s.starts_with("/_next")
         && !s.starts_with("/_nuxt")
+        && !looks_like_internal_path(s)
+        && has_substantive_segments(s)
+}
+
+// Sourcemap-style paths and bundler internals leak into chunks as quoted
+// strings. They're never real client routes.
+fn looks_like_internal_path(s: &str) -> bool {
+    let path = s.split('?').next().unwrap_or(s);
+    path.starts_with("/ROOT/")
+        || path.contains("/node_modules/")
+        || path.contains("/.next/")
+        || path.contains("/.bun/")
+}
+
+// Minified JS is full of two- and three-character quoted strings (`"/g"`,
+// `"/i"`, `"/mo"`, `"/yr"`) — regex flags, date format chunks, locale codes.
+// Real client routes have at least one segment of meaningful length OR multiple
+// segments where at least one is substantive.
+fn has_substantive_segments(s: &str) -> bool {
+    let path = s.split(['?', '#']).next().unwrap_or(s);
+    let path = path.strip_prefix("http://").unwrap_or(path);
+    let path = path.strip_prefix("https://").unwrap_or(path);
+    let path = path.split_once('/').map(|(_, rest)| rest).unwrap_or(path);
+    let mut any_substantive = false;
+    for seg in path.split('/').filter(|s| !s.is_empty()) {
+        // Pure-digit single segments (`/90`) usually come from numeric
+        // literals in JS, not routes — unless paired with substantive context.
+        if seg.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // 3+ chars, or 2 chars containing a separator like `-`, marks a
+        // segment as substantive enough to anchor a real route.
+        if seg.len() >= 3 || seg.bytes().any(|b| b == b'-' || b == b'_') {
+            any_substantive = true;
+            break;
+        }
+    }
+    any_substantive
 }
 
 pub(crate) fn is_url_like(s: &str) -> bool {
@@ -37,7 +80,7 @@ pub(crate) fn is_url_like(s: &str) -> bool {
         && bytes.iter().any(u8::is_ascii_alphanumeric)
 }
 
-pub(crate) fn normalize_api_url(s: &str) -> String {
+pub fn normalize_api_url(s: &str) -> String {
     let without_fragment = s.split('#').next().unwrap_or(s);
     let Some((path, query)) = without_fragment.split_once('?') else {
         return without_fragment.to_owned();

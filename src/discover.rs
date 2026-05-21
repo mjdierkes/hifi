@@ -149,6 +149,13 @@ pub fn scan_document_with_config(
 
     if let Some(routes) = parse_manifest_routes(bytes, base, kind) {
         for route in routes {
+            // Some Next.js manifests (notably app-build-manifest in v15+) list
+            // asset chunk paths alongside real route keys. Run them through
+            // the same quality bar as scanner-inferred routes so the output
+            // doesn't fill up with `/_next/static/chunks/*.js` entries.
+            if !crate::scan::classify::is_client_route(&route) {
+                continue;
+            }
             out.findings.routes.entry(route.clone()).or_default();
             out.findings
                 .bump_provenance(route, FindingSource::ManifestParsed);
@@ -633,6 +640,18 @@ fn scan_next_flight(bytes: &[u8], findings: &mut ScanResult) {
     // First pass: typed walk of the React Flight payload extracts href, src,
     // and action references with high precision (no quote-noise).
     for route in next::extract_flight_routes(bytes) {
+        // Flight payloads carry chunk URLs and image asset paths alongside real
+        // route hrefs; route API-looking entries to the candidates bucket and
+        // drop the rest as scanner noise.
+        if crate::scan::classify::is_api_candidate(&route) {
+            let url = crate::scan::classify::normalize_api_url(&route);
+            findings.candidates.entry(url.clone()).or_default();
+            findings.bump_provenance(url, FindingSource::FlightTyped);
+            continue;
+        }
+        if !crate::scan::classify::is_client_route(&route) {
+            continue;
+        }
         findings.routes.entry(route.clone()).or_default();
         findings.bump_provenance(route, FindingSource::FlightTyped);
     }
