@@ -1,7 +1,7 @@
 use super::{AppError, OutputMode};
 use crate::runtime::daemon;
-use crate::runtime::processor::Output;
-use crate::scan::{Confidence, Evidence, EvidenceKind, Shape};
+use crate::runtime::processor::{CacheStatus, Output};
+use crate::scan::{EvidenceKind, Shape};
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
@@ -65,7 +65,7 @@ fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
     rows.sort_by_key(|e| (e.kind, e.url.as_str(), e.extractor));
     for evidence in rows {
         match evidence.kind {
-            crate::scan::EvidenceKind::Api => {
+            EvidenceKind::Api => {
                 let Some(shape) = &evidence.shape else {
                     continue;
                 };
@@ -78,7 +78,7 @@ fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
                     evidence.confidence
                 )?;
             }
-            crate::scan::EvidenceKind::Candidate => {
+            EvidenceKind::Candidate => {
                 writeln!(
                     out,
                     "?\t{}\t\t{:?}",
@@ -86,7 +86,7 @@ fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
                     evidence.confidence
                 )?;
             }
-            crate::scan::EvidenceKind::Route => {
+            EvidenceKind::Route => {
                 writeln!(
                     out,
                     "route\t{}\t\t{:?}",
@@ -100,99 +100,119 @@ fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
 }
 
 fn render_grouped_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
-    let api_groups = grouped_apis(v);
-    if !api_groups.is_empty() {
+    let apis = collect_apis(v);
+    let candidates = collect_paths(v, EvidenceKind::Candidate);
+    let (routes, internal_count) = split_internal(collect_paths(v, EvidenceKind::Route));
+
+    write_header(out, v, apis.len(), routes.len(), candidates.len())?;
+
+    if !apis.is_empty() {
+        writeln!(out)?;
         writeln!(out, "APIs")?;
-        for (prefix, rows) in api_groups {
-            writeln!(out, "{}", escape_terminal(&prefix))?;
-            let method_width = rows
-                .iter()
-                .map(|row| row.shape.methods_csv().len())
-                .max()
-                .unwrap_or(0);
-            for row in rows {
-                let methods = row.shape.methods_csv();
-                let flags = row.shape.flags_csv();
-                if flags.is_empty() {
-                    writeln!(
-                        out,
-                        "  {methods:<method_width$}  {}",
-                        escape_terminal(&path_suffix(&prefix, &row.url)),
-                    )?;
-                } else {
-                    writeln!(
-                        out,
-                        "  {methods:<method_width$}  {}  {}",
-                        escape_terminal(&path_suffix(&prefix, &row.url)),
-                        flags,
-                    )?;
-                }
+        let method_width = apis.iter().map(|r| r.methods.len()).max().unwrap_or(0);
+        for row in &apis {
+            let path = escape_terminal(&row.path);
+            if row.flags.is_empty() {
+                writeln!(out, "  {:<width$}  {}", row.methods, path, width = method_width)?;
+            } else {
+                writeln!(
+                    out,
+                    "  {:<width$}  {}  {}",
+                    row.methods,
+                    path,
+                    row.flags,
+                    width = method_width
+                )?;
             }
         }
     }
 
-    render_path_groups(
-        out,
-        "API candidates",
-        v.evidence
-            .iter()
-            .filter(|evidence| evidence.kind == EvidenceKind::Candidate),
-        2,
-    )?;
-    render_path_groups(
-        out,
-        "Routes",
-        v.evidence
-            .iter()
-            .filter(|evidence| evidence.kind == EvidenceKind::Route),
-        1,
-    )?;
+    if !candidates.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "API candidates")?;
+        for path in &candidates {
+            writeln!(out, "  ?  {}", escape_terminal(path))?;
+        }
+    }
+
+    if !routes.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "Routes")?;
+        render_resource_summary(out, &routes)?;
+    }
+
+    if internal_count > 0 {
+        writeln!(out)?;
+        writeln!(
+            out,
+            "+{internal_count} internal route{} (--all)",
+            if internal_count == 1 { "" } else { "s" }
+        )?;
+    }
 
     Ok(())
 }
 
-fn render_path_groups<'a, W: Write>(
+fn write_header<W: Write>(
     out: &mut W,
-    title: &str,
-    rows: impl Iterator<Item = &'a Evidence>,
-    prefix_depth: usize,
+    v: &Output,
+    api_count: usize,
+    route_count: usize,
+    candidate_count: usize,
 ) -> io::Result<()> {
-    let mut rows: Vec<_> = rows.collect();
-    rows.sort_by_key(|evidence| (evidence.url.as_str(), evidence.extractor));
-    rows.dedup_by_key(|evidence| (evidence.url.as_str(), evidence.extractor));
-    if rows.is_empty() {
-        return Ok(());
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!(
+        "{route_count} route{}",
+        if route_count == 1 { "" } else { "s" }
+    ));
+    parts.push(format!(
+        "{api_count} API{}",
+        if api_count == 1 { "" } else { "s" }
+    ));
+    if candidate_count > 0 {
+        parts.push(format!(
+            "{candidate_count} candidate{}",
+            if candidate_count == 1 { "" } else { "s" }
+        ));
     }
+    if let Some(label) = v.framework.label() {
+        parts.push(label);
+    }
+    parts.push(cache_label(v.cache).to_string());
+    if let Some(us) = v.elapsed_us {
+        parts.push(format_elapsed(us));
+    }
+    writeln!(out, "{}", parts.join(" · "))
+}
 
-    writeln!(out, "{title}")?;
-    let mut groups = BTreeMap::<String, Vec<&Evidence>>::new();
-    for evidence in rows {
-        groups
-            .entry(path_prefix(&evidence.url, prefix_depth))
-            .or_default()
-            .push(evidence);
+fn cache_label(status: CacheStatus) -> &'static str {
+    match status {
+        CacheStatus::Fresh => "cache fresh",
+        CacheStatus::Stale => "cache stale",
+        CacheStatus::RevisionHit => "cache hit",
+        CacheStatus::Miss => "fresh scan",
+        CacheStatus::Stored => "stored",
     }
-    for (prefix, rows) in groups {
-        writeln!(out, "{}", escape_terminal(&prefix))?;
-        for evidence in rows {
-            writeln!(
-                out,
-                "  {}",
-                escape_terminal(&path_suffix(&prefix, &evidence.url))
-            )?;
-        }
+}
+
+fn format_elapsed(us: u128) -> String {
+    if us >= 1_000_000 {
+        format!("{:.2}s", us as f64 / 1_000_000.0)
+    } else if us >= 1_000 {
+        format!("{}ms", us / 1_000)
+    } else {
+        format!("{us}us")
     }
-    Ok(())
 }
 
 struct ApiRow {
-    url: String,
-    shape: Shape,
-    confidence: Confidence,
+    path: String,
+    methods: String,
+    flags: String,
 }
 
-fn grouped_apis(v: &Output) -> BTreeMap<String, Vec<ApiRow>> {
-    let mut rows = BTreeMap::<String, ApiRow>::new();
+fn collect_apis(v: &Output) -> Vec<ApiRow> {
+    let mut merged = BTreeMap::<String, Shape>::new();
     for evidence in &v.evidence {
         if evidence.kind != EvidenceKind::Api {
             continue;
@@ -200,71 +220,138 @@ fn grouped_apis(v: &Output) -> BTreeMap<String, Vec<ApiRow>> {
         let Some(shape) = &evidence.shape else {
             continue;
         };
-        rows.entry(evidence.url.clone())
-            .and_modify(|row| {
-                row.shape.merge(shape);
-                row.confidence = row.confidence.min(evidence.confidence);
-            })
-            .or_insert_with(|| ApiRow {
-                url: evidence.url.clone(),
-                shape: shape.clone(),
-                confidence: evidence.confidence,
-            });
+        let path = prettify(&normalize_path(&evidence.url));
+        merged
+            .entry(path)
+            .and_modify(|existing| existing.merge(shape))
+            .or_insert_with(|| shape.clone());
     }
-
-    let mut groups = BTreeMap::<String, Vec<ApiRow>>::new();
-    for row in rows.into_values() {
-        groups.entry(api_prefix(&row.url)).or_default().push(row);
-    }
-    groups
-}
-
-fn api_prefix(url: &str) -> String {
-    path_prefix(url, 2)
-}
-
-fn path_prefix(url: &str, depth: usize) -> String {
-    let path = url::Url::parse(url)
-        .map(|url| url.path().to_string())
-        .unwrap_or_else(|_| url.split(['?', '#']).next().unwrap_or(url).to_string());
-    let path = path.trim_end_matches('/');
-    let path = if path.is_empty() { "/" } else { path };
-    let segments = path
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .take(depth)
-        .collect::<Vec<_>>();
-
-    if segments.is_empty() {
-        return "/".to_string();
-    }
-
-    format!("/{}", segments.join("/"))
-}
-
-fn path_suffix(prefix: &str, url: &str) -> String {
-    let path = url::Url::parse(url)
-        .map(|url| {
-            let mut path = url.path().to_string();
-            if let Some(query) = url.query() {
-                path.push('?');
-                path.push_str(query);
-            }
-            path
+    let mut rows: Vec<ApiRow> = merged
+        .into_iter()
+        .map(|(path, shape)| ApiRow {
+            path,
+            methods: shape.methods_csv(),
+            flags: shape.flags_csv(),
         })
-        .unwrap_or_else(|_| url.to_string());
-    let path_no_query = path.split(['?', '#']).next().unwrap_or(&path);
-    let suffix = path_no_query.strip_prefix(prefix).unwrap_or(path_no_query);
-    if suffix.is_empty() {
-        "(root)".to_string()
+        .collect();
+    rows.sort_by(|a, b| a.methods.cmp(&b.methods).then(a.path.cmp(&b.path)));
+    rows
+}
+
+fn collect_paths(v: &Output, kind: EvidenceKind) -> Vec<String> {
+    let mut paths: Vec<String> = v
+        .evidence
+        .iter()
+        .filter(|e| e.kind == kind)
+        .map(|e| prettify(&normalize_path(&e.url)))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn normalize_path(url: &str) -> String {
+    let raw = url::Url::parse(url)
+        .map(|u| u.path().to_string())
+        .unwrap_or_else(|_| url.split(['?', '#']).next().unwrap_or(url).to_string());
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
     } else {
-        let mut out = suffix.to_string();
-        if let Some(rest) = path.strip_prefix(path_no_query) {
-            out.push_str(rest);
-        }
-        out
+        format!("/{trimmed}")
     }
+}
+
+fn split_internal(paths: Vec<String>) -> (Vec<String>, usize) {
+    let mut visible = Vec::with_capacity(paths.len());
+    let mut hidden = 0usize;
+    for path in paths {
+        let internal = path
+            .split('/')
+            .any(|seg| !seg.is_empty() && seg.starts_with('_'));
+        if internal {
+            hidden += 1;
+        } else {
+            visible.push(path);
+        }
+    }
+    (visible, hidden)
+}
+
+fn prettify(path: &str) -> String {
+    path.replace("{dynamic}", ":id")
+}
+
+#[derive(Default)]
+struct Trie {
+    is_endpoint: bool,
+    children: BTreeMap<String, Trie>,
+}
+
+impl Trie {
+    fn insert(&mut self, segments: &[String]) {
+        match segments.split_first() {
+            None => self.is_endpoint = true,
+            Some((head, rest)) => self
+                .children
+                .entry(head.clone())
+                .or_default()
+                .insert(rest),
+        }
+    }
+}
+
+fn brace_collapse(paths: &[String]) -> Vec<String> {
+    let mut root = Trie::default();
+    for path in paths {
+        let segs: Vec<String> = path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        root.insert(&segs);
+    }
+
+    let mut lines = Vec::new();
+    if root.is_endpoint {
+        lines.push("/".to_string());
+    }
+    for (name, child) in &root.children {
+        lines.push(format!("/{}{}", name, render_tail(child)));
+    }
+    lines
+}
+
+fn render_tail(node: &Trie) -> String {
+    if node.children.is_empty() {
+        return String::new();
+    }
+    let kids: Vec<(&String, &Trie)> = node.children.iter().collect();
+
+    // Single child, not an endpoint: chain segments with /
+    if !node.is_endpoint && kids.len() == 1 {
+        let (name, child) = kids[0];
+        return format!("/{}{}", name, render_tail(child));
+    }
+
+    // Multiple children, not an endpoint: factor the / outside the braces
+    if !node.is_endpoint {
+        let parts: Vec<String> = kids
+            .iter()
+            .map(|(n, c)| format!("{}{}", n, render_tail(c)))
+            .collect();
+        return format!("/{{{}}}", parts.join(", "));
+    }
+
+    // Endpoint + children: include an empty branch for the endpoint itself
+    let mut parts: Vec<String> = vec![String::new()];
+    for (name, child) in &kids {
+        parts.push(format!("/{}{}", name, render_tail(child)));
+    }
+    format!("{{{}}}", parts.join(","))
 }
 
 fn render_flat(json: &str) -> String {
@@ -315,64 +402,66 @@ fn is_visual_spoofing_char(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::processor::CacheStatus;
-    use crate::scan::{Evidence, Extractor};
+    use crate::scan::{Confidence, Evidence, Extractor};
 
     #[test]
-    fn auto_output_groups_human_sections_and_merges_api_shapes() {
+    fn brace_collapses_routes_and_hides_internal() {
         let out = Output {
             evidence: vec![
+                route("/"),
+                route("/account"),
+                route("/account/billing"),
+                route("/account/billing/setup"),
+                route("/account/password"),
+                route("/machines"),
+                route("/machines/{dynamic}"),
+                route("/machines/{dynamic}/cancel"),
+                route("/machines/{dynamic}/reboot"),
+                route("/_head"),
+                route("/_not-found"),
+            ],
+            revision: None,
+            framework: Default::default(),
+            cache: CacheStatus::Miss,
+            cache_age_secs: None,
+            elapsed_us: Some(1_234_000),
+            warnings: Vec::new(),
+        };
+
+        let mut rendered = Vec::new();
+        render_grouped_output(&out, &mut rendered).unwrap();
+        let rendered = String::from_utf8(rendered).unwrap();
+
+        let expected = "\
+9 routes · 0 APIs · fresh scan · 1.23s
+
+Routes
+  /
+  /account{,/billing{,/setup},/password}
+  /machines{,/:id{,/cancel,/reboot}}
+
++2 internal routes (--all)
+";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn apis_render_with_methods_and_flags() {
+        let out = Output {
+            evidence: vec![
+                api("/api/auth/signout", 2, true, false),
+                api("/api/auth/csrf", 1, false, false),
+                api("/api/checkout/start", 2, true, false),
                 Evidence {
-                    url: "/dashboard".to_string(),
-                    kind: EvidenceKind::Route,
-                    extractor: Extractor::Manifest,
-                    confidence: Confidence::Parsed,
-                    shape: None,
-                },
-                Evidence {
-                    url: "/api/users".to_string(),
-                    kind: EvidenceKind::Api,
-                    extractor: Extractor::ApiCall,
-                    confidence: Confidence::Observed,
-                    shape: Some(test_shape(1, false, false)),
-                },
-                Evidence {
-                    url: "/api/users".to_string(),
-                    kind: EvidenceKind::Api,
-                    extractor: Extractor::ServerAction,
-                    confidence: Confidence::Inferred,
-                    shape: Some(test_shape(2, true, true)),
-                },
-                Evidence {
-                    url: "/api/users/{dynamic}".to_string(),
-                    kind: EvidenceKind::Api,
-                    extractor: Extractor::ApiCall,
-                    confidence: Confidence::Observed,
-                    shape: Some(test_shape(1, false, false)),
-                },
-                Evidence {
-                    url: "/api/admin/settings".to_string(),
-                    kind: EvidenceKind::Api,
-                    extractor: Extractor::ApiCall,
-                    confidence: Confidence::Observed,
-                    shape: Some(test_shape(4, true, false)),
-                },
-                Evidence {
-                    url: "/api/team/{dynamic}".to_string(),
+                    url: "/api/docs".to_string(),
                     kind: EvidenceKind::Candidate,
                     extractor: Extractor::Literal,
                     confidence: Confidence::Candidate,
                     shape: None,
                 },
-                Evidence {
-                    url: "/dashboard/stats".to_string(),
-                    kind: EvidenceKind::Route,
-                    extractor: Extractor::Manifest,
-                    confidence: Confidence::Parsed,
-                    shape: None,
-                },
             ],
             revision: None,
+            framework: Default::default(),
             cache: CacheStatus::Miss,
             cache_age_secs: None,
             elapsed_us: None,
@@ -383,16 +472,34 @@ mod tests {
         render_grouped_output(&out, &mut rendered).unwrap();
         let rendered = String::from_utf8(rendered).unwrap();
 
-        assert_eq!(
-            rendered,
-            "APIs\n/api/admin\n  PUT  /settings  body\n/api/users\n  GET,POST  (root)  body,next-action\n  GET       /{dynamic}\nAPI candidates\n/api/team\n  /{dynamic}\nRoutes\n/dashboard\n  (root)\n  /stats\n"
-        );
+        assert!(rendered.starts_with("0 routes · 3 APIs · 1 candidate · fresh scan\n"));
+        assert!(rendered.contains("  GET   /api/auth/csrf\n"));
+        assert!(rendered.contains("  POST  /api/auth/signout  body\n"));
+        assert!(rendered.contains("  ?  /api/docs\n"));
     }
 
-    fn test_shape(methods: u8, has_body: bool, next_server_action: bool) -> Shape {
-        serde_json::from_str(&format!(
-            r#"{{"methods":{methods},"has_body":{has_body},"has_headers":false,"content_types":0,"auth":false,"query_params":[],"next_server_action":{next_server_action}}}"#
-        ))
-        .unwrap()
+    fn route(path: &str) -> Evidence {
+        Evidence {
+            url: path.to_string(),
+            kind: EvidenceKind::Route,
+            extractor: Extractor::Manifest,
+            confidence: Confidence::Parsed,
+            shape: None,
+        }
+    }
+
+    fn api(path: &str, methods: u8, has_body: bool, next_action: bool) -> Evidence {
+        Evidence {
+            url: path.to_string(),
+            kind: EvidenceKind::Api,
+            extractor: Extractor::ApiCall,
+            confidence: Confidence::Observed,
+            shape: Some(
+                serde_json::from_str(&format!(
+                    r#"{{"methods":{methods},"has_body":{has_body},"has_headers":false,"content_types":0,"auth":false,"query_params":[],"next_server_action":{next_action}}}"#
+                ))
+                .unwrap(),
+            ),
+        }
     }
 }

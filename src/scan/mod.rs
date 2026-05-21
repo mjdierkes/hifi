@@ -89,7 +89,6 @@ impl ScanResult {
 
     pub fn merge_findings(&mut self, other: &ScanResult) {
         self.evidence.extend(other.evidence.iter().cloned());
-        self.compact();
     }
 
     pub fn finalize(&mut self) {
@@ -106,7 +105,6 @@ impl ScanResult {
             confidence: extractor.confidence(),
             shape: Some(shape),
         });
-        self.compact();
     }
 
     pub fn record_route(&mut self, url: String, extractor: Extractor) {
@@ -117,7 +115,6 @@ impl ScanResult {
             confidence: extractor.confidence(),
             shape: None,
         });
-        self.compact();
     }
 
     pub fn record_candidate(&mut self, url: String, extractor: Extractor) {
@@ -128,7 +125,6 @@ impl ScanResult {
             confidence: extractor.confidence(),
             shape: None,
         });
-        self.compact();
     }
 
     pub fn api_map(&self) -> ApiMap {
@@ -225,6 +221,7 @@ pub fn scan_endpoints(bytes: &[u8]) -> ScanResult {
             PatternKind::RouteStart => record_route_start(bytes, m.end(), &mut out),
         }
     }
+    out.compact();
     out
 }
 

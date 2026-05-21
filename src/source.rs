@@ -78,10 +78,27 @@ pub fn find_token_delim(bytes: &[u8], include_equals: bool) -> Option<usize> {
     }
 }
 
+pub fn rfind_token_delim(bytes: &[u8], include_equals: bool) -> Option<usize> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { rfind_token_delim_neon(bytes, include_equals) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        rfind_token_delim_scalar(bytes, include_equals)
+    }
+}
+
 fn find_token_delim_scalar(bytes: &[u8], include_equals: bool) -> Option<usize> {
     bytes
         .iter()
         .position(|b| is_token_delim(*b, include_equals))
+}
+
+fn rfind_token_delim_scalar(bytes: &[u8], include_equals: bool) -> Option<usize> {
+    bytes
+        .iter()
+        .rposition(|b| is_token_delim(*b, include_equals))
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -90,20 +107,7 @@ unsafe fn find_token_delim_neon(bytes: &[u8], include_equals: bool) -> Option<us
 
     let mut i = 0;
     while i + 16 <= bytes.len() {
-        let v = vld1q_u8(bytes.as_ptr().add(i));
-        let mut m = vceqq_u8(v, vdupq_n_u8(b'"'));
-        for b in [
-            b'\'', b'`', b'<', b'>', b')', b'(', b',', b';', b'{', b'}', b'[', b']',
-        ] {
-            m = vorrq_u8(m, vceqq_u8(v, vdupq_n_u8(b)));
-        }
-        if include_equals {
-            m = vorrq_u8(m, vceqq_u8(v, vdupq_n_u8(b'=')));
-        }
-        let ws_range = vandq_u8(vcgeq_u8(v, vdupq_n_u8(9)), vcleq_u8(v, vdupq_n_u8(13)));
-        m = vorrq_u8(m, ws_range);
-        m = vorrq_u8(m, vceqq_u8(v, vdupq_n_u8(b' ')));
-
+        let m = token_delim_mask_neon(vld1q_u8(bytes.as_ptr().add(i)), include_equals);
         let mut out = [0u8; 16];
         vst1q_u8(out.as_mut_ptr(), m);
         if let Some(rel) = out.iter().position(|b| *b != 0) {
@@ -112,6 +116,44 @@ unsafe fn find_token_delim_neon(bytes: &[u8], include_equals: bool) -> Option<us
         i += 16;
     }
     find_token_delim_scalar(&bytes[i..], include_equals).map(|rel| i + rel)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn rfind_token_delim_neon(bytes: &[u8], include_equals: bool) -> Option<usize> {
+    use std::arch::aarch64::*;
+
+    let mut end = bytes.len();
+    while end >= 16 {
+        end -= 16;
+        let m = token_delim_mask_neon(vld1q_u8(bytes.as_ptr().add(end)), include_equals);
+        let mut out = [0u8; 16];
+        vst1q_u8(out.as_mut_ptr(), m);
+        if let Some(rel) = out.iter().rposition(|b| *b != 0) {
+            return Some(end + rel);
+        }
+    }
+    rfind_token_delim_scalar(&bytes[..end], include_equals)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn token_delim_mask_neon(
+    v: std::arch::aarch64::uint8x16_t,
+    include_equals: bool,
+) -> std::arch::aarch64::uint8x16_t {
+    use std::arch::aarch64::*;
+
+    let mut m = vceqq_u8(v, vdupq_n_u8(b'"'));
+    for b in [
+        b'\'', b'`', b'<', b'>', b')', b'(', b',', b';', b'{', b'}', b'[', b']',
+    ] {
+        m = vorrq_u8(m, vceqq_u8(v, vdupq_n_u8(b)));
+    }
+    if include_equals {
+        m = vorrq_u8(m, vceqq_u8(v, vdupq_n_u8(b'=')));
+    }
+    let ws_range = vandq_u8(vcgeq_u8(v, vdupq_n_u8(9)), vcleq_u8(v, vdupq_n_u8(13)));
+    m = vorrq_u8(m, ws_range);
+    vorrq_u8(m, vceqq_u8(v, vdupq_n_u8(b' ')))
 }
 
 pub fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
@@ -207,11 +249,7 @@ pub fn token_string(bytes: &[u8], start: usize, template_mode: TemplateMode) -> 
 }
 
 pub fn walk_token_start(bytes: &[u8], pos: usize) -> usize {
-    let mut start = pos;
-    while start > 0 && !is_token_delim(bytes[start - 1], true) {
-        start -= 1;
-    }
-    start
+    rfind_token_delim(&bytes[..pos], true).map_or(0, |idx| idx + 1)
 }
 
 pub fn identifier_at(bytes: &[u8], start: usize) -> Option<&[u8]> {

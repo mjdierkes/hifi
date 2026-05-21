@@ -23,6 +23,16 @@ impl FrameworkConfig {
             Self::None => None,
         }
     }
+
+    pub fn label(&self) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::Next(cfg) => Some(match cfg.build_id.as_deref() {
+                Some(build) if !build.is_empty() => format!("Next.js (build {build})"),
+                _ => "Next.js".to_string(),
+            }),
+        }
+    }
 }
 
 impl From<Option<NextConfig>> for FrameworkConfig {

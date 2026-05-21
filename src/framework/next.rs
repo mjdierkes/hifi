@@ -171,8 +171,8 @@ pub fn is_manifest(path: &str) -> bool {
 }
 
 pub fn is_payload(raw: &str, path: &str) -> bool {
-    (path.ends_with(".json") && is_framework_data(raw, path))
-        || (path.ends_with(".rsc") && has_meaningful_rsc_stem(path))
+    (source::ends_with_ascii_ignore_case(path, ".json") && is_framework_data(raw, path))
+        || (source::ends_with_ascii_ignore_case(path, ".rsc") && has_meaningful_rsc_stem(path))
         || raw.contains("?_rsc=")
         || raw.contains("&_rsc=")
 }
@@ -291,18 +291,18 @@ fn revision_from_bytes(bytes: &[u8], context: bool) -> Option<String> {
 fn is_framework_data(raw: &str, path: &str) -> bool {
     raw.starts_with("/_next/data/")
         || path.contains("/_next/data/")
-        || path.ends_with("/_payload.json")
-        || path.ends_with("/__data.json")
+        || source::ends_with_ascii_ignore_case(path, "/_payload.json")
+        || source::ends_with_ascii_ignore_case(path, "/__data.json")
 }
 
 fn has_meaningful_rsc_stem(path: &str) -> bool {
-    let Some(stem) = path
-        .rsplit('/')
-        .next()
-        .and_then(|file| file.strip_suffix(".rsc"))
-    else {
+    let Some(file) = path.rsplit('/').next() else {
         return false;
     };
+    if file.len() < 4 || !source::ends_with_ascii_ignore_case(file, ".rsc") {
+        return false;
+    }
+    let stem = &file[..file.len() - 4];
     if stem.is_empty()
         || !stem
             .bytes()

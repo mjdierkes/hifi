@@ -185,26 +185,28 @@ fn apply_options_object_shape(bytes: &[u8], start: usize, shape: &mut Shape) {
 }
 
 fn shape_from_object(bytes: &[u8]) -> Shape {
-    let lower = bytes.to_ascii_lowercase();
     let mut shape = Shape::default();
-    for method in memchr::memmem::find_iter(&lower, b"method") {
-        shape.methods |= parse_method(&lower[method + 6..]);
+    let mut offset = 0;
+    while let Some(rel) = source::find_ascii_ignore_case(&bytes[offset..], b"method") {
+        let method = offset + rel;
+        shape.methods |= parse_method(&bytes[method + 6..]);
+        offset = method + 6;
     }
-    shape.has_body = contains_any(&lower, BODY_HINTS);
-    shape.has_headers = contains_any(&lower, HEADER_HINTS);
-    shape.auth = contains_any(&lower, AUTH_HINTS);
+    shape.has_body = contains_any_ignore_case(bytes, BODY_HINTS);
+    shape.has_headers = contains_any_ignore_case(bytes, HEADER_HINTS);
+    shape.auth = contains_any_ignore_case(bytes, AUTH_HINTS);
     for (hints, bit) in CONTENT_HINTS {
-        if contains_any(&lower, hints) {
+        if contains_any_ignore_case(bytes, hints) {
             shape.content_types |= *bit;
         }
     }
     shape
 }
 
-fn contains_any(haystack: &[u8], needles: &[&[u8]]) -> bool {
+fn contains_any_ignore_case(haystack: &[u8], needles: &[&[u8]]) -> bool {
     needles
         .iter()
-        .any(|needle| source::contains(haystack, needle))
+        .any(|needle| source::find_ascii_ignore_case(haystack, needle).is_some())
 }
 
 fn parse_method(mut bytes: &[u8]) -> u8 {
@@ -224,16 +226,11 @@ fn parse_method(mut bytes: &[u8]) -> u8 {
         .iter()
         .position(|b| !b.is_ascii_alphabetic())
         .unwrap_or(bytes.len());
-    match &bytes[..end] {
-        b"get" => METHOD_GET,
-        b"post" => METHOD_POST,
-        b"put" => METHOD_PUT,
-        b"delete" => METHOD_DELETE,
-        b"patch" => METHOD_PATCH,
-        b"head" => METHOD_HEAD,
-        b"options" => METHOD_OPTIONS,
-        _ => 0,
-    }
+    let method = &bytes[..end];
+    METHODS
+        .iter()
+        .find_map(|(bit, name)| method.eq_ignore_ascii_case(name.as_bytes()).then_some(*bit))
+        .unwrap_or(0)
 }
 
 fn apply_second_arg_body_shape(bytes: &[u8], start: usize, shape: &mut Shape) {

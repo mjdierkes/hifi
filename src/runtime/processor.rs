@@ -6,6 +6,7 @@
 //! assets, then build display output.
 
 use crate::discover::{self, DocumentKind};
+use crate::framework::FrameworkConfig;
 use crate::scan::Evidence;
 
 use super::{cache, config::RuntimeConfig, fetch, net};
@@ -47,6 +48,8 @@ pub struct Output {
     pub evidence: Vec<Evidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "FrameworkConfig::is_none")]
+    pub framework: FrameworkConfig,
     #[serde(default, skip_serializing_if = "CacheStatus::is_stored")]
     pub cache: CacheStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -250,6 +253,7 @@ impl<'a> Processor<'a> {
             output: Output {
                 evidence: found.evidence,
                 revision,
+                framework: root_scan.framework_config,
                 cache: CacheStatus::Miss,
                 cache_age_secs: None,
                 elapsed_us: t0.map(|t| t.elapsed().as_micros()),
@@ -490,6 +494,7 @@ mod tests {
         let out = Output {
             evidence: Vec::new(),
             revision: None,
+            framework: FrameworkConfig::default(),
             cache: CacheStatus::Miss,
             cache_age_secs: None,
             elapsed_us: None,

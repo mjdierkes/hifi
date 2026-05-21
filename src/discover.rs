@@ -131,11 +131,21 @@ pub(crate) fn scan_document_with_config_and_findings(
     }
     let next_context = framework::next::is_context(bytes, base, next_config.as_ref());
     let revision = framework::next::revision(bytes, next_context, next_config.as_ref());
+    // If we recognized this as a Next context (e.g. via `/_next/` paths) but had
+    // no parseable __NEXT_DATA__, still mark the framework so callers can label
+    // the output. The build_id stays empty in that case.
+    let framework_config = match next_config.clone() {
+        Some(cfg) => FrameworkConfig::Next(cfg),
+        None if next_context => {
+            FrameworkConfig::Next(crate::scan::next::NextConfig::default())
+        }
+        None => FrameworkConfig::None,
+    };
     let mut out = DocumentScan {
         findings: cached_findings.unwrap_or_else(|| crate::scan::scan_endpoints(bytes)),
         assets: Vec::new(),
         revision,
-        framework_config: FrameworkConfig::from(next_config.clone()),
+        framework_config,
     };
     let mut seen = FxHashSet::default();
 
@@ -358,16 +368,12 @@ fn push_resolved_asset(
 }
 
 fn classify_asset(raw: &str) -> Option<AssetKind> {
-    let path = raw
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(raw)
-        .to_ascii_lowercase();
-    if framework::next::is_manifest(&path) {
+    let path = raw.split(['?', '#']).next().unwrap_or(raw);
+    if framework::next::is_manifest(path) {
         Some(AssetKind::Manifest)
-    } else if is_script_asset(&path) {
+    } else if is_script_asset(path) {
         Some(AssetKind::Script)
-    } else if framework::next::is_payload(raw, &path) {
+    } else if framework::next::is_payload(raw, path) {
         Some(AssetKind::Payload)
     } else {
         None
@@ -375,7 +381,8 @@ fn classify_asset(raw: &str) -> Option<AssetKind> {
 }
 
 fn is_script_asset(path: &str) -> bool {
-    path.ends_with(".js") || path.ends_with(".mjs")
+    source::ends_with_ascii_ignore_case(path, ".js")
+        || source::ends_with_ascii_ignore_case(path, ".mjs")
 }
 
 // Bundlers often emit relative chunk names that are only meaningful in a
