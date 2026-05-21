@@ -99,7 +99,12 @@ impl Output {
         Ok(serde_json::to_string(self)?)
     }
 
-    fn mark(mut self, t0: Option<Instant>, status: CacheStatus, age_secs: Option<u64>) -> Self {
+    pub(crate) fn mark(
+        mut self,
+        t0: Option<Instant>,
+        status: CacheStatus,
+        age_secs: Option<u64>,
+    ) -> Self {
         self.cache = status;
         self.cache_age_secs = age_secs;
         self.elapsed_us = t0.map(|t| t.elapsed().as_micros());
@@ -322,7 +327,7 @@ impl<'a> Processor<'a> {
                 cache_key: revision.clone(),
                 allow_private: cache_ctx.allow_private,
                 memory: cache_ctx.assets.clone(),
-                next_config: root_scan.next_config.clone(),
+                framework_config: root_scan.framework_config.clone(),
             },
             &mut found,
         )
@@ -456,6 +461,16 @@ pub fn write_memory(memory: &MemoryCache, url: String, body: Body) {
     }
 }
 
+pub fn mark_cached_body(
+    body: &str,
+    t0: Instant,
+    status: CacheStatus,
+    age_secs: u64,
+) -> Result<Body> {
+    let output = serde_json::from_str::<Output>(body)?.mark(Some(t0), status, Some(age_secs));
+    Ok(Arc::from(output.to_json_string()?))
+}
+
 fn redirected_base(redirects: Option<&RedirectMemory>, base: &Url) -> Option<Url> {
     let target = redirects?.write().ok()?.get(&origin_key(base)?).cloned()?;
     let mut out = target;
@@ -498,7 +513,7 @@ fn write_caches(
     let cached = out.clone().mark(None, CacheStatus::Stored, None);
     cache::write_with_revision(cache_path, &cached, out.revision.as_deref());
     if let Some(memory) = memory {
-        let body = Arc::from(out.to_json_string()?);
+        let body = Arc::from(cached.to_json_string()?);
         write_memory(&memory, url.to_string(), body);
     }
     Ok(())
@@ -571,7 +586,10 @@ mod tests {
     async fn generic_html_script_assets_are_scanned() {
         let addr = serve(2, |req| {
             if req.starts_with("GET /assets/app.js ") {
-                ("200 OK", r#"fetch("/api/from-generic-script")"#)
+                (
+                    "200 OK",
+                    r#"fetch("/api/from-generic-script"); const hinted="/api/from-html-asset";"#,
+                )
             } else {
                 (
                     "200 OK",
@@ -594,6 +612,42 @@ mod tests {
         .unwrap();
 
         assert!(out.apis.contains_key("/api/from-generic-script"));
+        assert!(out.candidates.contains_key("/api/from-html-asset"));
+        assert_eq!(
+            out.provenance.get("/api/from-html-asset"),
+            Some(&crate::scan::FindingSource::HtmlTag),
+        );
+    }
+
+    #[test]
+    fn memory_cached_processed_output_is_remarked_on_read() {
+        let memory = memory_cache();
+        let url = "https://example.com/cache-regression";
+        let path =
+            std::env::temp_dir().join(format!("hifi-cache-regression-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let out = Output {
+            apis: ApiMap::default(),
+            routes: RouteMap::default(),
+            candidates: CandidateMap::default(),
+            provenance: ProvenanceMap::default(),
+            revision: None,
+            cache: CacheStatus::Miss,
+            cache_age_secs: None,
+            elapsed_us: None,
+            warnings: Vec::new(),
+        };
+
+        write_caches(&path, &out, url, Some(memory.clone())).unwrap();
+        let (body, age) = read_memory(&memory, url).unwrap();
+        let stored = serde_json::from_str::<Output>(&body).unwrap();
+        assert_eq!(stored.cache, CacheStatus::Stored);
+
+        let marked = mark_cached_body(&body, Instant::now(), CacheStatus::Fresh, age).unwrap();
+        let marked = serde_json::from_str::<Output>(&marked).unwrap();
+        assert_eq!(marked.cache, CacheStatus::Fresh);
+        assert_eq!(marked.cache_age_secs, Some(age));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

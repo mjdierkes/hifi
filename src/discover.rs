@@ -5,8 +5,10 @@
 //! chunk literals. It does not fetch anything; it only produces `AssetRef`s for
 //! the runtime to schedule and deduplicate.
 
-use crate::scan::next::{self, NextConfig};
-use crate::scan::{FindingSource, ScanResult, Shape};
+use crate::framework;
+use crate::framework::FrameworkConfig;
+use crate::scan::next::NextConfig;
+use crate::scan::{FindingSource, ScanResult};
 use crate::source::{self, TemplateMode};
 use aho_corasick::{AhoCorasick, MatchKind};
 use rustc_hash::FxHashSet;
@@ -28,24 +30,7 @@ const ASSET_LITERALS: &[&str] = &[
     "&_rsc=",
     ".rsc",
 ];
-const NEXT_SKIP_FRAGMENTS: &[&str] = &[
-    "framework-",
-    "polyfills-",
-    "webpack-",
-    "main-app-",
-    "_next/static/chunks/_turbopack_",
-    "[turbopack]_runtime",
-    "[next]_internal_",
-    "react-refresh",
-    "next/dist/",
-    "instrumentation-",
-    "app-pages-internals-",
-    "app-client-internals-",
-];
 const FRAMEWORK_DATA_MARKERS: &[&[u8]] = &[b"/_next/data/", b"/_payload.json", b"/__data.json"];
-const NEXT_MANIFESTS: &[&str] = &["_buildManifest.js", "_ssgManifest.js"];
-const NEXT_ACTION_MARKERS: &[&[u8]] = &[b"Next-Action", b"next-action", b"$ACTION_"];
-const NEXT_FLIGHT_MARKER: &[u8] = b"self.__next_f.push";
 
 static ASSET_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
     AhoCorasick::builder()
@@ -108,8 +93,8 @@ pub struct DocumentScan {
     pub assets: Vec<AssetRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_config: Option<NextConfig>,
+    #[serde(default, skip_serializing_if = "FrameworkConfig::is_none")]
+    pub framework_config: FrameworkConfig,
 }
 
 pub fn scan_document(bytes: &[u8], base: &Url, kind: DocumentKind) -> DocumentScan {
@@ -126,28 +111,21 @@ pub fn scan_document_with_config(
     kind: DocumentKind,
     parent_config: Option<&NextConfig>,
 ) -> DocumentScan {
-    let mut next_config = if kind == DocumentKind::Html {
-        next::parse_next_data(bytes)
-    } else {
-        None
-    };
+    let mut next_config = framework::next::parse_page_config(bytes, kind);
     if next_config.is_none() {
         next_config = parent_config.cloned();
     }
-    let next_context = next_config.is_some() || is_next_context(bytes, base);
-    let revision = next_config
-        .as_ref()
-        .and_then(|cfg| cfg.build_id.clone())
-        .or_else(|| next_revision(bytes, next_context));
+    let next_context = framework::next::is_context(bytes, base, next_config.as_ref());
+    let revision = framework::next::revision(bytes, next_context, next_config.as_ref());
     let mut out = DocumentScan {
         findings: crate::scan::scan_endpoints(bytes),
         assets: Vec::new(),
         revision,
-        next_config: next_config.clone(),
+        framework_config: FrameworkConfig::from(next_config.clone()),
     };
     let mut seen = FxHashSet::default();
 
-    if let Some(routes) = parse_manifest_routes(bytes, base, kind) {
+    if let Some(routes) = framework::next::parse_manifest_routes(bytes, base, kind) {
         for route in routes {
             // Some Next.js manifests (notably app-build-manifest in v15+) list
             // asset chunk paths alongside real route keys. Run them through
@@ -163,8 +141,8 @@ pub fn scan_document_with_config(
     }
 
     push_framework_candidates(bytes, &mut out.findings);
-    scan_next_flight(bytes, &mut out.findings);
-    scan_next_server_action(bytes, base, kind, next_config.as_ref(), &mut out.findings);
+    framework::next::scan_flight(bytes, &mut out.findings);
+    framework::next::scan_server_action(bytes, base, kind, next_config.as_ref(), &mut out.findings);
     if kind == DocumentKind::Html {
         scan_html_assets(bytes, base, next_context, &mut seen, &mut out.assets);
     }
@@ -180,7 +158,7 @@ pub fn scan_document_with_config(
 
     if kind == DocumentKind::Html {
         if let Some(revision) = out.revision.as_deref() {
-            push_next_manifests(
+            framework::next::push_manifests(
                 bytes,
                 base,
                 revision,
@@ -193,32 +171,6 @@ pub fn scan_document_with_config(
     }
 
     out
-}
-
-/// Parse JSON-style Next.js manifest documents into routes the runtime should
-/// crawl. Each branch checks for a marker that's both cheap to find and
-/// unambiguous, so non-manifest documents short-circuit immediately.
-fn parse_manifest_routes(bytes: &[u8], base: &Url, kind: DocumentKind) -> Option<Vec<String>> {
-    if !matches!(kind, DocumentKind::Manifest | DocumentKind::Payload) {
-        return None;
-    }
-    let path = base.path();
-    let routes = if path.ends_with("_buildManifest.js") {
-        next::parse_build_manifest_js(bytes)
-    } else if path.ends_with("app-build-manifest.json") {
-        next::parse_app_build_manifest(bytes)
-    } else if path.ends_with("middleware-manifest.json")
-        || path.ends_with("_middlewareManifest.json")
-    {
-        next::parse_middleware_manifest(bytes)
-    } else if path.ends_with("client-reference-manifest.json")
-        || path.ends_with("_clientReferenceManifest.json")
-    {
-        next::parse_client_reference_manifest(bytes)
-    } else {
-        return None;
-    };
-    (!routes.is_empty()).then_some(routes)
 }
 
 // HTML documents are the only place where tag structure is meaningful. Scripts,
@@ -341,75 +293,7 @@ fn push_framework_candidates(bytes: &[u8], findings: &mut ScanResult) {
 }
 
 fn push_candidate(findings: &mut ScanResult, raw: &str) {
-    let path = raw.split(['?', '#']).next().unwrap_or(raw);
-    if is_framework_data(raw, path) && raw.len() <= 512 {
-        findings.candidates.entry(raw.to_owned()).or_default();
-    }
-}
-
-fn push_next_manifests(
-    bytes: &[u8],
-    base: &Url,
-    revision: &str,
-    config: Option<&NextConfig>,
-    next_context: bool,
-    seen: &mut FxHashSet<Url>,
-    out: &mut Vec<AssetRef>,
-) {
-    let root = config
-        .and_then(|cfg| asset_prefix_root(cfg, base))
-        .and_then(|url| url.join(&format!("{revision}/")).ok())
-        .or_else(|| next_static_mount(bytes, base, next_context).and_then(|url| url.join(&format!("{revision}/")).ok()))
-        .or_else(|| {
-            let prefix = config.and_then(|c| c.base_path.as_deref()).unwrap_or("");
-            base.join(&format!("{prefix}/_next/static/{revision}/")).ok()
-        });
-    let Some(root) = root else {
-        return;
-    };
-    for name in NEXT_MANIFESTS {
-        let Ok(url) = root.join(name) else {
-            continue;
-        };
-        push_resolved_asset(
-            url,
-            AssetKind::Manifest,
-            AssetSource::NextManifest,
-            seen,
-            out,
-        );
-    }
-    // Also queue the App Router manifests when this looks like a Next 13+
-    // build. These live under the same `_next/static/<buildId>/` root and the
-    // runtime fetcher will skip them silently when they don't exist.
-    for name in &["app-build-manifest.json", "_clientReferenceManifest.json"] {
-        let Ok(url) = root.join(name) else { continue };
-        push_resolved_asset(
-            url,
-            AssetKind::Manifest,
-            AssetSource::NextManifest,
-            seen,
-            out,
-        );
-    }
-}
-
-fn asset_prefix_root(cfg: &NextConfig, base: &Url) -> Option<Url> {
-    let prefix = cfg.asset_prefix.as_deref()?.trim_end_matches('/');
-    if prefix.is_empty() {
-        return None;
-    }
-    let base_path = cfg.base_path.as_deref().unwrap_or("");
-    let is_absolute = prefix.starts_with("http://") || prefix.starts_with("https://");
-    if !is_absolute && !prefix.starts_with('/') {
-        return None;
-    }
-    let combined = format!("{prefix}{base_path}/_next/static/");
-    if is_absolute {
-        Url::parse(&combined).ok()
-    } else {
-        base.join(&combined).ok()
-    }
+    framework::next::push_framework_candidate(findings, raw);
 }
 
 fn push_asset(
@@ -426,7 +310,7 @@ fn push_asset(
     let Some(url) = resolve_asset(base, raw, next_context) else {
         return;
     };
-    if should_skip(&url) {
+    if framework::next::should_skip(&url) {
         return;
     }
     push_resolved_asset(url, kind, source, seen, out);
@@ -450,65 +334,19 @@ fn classify_asset(raw: &str) -> Option<AssetKind> {
         .next()
         .unwrap_or(raw)
         .to_ascii_lowercase();
-    if is_next_manifest(&path) {
+    if framework::next::is_manifest(&path) {
         Some(AssetKind::Manifest)
     } else if is_script_asset(&path) {
         Some(AssetKind::Script)
-    } else if is_framework_payload(raw, &path) {
+    } else if framework::next::is_payload(raw, &path) {
         Some(AssetKind::Payload)
     } else {
         None
     }
 }
 
-fn is_next_manifest(path: &str) -> bool {
-    path.ends_with("_buildmanifest.js") || path.ends_with("_ssgmanifest.js")
-}
-
 fn is_script_asset(path: &str) -> bool {
     path.ends_with(".js") || path.ends_with(".mjs")
-}
-
-fn is_framework_data(raw: &str, path: &str) -> bool {
-    raw.starts_with("/_next/data/")
-        || path.contains("/_next/data/")
-        || path.ends_with("/_payload.json")
-        || path.ends_with("/__data.json")
-}
-
-fn is_framework_payload(raw: &str, path: &str) -> bool {
-    (path.ends_with(".json") && is_framework_data(raw, path))
-        || (path.ends_with(".rsc") && has_meaningful_rsc_stem(path))
-        || raw.contains("?_rsc=")
-        || raw.contains("&_rsc=")
-}
-
-// Minified RSC framework code contains `.rsc` substrings inside property
-// accesses (`x.rsc`, `rsc:E.rsc`) and concatenated chunk paths
-// (`"_next/static/chunks/" + n + ".rsc"`). Their tokens look like real `.rsc`
-// URLs but produce 404s. Require a non-trivial filename stem before the
-// extension so we only enqueue plausible payload paths.
-fn has_meaningful_rsc_stem(path: &str) -> bool {
-    let Some(stem) = path
-        .rsplit('/')
-        .next()
-        .and_then(|file| file.strip_suffix(".rsc"))
-    else {
-        return false;
-    };
-    if stem.is_empty()
-        || !stem
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    {
-        return false;
-    }
-    // Reject synthesized stems from minified concatenations like
-    // `"/chunks/" + s + ".head.rsc"`, where the first dot-segment is a
-    // single-character variable name. Real route-segment payloads use the
-    // route name (e.g. `dashboard.head.rsc`).
-    let first_segment = stem.split('.').next().unwrap_or(stem);
-    first_segment.len() >= 2
 }
 
 // Bundlers often emit relative chunk names that are only meaningful in a
@@ -519,13 +357,8 @@ fn resolve_asset(base: &Url, raw: &str, next_context: bool) -> Option<Url> {
     if raw.is_empty() || raw.starts_with("data:") || raw.starts_with("blob:") {
         return None;
     }
-    if raw.starts_with("http://")
-        || raw.starts_with("https://")
-        || raw.starts_with('/')
-        || raw.starts_with("./")
-        || raw.starts_with("../")
-    {
-        return base.join(raw).ok();
+    if let Some(url) = framework::next::resolve_asset(base, raw, next_context) {
+        return Some(url);
     }
 
     let absolute = if raw.starts_with("static/") && next_context {
@@ -543,65 +376,6 @@ fn resolve_asset(base: &Url, raw: &str, next_context: bool) -> Option<Url> {
     }
 }
 
-fn is_next_context(bytes: &[u8], base: &Url) -> bool {
-    base.path().contains("/_next/")
-        || memchr::memmem::find(bytes, b"/_next/").is_some()
-        || memchr::memmem::find(bytes, b"__NEXT_DATA__").is_some()
-        || memchr::memmem::find(bytes, NEXT_FLIGHT_MARKER).is_some()
-}
-
-// Skip common framework runtime chunks. They are large, noisy, and usually do
-// not contain application API calls; scanning them makes output less focused.
-fn should_skip(url: &Url) -> bool {
-    let path = url.path();
-    path.contains("/_next/")
-        && NEXT_SKIP_FRAGMENTS
-            .iter()
-            .any(|fragment| path.contains(fragment))
-}
-
-// Prefer explicit Next.js build IDs when present. Falling back to the
-// `/_next/static/<revision>/...` path keeps manifest discovery working for
-// pages that do not include inline `__NEXT_DATA__`.
-fn next_revision(bytes: &[u8], next_context: bool) -> Option<String> {
-    if next_context {
-        let needle = br#""buildId":""#;
-        if let Some(i) = memchr::memmem::find(bytes, needle) {
-            let rest = &bytes[i + needle.len()..];
-            if let Some(end) = memchr::memchr(b'"', rest) {
-                return std::str::from_utf8(&rest[..end]).ok().map(str::to_string);
-            }
-        }
-    }
-    let marker = b"/_next/static/";
-    let rest = &bytes[memchr::memmem::find(bytes, marker)? + marker.len()..];
-    let candidate = &rest[..memchr::memchr(b'/', rest)?];
-    (!matches!(candidate, b"chunks" | b"css" | b"media" | b"development"))
-        .then(|| std::str::from_utf8(candidate).ok().map(str::to_string))?
-}
-
-fn next_static_mount(bytes: &[u8], base: &Url, next_context: bool) -> Option<Url> {
-    let marker = b"/_next/static/";
-    for pos in memchr::memmem::find_iter(bytes, marker) {
-        let start = source::walk_token_start(bytes, pos);
-        let Some(raw) = asset_token_string(bytes, start) else {
-            continue;
-        };
-        let Some(url) = resolve_asset(base, &raw, next_context) else {
-            continue;
-        };
-        let Some(path_pos) = url.path().find("/_next/static/") else {
-            continue;
-        };
-        let mut root = url.clone();
-        root.set_path(&url.path()[..path_pos + marker.len()]);
-        root.set_query(None);
-        root.set_fragment(None);
-        return Some(root);
-    }
-    None
-}
-
 fn asset_token_string(bytes: &[u8], start: usize) -> Option<String> {
     let raw = source::token_string(bytes, start, TemplateMode::Preserve)?;
     if !raw.contains('?') && !raw.contains('&') {
@@ -609,140 +383,12 @@ fn asset_token_string(bytes: &[u8], start: usize) -> Option<String> {
     }
 
     let mut end = start;
-    while end < bytes.len() && !is_asset_token_delim(bytes[end]) {
+    while end < bytes.len() && !source::is_token_delim(bytes[end], false) {
         end += 1;
     }
     std::str::from_utf8(&bytes[start..end])
         .ok()
         .map(|s| s.trim_matches('\\').to_string())
-}
-
-fn is_asset_token_delim(b: u8) -> bool {
-    b.is_ascii_whitespace()
-        || matches!(
-            b,
-            b'"' | b'\''
-                | b'`'
-                | b'<'
-                | b'>'
-                | b')'
-                | b'('
-                | b','
-                | b';'
-                | b'{'
-                | b'}'
-                | b'['
-                | b']'
-        )
-}
-
-fn scan_next_flight(bytes: &[u8], findings: &mut ScanResult) {
-    // First pass: typed walk of the React Flight payload extracts href, src,
-    // and action references with high precision (no quote-noise).
-    for route in next::extract_flight_routes(bytes) {
-        // Flight payloads carry chunk URLs and image asset paths alongside real
-        // route hrefs; route API-looking entries to the candidates bucket and
-        // drop the rest as scanner noise.
-        if crate::scan::classify::is_api_candidate(&route) {
-            let url = crate::scan::classify::normalize_api_url(&route);
-            findings.candidates.entry(url.clone()).or_default();
-            findings.bump_provenance(url, FindingSource::FlightTyped);
-            continue;
-        }
-        if !crate::scan::classify::is_client_route(&route) {
-            continue;
-        }
-        findings.routes.entry(route.clone()).or_default();
-        findings.bump_provenance(route, FindingSource::FlightTyped);
-    }
-    // Second pass kept for now: the legacy "scan every quoted string" sweep
-    // still catches API calls embedded inside flight strings that the typed
-    // walker doesn't decode. Bound by `</script>` per push, no fixed window.
-    for pos in memchr::memmem::find_iter(bytes, NEXT_FLIGHT_MARKER) {
-        let rest = &bytes[pos..];
-        let script_end = memchr::memmem::find(rest, b"</script>").unwrap_or(rest.len());
-        let window = &rest[..script_end];
-        let mut i = 0;
-        while i < window.len() {
-            let quote = window[i];
-            if !matches!(quote, b'"' | b'\'' | b'`') {
-                i += 1;
-                continue;
-            }
-            let Some(end) = source::quoted_end(window, i + 1, quote) else {
-                break;
-            };
-            if let Some(decoded) =
-                source::quoted_string(window, i + 1, quote, TemplateMode::ReplaceExpressions)
-            {
-                findings.merge(crate::scan::scan_endpoints(decoded.as_bytes()));
-            }
-            i = end + 1;
-        }
-    }
-}
-
-fn scan_next_server_action(
-    bytes: &[u8],
-    base: &Url,
-    kind: DocumentKind,
-    config: Option<&NextConfig>,
-    findings: &mut ScanResult,
-) {
-    if !matches!(kind, DocumentKind::Html | DocumentKind::Payload)
-        || !NEXT_ACTION_MARKERS
-            .iter()
-            .any(|marker| source::contains(bytes, marker))
-    {
-        return;
-    }
-    let Some(route) = next_route_from_payload(base, config) else {
-        return;
-    };
-    findings
-        .apis
-        .entry(route.clone())
-        .or_default()
-        .merge(&Shape::next_server_action());
-    findings.bump_provenance(route, FindingSource::ServerAction);
-}
-
-fn next_route_from_payload(base: &Url, config: Option<&NextConfig>) -> Option<String> {
-    let mut path = base.path().to_owned();
-    if let Some(pos) = path.find("/_next/data/") {
-        let prefix = &path[..pos];
-        let route = path[pos + "/_next/data/".len()..]
-            .split_once('/')
-            .map(|(_, route)| route)?;
-        path = format!("{prefix}/{}", route.trim_end_matches(".json"));
-    } else if let Some(pos) = path.find(".segments/") {
-        path.truncate(pos);
-    } else if let Some(stripped) = path.strip_suffix(".rsc") {
-        path = stripped.to_owned();
-    } else if path.starts_with("/_next/") {
-        return None;
-    }
-    if path.is_empty() {
-        path.push('/');
-    }
-    if let Some(cfg) = config {
-        if let Some(base_path) = cfg.base_path.as_deref() {
-            if !base_path.is_empty() {
-                if let Some(stripped) = path.strip_prefix(base_path) {
-                    path = if stripped.is_empty() {
-                        "/".to_owned()
-                    } else {
-                        stripped.to_owned()
-                    };
-                }
-            }
-        }
-        if !cfg.locales.is_empty() {
-            path = next::strip_locale(&path, &cfg.locales);
-        }
-    }
-    path = next::normalize_app_route(&path);
-    Some(path)
 }
 
 fn attr_value<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a str> {

@@ -7,8 +7,8 @@
 use super::config::RuntimeConfig;
 use super::fetch;
 use super::processor::{
-    memory_cache, read_memory, redirect_cache, spawn_refresh, write_memory, Body, CacheContext,
-    MemoryCache, Processor, RedirectMemory, CACHE_FRESH_SECS, CACHE_STALE_SECS,
+    mark_cached_body, memory_cache, read_memory, redirect_cache, spawn_refresh, Body, CacheContext,
+    CacheStatus, MemoryCache, Processor, RedirectMemory, CACHE_FRESH_SECS, CACHE_STALE_SECS,
 };
 use reqwest::Client;
 use rustc_hash::FxHashMap;
@@ -408,14 +408,18 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
     if !no_cache {
         if let Some((body, age)) = read_memory(&state.memory, url) {
             if age < CACHE_STALE_SECS {
-                if age >= CACHE_FRESH_SECS {
+                let status = if age >= CACHE_FRESH_SECS {
                     spawn_refresh(
                         state.client.clone(),
                         state.config.chunk_concurrency,
                         url,
                         state.cache(),
                     );
-                }
+                    CacheStatus::Stale
+                } else {
+                    CacheStatus::Fresh
+                };
+                let body = mark_cached_body(&body, t0, status, age)?;
                 return reply(
                     &mut stream,
                     DaemonReply {
@@ -467,7 +471,6 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
     let body = out.to_json_string()?;
     if !no_cache {
         let body: Body = Arc::from(body);
-        write_memory(&state.memory, url.to_string(), body.clone());
         finish_inflight(&state.inflight, url, body.clone()).await;
         drop(inflight_guard);
         return reply(

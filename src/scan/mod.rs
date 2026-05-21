@@ -47,6 +47,8 @@ pub enum FindingSource {
     FlightTyped,
     /// Identified at a call site like `fetch(...)`, `axios.get(...)`.
     ApiCall,
+    /// Identified at a client-navigation call site like `router.push(...)`.
+    RouteCall,
     /// Inferred from a Next.js Server Action marker on an HTML or RSC payload.
     ServerAction,
 }
@@ -55,28 +57,40 @@ impl FindingSource {
     /// Provenance levels that are accurate enough to ship in a 99%-precision
     /// output tier without manual triage.
     pub fn is_high_confidence(self) -> bool {
-        matches!(
-            self,
-            Self::HtmlTag
-                | Self::ManifestParsed
-                | Self::FlightTyped
-                | Self::ApiCall
-                | Self::ServerAction
-        )
+        self.confidence_tier() == ConfidenceTier::High
     }
 
-    /// When two emit sites disagree on a finding's provenance, take the higher
-    /// confidence one. Numeric ordering here is just for the max() call below.
-    fn rank(self) -> u8 {
+    pub fn confidence_tier(self) -> ConfidenceTier {
+        match self {
+            Self::Literal => ConfidenceTier::Regular,
+            Self::HtmlTag
+            | Self::ManifestParsed
+            | Self::FlightTyped
+            | Self::ApiCall
+            | Self::RouteCall
+            | Self::ServerAction => ConfidenceTier::High,
+        }
+    }
+
+    /// When two emit sites disagree on a finding's provenance, keep the source
+    /// that carries the strongest evidence for downstream confidence filters.
+    fn merge_rank(self) -> u8 {
         match self {
             Self::Literal => 0,
             Self::FlightTyped => 1,
             Self::HtmlTag => 2,
-            Self::ApiCall => 3,
-            Self::ServerAction => 4,
-            Self::ManifestParsed => 5,
+            Self::RouteCall => 3,
+            Self::ApiCall => 4,
+            Self::ServerAction => 5,
+            Self::ManifestParsed => 6,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfidenceTier {
+    Regular,
+    High,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -105,6 +119,18 @@ impl ScanResult {
             .extend(other.candidates.keys().map(|url| (url.clone(), ())));
         for (url, source) in &other.provenance {
             self.bump_provenance(url.clone(), *source);
+        }
+    }
+
+    pub fn merge_findings_with_source(&mut self, other: &ScanResult, source: FindingSource) {
+        self.merge_findings(other);
+        for url in other
+            .apis
+            .keys()
+            .chain(other.routes.keys())
+            .chain(other.candidates.keys())
+        {
+            self.bump_provenance(url.clone(), source);
         }
     }
 
@@ -143,7 +169,7 @@ impl ScanResult {
             if canonical != variant {
                 if let Some(source) = self.provenance.remove(&variant) {
                     let entry = self.provenance.entry(canonical.clone()).or_default();
-                    if source.rank() > entry.rank() {
+                    if source.merge_rank() > entry.merge_rank() {
                         *entry = source;
                     }
                 }
@@ -156,7 +182,7 @@ impl ScanResult {
     /// the same finding via a higher-confidence source, keep the higher one.
     pub fn bump_provenance(&mut self, url: String, source: FindingSource) {
         let entry = self.provenance.entry(url).or_default();
-        if source.rank() > entry.rank() {
+        if source.merge_rank() > entry.merge_rank() {
             *entry = source;
         }
     }
@@ -212,7 +238,7 @@ fn record_api_call(bytes: &[u8], start: usize, after: usize, anchor: &str, out: 
 fn record_route_call(bytes: &[u8], after: usize, out: &mut ScanResult) {
     if let Some(url) = extract::url_arg(bytes, after).filter(|url| classify::is_client_route(url)) {
         out.routes.entry(url.clone()).or_default();
-        out.bump_provenance(url, FindingSource::ApiCall);
+        out.bump_provenance(url, FindingSource::RouteCall);
     }
 }
 

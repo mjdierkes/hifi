@@ -20,50 +20,16 @@ pub(crate) fn url_arg(bytes: &[u8], start: usize) -> Option<String> {
 }
 
 fn resolve_var_url(bytes: &[u8], pos: usize) -> Option<String> {
-    let ident = read_identifier(bytes, pos)?;
-    if ident.is_empty() || !is_ident_continue(ident[0]) {
-        return None;
-    }
-
-    let start = pos.saturating_sub(LOOKBACK_WINDOW);
-    let mut search_from = start;
-    let mut latest_url: Option<String> = None;
-    while let Some(rel) = memchr::memmem::find(&bytes[search_from..pos], ident) {
-        let match_pos = search_from + rel;
-        let after = match_pos + ident.len();
-        search_from = match_pos + 1;
-
-        if match_pos > 0 && is_ident_continue(bytes[match_pos - 1]) {
-            continue;
-        }
-        if bytes.get(after).is_some_and(|b| is_ident_continue(*b)) {
-            continue;
-        }
-
-        let mut j = source::skip_ws(bytes, after);
-        if bytes.get(j) != Some(&b'=') {
-            continue;
-        }
-        // Skip `==` and `===`; those are comparisons, not assignments.
-        if bytes.get(j + 1) == Some(&b'=') {
-            continue;
-        }
-        j = source::skip_ws(bytes, j + 1);
-        let quote = match bytes.get(j) {
-            Some(&q) if matches!(q, b'"' | b'\'' | b'`') => q,
-            _ => continue,
-        };
-        let mut value_start = j + 1;
-        if quote == b'`' && bytes.get(value_start..value_start + 2) == Some(b"${") {
-            value_start = source::skip_template_expr(bytes, value_start + 2);
-        }
-        if let Some(url) =
-            source::quoted_string(bytes, value_start, quote, TemplateMode::ReplaceExpressions)
-        {
-            latest_url = Some(url);
-        }
-    }
-    latest_url
+    let ident = source::identifier_at(bytes, pos)?;
+    source::latest_quoted_assignment(
+        bytes,
+        ident,
+        pos,
+        LOOKBACK_WINDOW,
+        TemplateMode::ReplaceExpressions,
+        true,
+        false,
+    )
 }
 
 fn quoted_url_string(bytes: &[u8], start: usize, quote: u8, quote_pos: usize) -> Option<String> {
@@ -143,9 +109,7 @@ fn resolve_template_identifier(
     before_pos: usize,
 ) -> Option<String> {
     let mut start = expr_start;
-    while start < expr_end && bytes[start].is_ascii_whitespace() {
-        start += 1;
-    }
+    start = source::skip_ws(bytes, start);
     let mut end = expr_end;
     while end > start && bytes[end - 1].is_ascii_whitespace() {
         end -= 1;
@@ -153,7 +117,7 @@ fn resolve_template_identifier(
     if start >= end {
         return None;
     }
-    let ident = read_identifier(bytes, start)?;
+    let ident = source::identifier_at(bytes, start)?;
     if start + ident.len() != end {
         return None;
     }
@@ -161,60 +125,15 @@ fn resolve_template_identifier(
 }
 
 fn resolve_const_string(bytes: &[u8], ident: &[u8], before_pos: usize) -> Option<String> {
-    let start = before_pos.saturating_sub(LOOKBACK_WINDOW);
-    let mut search_from = start;
-    let mut latest_value = None;
-    while let Some(rel) = memchr::memmem::find(&bytes[search_from..before_pos], ident) {
-        let match_pos = search_from + rel;
-        let after = match_pos + ident.len();
-        search_from = match_pos + 1;
-
-        if match_pos > 0 && is_ident_continue(bytes[match_pos - 1]) {
-            continue;
-        }
-        if bytes.get(after).is_some_and(|b| is_ident_continue(*b)) {
-            continue;
-        }
-
-        let mut j = source::skip_ws(bytes, after);
-        if bytes.get(j) != Some(&b'=') || bytes.get(j + 1) == Some(&b'=') {
-            continue;
-        }
-        j = source::skip_ws(bytes, j + 1);
-        let quote = match bytes.get(j) {
-            Some(&q) if matches!(q, b'"' | b'\'' | b'`') => q,
-            _ => continue,
-        };
-        let value_start = j + 1;
-        let value =
-            source::quoted_string(bytes, value_start, quote, TemplateMode::ReplaceExpressions)?;
-        if value.contains(DYNAMIC) || value.contains("${") {
-            continue;
-        }
-        latest_value = Some(value);
-    }
-    latest_value
-}
-
-fn read_identifier(bytes: &[u8], start: usize) -> Option<&[u8]> {
-    let first = *bytes.get(start)?;
-    if !is_ident_start(first) {
-        return None;
-    }
-    let end = bytes[start..]
-        .iter()
-        .position(|b| !is_ident_continue(*b))
-        .map(|rel| start + rel)
-        .unwrap_or(bytes.len());
-    Some(&bytes[start..end])
-}
-
-fn is_ident_start(b: u8) -> bool {
-    b == b'_' || b == b'$' || b.is_ascii_alphabetic()
-}
-
-fn is_ident_continue(b: u8) -> bool {
-    b == b'_' || b == b'$' || b.is_ascii_alphanumeric()
+    source::latest_quoted_assignment(
+        bytes,
+        ident,
+        before_pos,
+        LOOKBACK_WINDOW,
+        TemplateMode::ReplaceExpressions,
+        false,
+        true,
+    )
 }
 
 pub(crate) fn value_after_anchor(bytes: &[u8], mut i: usize) -> Option<String> {

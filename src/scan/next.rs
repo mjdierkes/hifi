@@ -6,6 +6,7 @@
 //! manifests are JSON, and `_buildManifest.js` wraps a single returned object
 //! literal that can be sliced out by bracket-walking and coerced to JSON.
 
+use crate::source;
 use serde::{Deserialize, Serialize};
 
 /// Runtime configuration leaked into the page by Next.js. Each field maps to a
@@ -154,8 +155,7 @@ pub fn parse_build_manifest_js(bytes: &[u8]) -> Vec<String> {
     // older or hand-rolled forms write `self.__BUILD_MANIFEST = {...}` inline.
     // Try the `return` anchor first, then fall back to the first `{` after the
     // build-manifest identifier.
-    let i = locate_build_manifest_object(bytes)
-        .or_else(|| locate_build_manifest_inline(bytes));
+    let i = locate_build_manifest_object(bytes).or_else(|| locate_build_manifest_inline(bytes));
     let Some(i) = i else {
         return Vec::new();
     };
@@ -185,18 +185,17 @@ pub fn parse_build_manifest_js(bytes: &[u8]) -> Vec<String> {
 
 fn locate_build_manifest_object(bytes: &[u8]) -> Option<usize> {
     let return_pos = memchr::memmem::find(bytes, b"return")?;
-    let mut i = return_pos + b"return".len();
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
+    let i = source::skip_ws(bytes, return_pos + b"return".len());
     (bytes.get(i) == Some(&b'{')).then_some(i)
 }
 
 fn locate_build_manifest_inline(bytes: &[u8]) -> Option<usize> {
     let ident_pos = memchr::memmem::find(bytes, b"__BUILD_MANIFEST")?;
     let mut i = ident_pos + b"__BUILD_MANIFEST".len();
-    while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'=') {
+    i = source::skip_ws(bytes, i);
+    while i < bytes.len() && bytes[i] == b'=' {
         i += 1;
+        i = source::skip_ws(bytes, i);
     }
     (bytes.get(i) == Some(&b'{')).then_some(i)
 }
@@ -296,15 +295,9 @@ fn coerce_object_literal_to_json(bytes: &[u8]) -> Option<String> {
             }
             b if b.is_ascii_whitespace() => i += 1,
             b if b == b'_' || b == b'$' || b.is_ascii_alphabetic() => {
-                let ident_start = i;
-                while i < bytes.len()
-                    && (bytes[i] == b'_'
-                        || bytes[i] == b'$'
-                        || bytes[i].is_ascii_alphanumeric())
-                {
-                    i += 1;
-                }
-                let ident = std::str::from_utf8(&bytes[ident_start..i]).ok()?;
+                let ident_bytes = source::identifier_at(bytes, i)?;
+                i += ident_bytes.len();
+                let ident = std::str::from_utf8(ident_bytes).ok()?;
                 if expect_key {
                     out.push('"');
                     out.push_str(ident);
@@ -607,7 +600,10 @@ mod tests {
     #[test]
     fn normalizes_app_router_conventions() {
         assert_eq!(normalize_app_route("/(marketing)/about"), "/about");
-        assert_eq!(normalize_app_route("/dashboard/@modal/login"), "/dashboard/login");
+        assert_eq!(
+            normalize_app_route("/dashboard/@modal/login"),
+            "/dashboard/login"
+        );
         assert_eq!(normalize_app_route("/feed/(.)photo/42"), "/feed/42");
         assert_eq!(normalize_app_route("/blog/[slug]"), "/blog/[slug]");
         assert_eq!(normalize_app_route("/docs/[...slug]"), "/docs/[...slug]");

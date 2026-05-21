@@ -8,8 +8,8 @@
 //! data across builds, so the processed asset cache is scoped by cache key.
 
 use crate::discover::{self, AssetRef, AssetSource, DocumentScan};
-use crate::scan::next::NextConfig;
-use crate::scan::ScanResult;
+use crate::framework::{self, FrameworkConfig};
+use crate::scan::{FindingSource, ScanResult};
 
 use super::cache::{self, AssetData};
 use super::net;
@@ -45,10 +45,10 @@ pub struct AssetScanOptions {
     pub cache_key: Option<String>,
     pub allow_private: bool,
     pub memory: Option<AssetMemoryCache>,
-    /// Config extracted from the root HTML document. Sub-resources can't host
-    /// their own `__NEXT_DATA__`, so this is the only way RSC payloads get
-    /// locale and base-path information for route reconstruction.
-    pub next_config: Option<NextConfig>,
+    /// Framework config extracted from the root HTML document. Sub-resources
+    /// can't host their own page config, so this is how payloads reconstruct
+    /// framework routes consistently.
+    pub framework_config: FrameworkConfig,
 }
 
 #[derive(Default)]
@@ -69,6 +69,7 @@ pub(crate) enum FetchFailure {
 
 struct ScannedAsset {
     asset: Arc<AssetData>,
+    source: AssetSource,
     memory_hit: bool,
 }
 
@@ -103,7 +104,7 @@ pub async fn scan_assets(
                 opts.cache_key.as_deref(),
                 opts.allow_private,
                 opts.memory.clone(),
-                opts.next_config.clone(),
+                opts.framework_config.clone(),
             ));
         }
 
@@ -115,7 +116,10 @@ pub async fn scan_assets(
                 if result.memory_hit {
                     stats.memory_hits += 1;
                 }
-                out.merge_findings(&result.asset.findings);
+                out.merge_findings_with_source(
+                    &result.asset.findings,
+                    finding_source_for_asset(result.source),
+                );
                 enqueue_assets(
                     result.asset.assets.iter().cloned(),
                     &mut visited,
@@ -163,13 +167,14 @@ async fn fetch_scan(
     cache_key: Option<&str>,
     allow_private: bool,
     memory: Option<AssetMemoryCache>,
-    parent_config: Option<NextConfig>,
+    framework_config: FrameworkConfig,
 ) -> Result<ScannedAsset, (AssetRef, FetchFailure)> {
     let mut cached = None;
     if use_cache {
         if let Some(asset_data) = read_memory_asset(memory.as_ref(), &asset.url, cache_key) {
             return Ok(ScannedAsset {
                 asset: asset_data,
+                source: asset.source,
                 memory_hit: true,
             });
         }
@@ -179,6 +184,7 @@ async fn fetch_scan(
                 write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
                 return Ok(ScannedAsset {
                     asset: asset_data,
+                    source: asset.source,
                     memory_hit: false,
                 });
             }
@@ -187,9 +193,15 @@ async fn fetch_scan(
     }
 
     let validators = cached.as_ref().map(|asset_data| &asset_data.validators);
-    match fetch_asset_body(&client, asset.clone(), allow_private, validators, parent_config)
-        .await
-        .map_err(|reason| (asset.clone(), reason))?
+    match fetch_asset_body(
+        &client,
+        asset.clone(),
+        allow_private,
+        validators,
+        framework_config,
+    )
+    .await
+    .map_err(|reason| (asset.clone(), reason))?
     {
         FetchedBody::NotModified => {
             let cached = cached.ok_or_else(|| (asset.clone(), FetchFailure::Other))?;
@@ -203,6 +215,7 @@ async fn fetch_scan(
             write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
             Ok(ScannedAsset {
                 asset: asset_data,
+                source: asset.source,
                 memory_hit: false,
             })
         }
@@ -214,8 +227,19 @@ async fn fetch_scan(
             }
             Ok(ScannedAsset {
                 asset: asset_data,
+                source: asset.source,
                 memory_hit: false,
             })
+        }
+    }
+}
+
+fn finding_source_for_asset(source: AssetSource) -> FindingSource {
+    match source {
+        AssetSource::HtmlScript | AssetSource::HtmlPreload => FindingSource::HtmlTag,
+        AssetSource::NextManifest => FindingSource::ManifestParsed,
+        AssetSource::Literal | AssetSource::DynamicImport | AssetSource::NewUrl => {
+            FindingSource::Literal
         }
     }
 }
@@ -261,12 +285,12 @@ async fn fetch_asset_body(
     asset: AssetRef,
     allow_private: bool,
     validators: Option<&cache::AssetValidators>,
-    parent_config: Option<NextConfig>,
+    framework_config: FrameworkConfig,
 ) -> Result<FetchedBody, FetchFailure> {
     net::validate_url(&asset.url, allow_private).map_err(|_| FetchFailure::Other)?;
     let mut request = client.get(asset.url.clone());
-    if is_next_rsc_payload(&asset.url) {
-        request = request.header("RSC", "1");
+    for (name, value) in framework::request_headers(&asset.url) {
+        request = request.header(name, value);
     }
     if let Some(validators) = validators {
         if let Some(etag) = &validators.etag {
@@ -310,18 +334,11 @@ async fn fetch_asset_body(
     let scan_url = asset.url.clone();
     let kind = asset.document_kind();
     let scan = tokio::task::spawn_blocking(move || {
-        discover::scan_document_with_config(&body, &scan_url, kind, parent_config.as_ref())
+        discover::scan_document_with_config(&body, &scan_url, kind, framework_config.as_next())
     })
     .await
     .map_err(|_| FetchFailure::Other)?;
     Ok(FetchedBody::Body(scan, validators))
-}
-
-fn is_next_rsc_payload(url: &Url) -> bool {
-    url.path().ends_with(".rsc")
-        || url
-            .query_pairs()
-            .any(|(key, _)| key.eq_ignore_ascii_case("_rsc"))
 }
 
 fn asset_validators(headers: &HeaderMap) -> cache::AssetValidators {

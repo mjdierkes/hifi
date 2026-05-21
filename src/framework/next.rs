@@ -1,0 +1,376 @@
+//! Next.js discovery policy and runtime hooks.
+
+use crate::discover::{AssetKind, AssetRef, AssetSource, DocumentKind};
+use crate::scan::next::{self as parser, NextConfig};
+use crate::scan::{FindingSource, ScanResult, Shape};
+use crate::source::{self, TemplateMode};
+use rustc_hash::FxHashSet;
+use url::Url;
+
+const NEXT_SKIP_FRAGMENTS: &[&str] = &[
+    "framework-",
+    "polyfills-",
+    "webpack-",
+    "main-app-",
+    "_next/static/chunks/_turbopack_",
+    "[turbopack]_runtime",
+    "[next]_internal_",
+    "react-refresh",
+    "next/dist/",
+    "instrumentation-",
+    "app-pages-internals-",
+    "app-client-internals-",
+];
+const NEXT_MANIFESTS: &[&str] = &["_buildManifest.js", "_ssgManifest.js"];
+const NEXT_ACTION_MARKERS: &[&[u8]] = &[b"Next-Action", b"next-action", b"$ACTION_"];
+const NEXT_FLIGHT_MARKER: &[u8] = b"self.__next_f.push";
+
+pub fn parse_page_config(bytes: &[u8], kind: DocumentKind) -> Option<NextConfig> {
+    (kind == DocumentKind::Html)
+        .then(|| parser::parse_next_data(bytes))
+        .flatten()
+}
+
+pub fn is_context(bytes: &[u8], base: &Url, config: Option<&NextConfig>) -> bool {
+    config.is_some()
+        || base.path().contains("/_next/")
+        || source::contains(bytes, b"/_next/")
+        || source::contains(bytes, b"__NEXT_DATA__")
+        || source::contains(bytes, NEXT_FLIGHT_MARKER)
+}
+
+pub fn revision(bytes: &[u8], context: bool, config: Option<&NextConfig>) -> Option<String> {
+    config
+        .and_then(|cfg| cfg.build_id.clone())
+        .or_else(|| revision_from_bytes(bytes, context))
+}
+
+pub fn parse_manifest_routes(bytes: &[u8], base: &Url, kind: DocumentKind) -> Option<Vec<String>> {
+    if !matches!(kind, DocumentKind::Manifest | DocumentKind::Payload) {
+        return None;
+    }
+    let path = base.path();
+    let routes = if path.ends_with("_buildManifest.js") {
+        parser::parse_build_manifest_js(bytes)
+    } else if path.ends_with("app-build-manifest.json") {
+        parser::parse_app_build_manifest(bytes)
+    } else if path.ends_with("middleware-manifest.json")
+        || path.ends_with("_middlewareManifest.json")
+    {
+        parser::parse_middleware_manifest(bytes)
+    } else if path.ends_with("client-reference-manifest.json")
+        || path.ends_with("_clientReferenceManifest.json")
+    {
+        parser::parse_client_reference_manifest(bytes)
+    } else {
+        return None;
+    };
+    (!routes.is_empty()).then_some(routes)
+}
+
+pub fn push_manifests(
+    bytes: &[u8],
+    base: &Url,
+    revision: &str,
+    config: Option<&NextConfig>,
+    context: bool,
+    seen: &mut FxHashSet<Url>,
+    out: &mut Vec<AssetRef>,
+) {
+    let root = config
+        .and_then(|cfg| asset_prefix_root(cfg, base))
+        .and_then(|url| url.join(&format!("{revision}/")).ok())
+        .or_else(|| {
+            static_mount(bytes, base, context)
+                .and_then(|url| url.join(&format!("{revision}/")).ok())
+        })
+        .or_else(|| {
+            let prefix = config.and_then(|c| c.base_path.as_deref()).unwrap_or("");
+            base.join(&format!("{prefix}/_next/static/{revision}/"))
+                .ok()
+        });
+    let Some(root) = root else {
+        return;
+    };
+    for name in NEXT_MANIFESTS
+        .iter()
+        .copied()
+        .chain(["app-build-manifest.json", "_clientReferenceManifest.json"])
+    {
+        let Ok(url) = root.join(name) else {
+            continue;
+        };
+        push_resolved_asset(
+            url,
+            AssetKind::Manifest,
+            AssetSource::NextManifest,
+            seen,
+            out,
+        );
+    }
+}
+
+pub fn resolve_asset(base: &Url, raw: &str, context: bool) -> Option<Url> {
+    let raw = raw.trim_matches('\\');
+    if raw.is_empty() || raw.starts_with("data:") || raw.starts_with("blob:") {
+        return None;
+    }
+    if raw.starts_with("http://")
+        || raw.starts_with("https://")
+        || raw.starts_with('/')
+        || raw.starts_with("./")
+        || raw.starts_with("../")
+    {
+        return base.join(raw).ok();
+    }
+    if raw.starts_with("static/") && context {
+        return base.join(&format!("/_next/{raw}")).ok();
+    }
+    None
+}
+
+pub fn should_skip(url: &Url) -> bool {
+    let path = url.path();
+    path.contains("/_next/")
+        && NEXT_SKIP_FRAGMENTS
+            .iter()
+            .any(|fragment| path.contains(fragment))
+}
+
+pub fn is_manifest(path: &str) -> bool {
+    path.ends_with("_buildmanifest.js") || path.ends_with("_ssgmanifest.js")
+}
+
+pub fn is_payload(raw: &str, path: &str) -> bool {
+    (path.ends_with(".json") && is_framework_data(raw, path))
+        || (path.ends_with(".rsc") && has_meaningful_rsc_stem(path))
+        || raw.contains("?_rsc=")
+        || raw.contains("&_rsc=")
+}
+
+pub fn push_framework_candidate(findings: &mut ScanResult, raw: &str) {
+    let path = raw.split(['?', '#']).next().unwrap_or(raw);
+    if is_framework_data(raw, path) && raw.len() <= 512 {
+        findings.candidates.entry(raw.to_owned()).or_default();
+        findings.bump_provenance(raw.to_owned(), FindingSource::Literal);
+    }
+}
+
+pub fn scan_flight(bytes: &[u8], findings: &mut ScanResult) {
+    for route in parser::extract_flight_routes(bytes) {
+        if crate::scan::classify::is_api_candidate(&route) {
+            let url = crate::scan::classify::normalize_api_url(&route);
+            findings.candidates.entry(url.clone()).or_default();
+            findings.bump_provenance(url, FindingSource::FlightTyped);
+            continue;
+        }
+        if !crate::scan::classify::is_client_route(&route) {
+            continue;
+        }
+        findings.routes.entry(route.clone()).or_default();
+        findings.bump_provenance(route, FindingSource::FlightTyped);
+    }
+
+    for pos in memchr::memmem::find_iter(bytes, NEXT_FLIGHT_MARKER) {
+        let rest = &bytes[pos..];
+        let script_end = memchr::memmem::find(rest, b"</script>").unwrap_or(rest.len());
+        let window = &rest[..script_end];
+        let mut i = 0;
+        while i < window.len() {
+            let quote = window[i];
+            if !matches!(quote, b'"' | b'\'' | b'`') {
+                i += 1;
+                continue;
+            }
+            let Some(end) = source::quoted_end(window, i + 1, quote) else {
+                break;
+            };
+            if let Some(decoded) =
+                source::quoted_string(window, i + 1, quote, TemplateMode::ReplaceExpressions)
+            {
+                findings.merge(crate::scan::scan_endpoints(decoded.as_bytes()));
+            }
+            i = end + 1;
+        }
+    }
+}
+
+pub fn scan_server_action(
+    bytes: &[u8],
+    base: &Url,
+    kind: DocumentKind,
+    config: Option<&NextConfig>,
+    findings: &mut ScanResult,
+) {
+    if !matches!(kind, DocumentKind::Html | DocumentKind::Payload)
+        || !NEXT_ACTION_MARKERS
+            .iter()
+            .any(|marker| source::contains(bytes, marker))
+    {
+        return;
+    }
+    let Some(route) = route_from_payload(base, config) else {
+        return;
+    };
+    findings
+        .apis
+        .entry(route.clone())
+        .or_default()
+        .merge(&Shape::next_server_action());
+    findings.bump_provenance(route, FindingSource::ServerAction);
+}
+
+pub fn is_rsc_payload(url: &Url) -> bool {
+    url.path().ends_with(".rsc")
+        || url
+            .query_pairs()
+            .any(|(key, _)| key.eq_ignore_ascii_case("_rsc"))
+}
+
+fn asset_prefix_root(cfg: &NextConfig, base: &Url) -> Option<Url> {
+    let prefix = cfg.asset_prefix.as_deref()?.trim_end_matches('/');
+    if prefix.is_empty() {
+        return None;
+    }
+    let base_path = cfg.base_path.as_deref().unwrap_or("");
+    let is_absolute = prefix.starts_with("http://") || prefix.starts_with("https://");
+    if !is_absolute && !prefix.starts_with('/') {
+        return None;
+    }
+    let combined = format!("{prefix}{base_path}/_next/static/");
+    if is_absolute {
+        Url::parse(&combined).ok()
+    } else {
+        base.join(&combined).ok()
+    }
+}
+
+fn static_mount(bytes: &[u8], base: &Url, context: bool) -> Option<Url> {
+    let marker = b"/_next/static/";
+    for pos in memchr::memmem::find_iter(bytes, marker) {
+        let start = source::walk_token_start(bytes, pos);
+        let Some(raw) = asset_token_string(bytes, start) else {
+            continue;
+        };
+        let Some(url) = resolve_asset(base, &raw, context) else {
+            continue;
+        };
+        let Some(path_pos) = url.path().find("/_next/static/") else {
+            continue;
+        };
+        let mut root = url.clone();
+        root.set_path(&url.path()[..path_pos + marker.len()]);
+        root.set_query(None);
+        root.set_fragment(None);
+        return Some(root);
+    }
+    None
+}
+
+fn revision_from_bytes(bytes: &[u8], context: bool) -> Option<String> {
+    if context {
+        let needle = br#""buildId":""#;
+        if let Some(i) = memchr::memmem::find(bytes, needle) {
+            let rest = &bytes[i + needle.len()..];
+            if let Some(end) = memchr::memchr(b'"', rest) {
+                return std::str::from_utf8(&rest[..end]).ok().map(str::to_string);
+            }
+        }
+    }
+    let marker = b"/_next/static/";
+    let rest = &bytes[memchr::memmem::find(bytes, marker)? + marker.len()..];
+    let candidate = &rest[..memchr::memchr(b'/', rest)?];
+    (!matches!(candidate, b"chunks" | b"css" | b"media" | b"development"))
+        .then(|| std::str::from_utf8(candidate).ok().map(str::to_string))?
+}
+
+fn is_framework_data(raw: &str, path: &str) -> bool {
+    raw.starts_with("/_next/data/")
+        || path.contains("/_next/data/")
+        || path.ends_with("/_payload.json")
+        || path.ends_with("/__data.json")
+}
+
+fn has_meaningful_rsc_stem(path: &str) -> bool {
+    let Some(stem) = path
+        .rsplit('/')
+        .next()
+        .and_then(|file| file.strip_suffix(".rsc"))
+    else {
+        return false;
+    };
+    if stem.is_empty()
+        || !stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return false;
+    }
+    let first_segment = stem.split('.').next().unwrap_or(stem);
+    first_segment.len() >= 2
+}
+
+fn route_from_payload(base: &Url, config: Option<&NextConfig>) -> Option<String> {
+    let mut path = base.path().to_owned();
+    if let Some(pos) = path.find("/_next/data/") {
+        let prefix = &path[..pos];
+        let route = path[pos + "/_next/data/".len()..]
+            .split_once('/')
+            .map(|(_, route)| route)?;
+        path = format!("{prefix}/{}", route.trim_end_matches(".json"));
+    } else if let Some(pos) = path.find(".segments/") {
+        path.truncate(pos);
+    } else if let Some(stripped) = path.strip_suffix(".rsc") {
+        path = stripped.to_owned();
+    } else if path.starts_with("/_next/") {
+        return None;
+    }
+    if path.is_empty() {
+        path.push('/');
+    }
+    if let Some(cfg) = config {
+        if let Some(base_path) = cfg.base_path.as_deref() {
+            if !base_path.is_empty() {
+                if let Some(stripped) = path.strip_prefix(base_path) {
+                    path = if stripped.is_empty() {
+                        "/".to_owned()
+                    } else {
+                        stripped.to_owned()
+                    };
+                }
+            }
+        }
+        if !cfg.locales.is_empty() {
+            path = parser::strip_locale(&path, &cfg.locales);
+        }
+    }
+    path = parser::normalize_app_route(&path);
+    Some(path)
+}
+
+fn push_resolved_asset(
+    url: Url,
+    kind: AssetKind,
+    source: AssetSource,
+    seen: &mut FxHashSet<Url>,
+    out: &mut Vec<AssetRef>,
+) {
+    if seen.insert(url.clone()) {
+        out.push(AssetRef { url, kind, source });
+    }
+}
+
+fn asset_token_string(bytes: &[u8], start: usize) -> Option<String> {
+    let raw = source::token_string(bytes, start, TemplateMode::Preserve)?;
+    if !raw.contains('?') && !raw.contains('&') {
+        return Some(raw);
+    }
+
+    let mut end = start;
+    while end < bytes.len() && !source::is_token_delim(bytes[end], false) {
+        end += 1;
+    }
+    std::str::from_utf8(&bytes[start..end])
+        .ok()
+        .map(|s| s.trim_matches('\\').to_string())
+}
