@@ -431,6 +431,143 @@ pub fn parse_client_reference_manifest(bytes: &[u8]) -> Vec<String> {
     out
 }
 
+/// Walk every `__next_f.push([N, "..."])` payload in `bytes` and extract
+/// route-like strings from the typed flight stream. Each push carries a
+/// JS-escaped chunk of the React Flight protocol; lines are shaped as
+/// `<id>:<prefix?><json>`, and the JSON portion is recursively scanned for
+/// href / src / action attributes and route-like string values.
+pub fn extract_flight_routes(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = memchr::memmem::find(&bytes[i..], b"__next_f.push") {
+        let pos = i + rel + b"__next_f.push".len();
+        i = pos;
+        // Bound the search to the enclosing </script> tag if there is one.
+        let limit = memchr::memmem::find(&bytes[pos..], b"</script>")
+            .map(|rel| pos + rel)
+            .unwrap_or(bytes.len());
+        let region = &bytes[pos..limit];
+        let Some(payload) = decode_flight_push(region) else {
+            continue;
+        };
+        walk_flight_payload(&payload, &mut out);
+    }
+    out
+}
+
+/// Parse the `__next_f.push([N, "..."])` argument and return the decoded
+/// second-argument string. Returns `None` if the call shape is unexpected or
+/// the payload isn't a quoted string.
+fn decode_flight_push(region: &[u8]) -> Option<String> {
+    let open = region.iter().position(|b| *b == b'(')?;
+    let arr_open = region[open..].iter().position(|b| *b == b'[')?;
+    let mut i = open + arr_open + 1;
+    // Skip the first element (an id) and the comma.
+    while i < region.len() && region[i] != b',' {
+        i += 1;
+    }
+    if i >= region.len() {
+        return None;
+    }
+    i += 1;
+    while i < region.len() && region[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let quote = *region.get(i)?;
+    if !matches!(quote, b'"' | b'\'') {
+        return None;
+    }
+    i += 1;
+    let mut out = Vec::with_capacity(region.len() - i);
+    while i < region.len() {
+        let b = region[i];
+        if b == b'\\' && i + 1 < region.len() {
+            match region[i + 1] {
+                b'n' => out.push(b'\n'),
+                b't' => out.push(b'\t'),
+                b'r' => out.push(b'\r'),
+                b'\\' => out.push(b'\\'),
+                b'"' => out.push(b'"'),
+                b'\'' => out.push(b'\''),
+                b'/' => out.push(b'/'),
+                b'u' if i + 5 < region.len() => {
+                    let hex = std::str::from_utf8(&region[i + 2..i + 6]).ok()?;
+                    let code = u32::from_str_radix(hex, 16).ok()?;
+                    if let Some(c) = char::from_u32(code) {
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                    i += 6;
+                    continue;
+                }
+                other => out.push(other),
+            }
+            i += 2;
+        } else if b == quote {
+            return String::from_utf8(out).ok();
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    None
+}
+
+fn walk_flight_payload(payload: &str, out: &mut Vec<String>) {
+    for line in payload.split('\n') {
+        let Some((_id, rest)) = line.split_once(':') else {
+            continue;
+        };
+        // The line may have a one-character type prefix before the JSON
+        // payload (e.g. `1:I[...]`, `M2:{...}`). Find the first JSON delimiter
+        // and parse from there.
+        let json_start = rest
+            .bytes()
+            .position(|b| matches!(b, b'[' | b'{' | b'"'))
+            .unwrap_or(rest.len());
+        let json = &rest[json_start..];
+        if json.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+            continue;
+        };
+        collect_flight_routes(&value, out);
+    }
+}
+
+fn collect_flight_routes(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                collect_flight_routes(v, out);
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            for (k, v) in obj {
+                if matches!(k.as_str(), "href" | "src" | "action" | "url" | "data-href") {
+                    if let Some(s) = v.as_str() {
+                        if looks_like_route(s) {
+                            out.push(s.to_owned());
+                        }
+                    }
+                }
+                collect_flight_routes(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn looks_like_route(s: &str) -> bool {
+    !s.is_empty()
+        && s.starts_with('/')
+        && !s.starts_with("//")
+        && s.len() <= 512
+        && !s.contains('\n')
+        && !s.contains(' ')
+}
+
 fn route_from_app_chunk(key: &str) -> Option<String> {
     // Keys like "app/foo/page" or "app/(marketing)/about/page".
     let path = key.strip_prefix("app").unwrap_or(key);
@@ -491,6 +628,22 @@ mod tests {
         let mut routes = parse_app_build_manifest(src);
         routes.sort();
         assert_eq!(routes, vec!["/about", "/dashboard"]);
+    }
+
+    #[test]
+    fn flight_extracts_href_and_action_routes() {
+        // The push string contains escaped JSON-like flight lines.
+        let html = br#"<script>self.__next_f.push([1,"0:[\"$\",\"$L1\",null,{\"href\":\"/dashboard\",\"action\":\"/api/checkout\"}]\n2:{\"href\":\"/about\"}\n"])</script>"#;
+        let mut routes = extract_flight_routes(html);
+        routes.sort();
+        assert_eq!(routes, vec!["/about", "/api/checkout", "/dashboard"]);
+    }
+
+    #[test]
+    fn flight_ignores_garbage_strings() {
+        let html = br#"<script>self.__next_f.push([1,"0:[\"$L1\",null,{\"foo\":\"not a route\",\"href\":\"http://other.example.com\"}]"])</script>"#;
+        let routes = extract_flight_routes(html);
+        assert!(routes.is_empty(), "got: {routes:?}");
     }
 
     #[test]

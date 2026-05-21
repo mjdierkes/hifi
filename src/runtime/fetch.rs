@@ -8,6 +8,7 @@
 //! data across builds, so the processed asset cache is scoped by cache key.
 
 use crate::discover::{self, AssetRef, AssetSource, DocumentScan};
+use crate::scan::next::NextConfig;
 use crate::scan::ScanResult;
 
 use super::cache::{self, AssetData};
@@ -37,12 +38,17 @@ pub fn asset_memory_cache() -> AssetMemoryCache {
     )))
 }
 
+#[derive(Default)]
 pub struct AssetScanOptions {
     pub concurrency: usize,
     pub use_processed_cache: bool,
     pub cache_key: Option<String>,
     pub allow_private: bool,
     pub memory: Option<AssetMemoryCache>,
+    /// Config extracted from the root HTML document. Sub-resources can't host
+    /// their own `__NEXT_DATA__`, so this is the only way RSC payloads get
+    /// locale and base-path information for route reconstruction.
+    pub next_config: Option<NextConfig>,
 }
 
 #[derive(Default)]
@@ -97,6 +103,7 @@ pub async fn scan_assets(
                 opts.cache_key.as_deref(),
                 opts.allow_private,
                 opts.memory.clone(),
+                opts.next_config.clone(),
             ));
         }
 
@@ -156,6 +163,7 @@ async fn fetch_scan(
     cache_key: Option<&str>,
     allow_private: bool,
     memory: Option<AssetMemoryCache>,
+    parent_config: Option<NextConfig>,
 ) -> Result<ScannedAsset, (AssetRef, FetchFailure)> {
     let mut cached = None;
     if use_cache {
@@ -179,7 +187,7 @@ async fn fetch_scan(
     }
 
     let validators = cached.as_ref().map(|asset_data| &asset_data.validators);
-    match fetch_asset_body(&client, asset.clone(), allow_private, validators)
+    match fetch_asset_body(&client, asset.clone(), allow_private, validators, parent_config)
         .await
         .map_err(|reason| (asset.clone(), reason))?
     {
@@ -253,6 +261,7 @@ async fn fetch_asset_body(
     asset: AssetRef,
     allow_private: bool,
     validators: Option<&cache::AssetValidators>,
+    parent_config: Option<NextConfig>,
 ) -> Result<FetchedBody, FetchFailure> {
     net::validate_url(&asset.url, allow_private).map_err(|_| FetchFailure::Other)?;
     let mut request = client.get(asset.url.clone());
@@ -300,9 +309,11 @@ async fn fetch_asset_body(
         .map_err(|_| FetchFailure::Other)?;
     let scan_url = asset.url.clone();
     let kind = asset.document_kind();
-    let scan = tokio::task::spawn_blocking(move || discover::scan_document(&body, &scan_url, kind))
-        .await
-        .map_err(|_| FetchFailure::Other)?;
+    let scan = tokio::task::spawn_blocking(move || {
+        discover::scan_document_with_config(&body, &scan_url, kind, parent_config.as_ref())
+    })
+    .await
+    .map_err(|_| FetchFailure::Other)?;
     Ok(FetchedBody::Body(scan, validators))
 }
 
@@ -360,6 +371,7 @@ mod tests {
                 cache_key: Some("b1".into()),
                 allow_private: true,
                 memory: Some(memory.clone()),
+                ..Default::default()
             },
             &mut first,
         )
@@ -378,6 +390,7 @@ mod tests {
                 cache_key: Some("b1".into()),
                 allow_private: true,
                 memory: Some(memory),
+                ..Default::default()
             },
             &mut second,
         )
@@ -419,6 +432,7 @@ mod tests {
                 cache_key: None,
                 allow_private: true,
                 memory: None,
+                ..Default::default()
             },
             &mut found,
         )

@@ -259,6 +259,62 @@ fn app_build_manifest_routes_decode_groups() {
 }
 
 #[test]
+fn flight_typed_walk_extracts_href_routes() {
+    let result = scan_html(
+        r#"<script>self.__next_f.push([1,"0:[\"$\",\"a\",null,{\"href\":\"/profile\",\"action\":\"/api/save\"}]\n"])</script>"#,
+    );
+    assert!(result.findings.routes.contains_key("/profile"));
+    assert!(
+        result.findings.routes.contains_key("/api/save")
+            || result.findings.apis.contains_key("/api/save"),
+        "got routes={:?} apis={:?}",
+        result.findings.routes.keys().collect::<Vec<_>>(),
+        result.findings.apis.keys().collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn flight_large_payload_is_not_truncated_at_64k() {
+    // Construct a flight push whose embedded payload exceeds the old 64KB cap.
+    let mut middle = String::with_capacity(80_000);
+    for i in 0..1500 {
+        middle.push_str(&format!("\\\"pad_{i}\\\":\\\"x\\\","));
+    }
+    let html = format!(
+        r#"<script>self.__next_f.push([1,"0:{{{middle}\"href\":\"/late-route\"}}\n"])</script>"#
+    );
+    let result = scan_html(&html);
+    assert!(
+        result.findings.routes.contains_key("/late-route"),
+        "large flight payload was truncated; routes={:?}",
+        result.findings.routes.keys().collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn scan_document_with_config_uses_parent_locale() {
+    use hifi::discover::scan_document_with_config;
+    use hifi::scan::next::NextConfig;
+    let cfg = NextConfig {
+        build_id: Some("b1".into()),
+        locales: vec!["en".into(), "fr".into()],
+        ..Default::default()
+    };
+    let base = url::Url::parse("https://example.com/fr/about.rsc").unwrap();
+    let result = scan_document_with_config(
+        br#"<form><input name="$ACTION_xyz"></form>"#,
+        &base,
+        hifi::discover::DocumentKind::Payload,
+        Some(&cfg),
+    );
+    assert!(
+        result.findings.apis.contains_key("/about"),
+        "got: {:?}",
+        result.findings.apis.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn app_router_route_groups_decoded_in_payload_route() {
     let base = url::Url::parse("https://example.com/(marketing)/about.rsc").unwrap();
     let result = scan_document(

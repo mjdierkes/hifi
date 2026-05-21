@@ -289,6 +289,7 @@ impl<'a> Processor<'a> {
                 cache_key: revision.clone(),
                 allow_private: cache_ctx.allow_private,
                 memory: cache_ctx.assets.clone(),
+                next_config: root_scan.next_config.clone(),
             },
             &mut found,
         )

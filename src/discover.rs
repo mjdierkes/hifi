@@ -43,7 +43,6 @@ const FRAMEWORK_DATA_MARKERS: &[&[u8]] = &[b"/_next/data/", b"/_payload.json", b
 const NEXT_MANIFESTS: &[&str] = &["_buildManifest.js", "_ssgManifest.js"];
 const NEXT_ACTION_MARKERS: &[&[u8]] = &[b"Next-Action", b"next-action", b"$ACTION_"];
 const NEXT_FLIGHT_MARKER: &[u8] = b"self.__next_f.push";
-const FLIGHT_SCAN_WINDOW: usize = 64 * 1024;
 
 static ASSET_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
     AhoCorasick::builder()
@@ -106,14 +105,32 @@ pub struct DocumentScan {
     pub assets: Vec<AssetRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_config: Option<NextConfig>,
 }
 
 pub fn scan_document(bytes: &[u8], base: &Url, kind: DocumentKind) -> DocumentScan {
-    let next_config = if kind == DocumentKind::Html {
+    scan_document_with_config(bytes, base, kind, None)
+}
+
+/// Variant of [`scan_document`] that accepts a parent-scan-derived `NextConfig`.
+/// Used when scanning sub-resources (RSC payloads, JSON manifests) that cannot
+/// host their own `__NEXT_DATA__` block but still need the page's locale and
+/// base path to reconstruct routes.
+pub fn scan_document_with_config(
+    bytes: &[u8],
+    base: &Url,
+    kind: DocumentKind,
+    parent_config: Option<&NextConfig>,
+) -> DocumentScan {
+    let mut next_config = if kind == DocumentKind::Html {
         next::parse_next_data(bytes)
     } else {
         None
     };
+    if next_config.is_none() {
+        next_config = parent_config.cloned();
+    }
     let next_context = next_config.is_some() || is_next_context(bytes, base);
     let revision = next_config
         .as_ref()
@@ -123,6 +140,7 @@ pub fn scan_document(bytes: &[u8], base: &Url, kind: DocumentKind) -> DocumentSc
         findings: crate::scan::scan_endpoints(bytes),
         assets: Vec::new(),
         revision,
+        next_config: next_config.clone(),
     };
     let mut seen = FxHashSet::default();
 
@@ -593,10 +611,18 @@ fn is_asset_token_delim(b: u8) -> bool {
 }
 
 fn scan_next_flight(bytes: &[u8], findings: &mut ScanResult) {
+    // First pass: typed walk of the React Flight payload extracts href, src,
+    // and action references with high precision (no quote-noise).
+    for route in next::extract_flight_routes(bytes) {
+        findings.routes.entry(route).or_default();
+    }
+    // Second pass kept for now: the legacy "scan every quoted string" sweep
+    // still catches API calls embedded inside flight strings that the typed
+    // walker doesn't decode. Bound by `</script>` per push, no fixed window.
     for pos in memchr::memmem::find_iter(bytes, NEXT_FLIGHT_MARKER) {
         let rest = &bytes[pos..];
-        let script_end = memchr::memmem::find(rest, b"</script>").unwrap_or(FLIGHT_SCAN_WINDOW);
-        let window = &rest[..script_end.min(FLIGHT_SCAN_WINDOW).min(rest.len())];
+        let script_end = memchr::memmem::find(rest, b"</script>").unwrap_or(rest.len());
+        let window = &rest[..script_end];
         let mut i = 0;
         while i < window.len() {
             let quote = window[i];
