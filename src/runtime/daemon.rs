@@ -27,6 +27,7 @@ use tokio::sync::{oneshot, Mutex};
 
 type Result<T = ()> = std::result::Result<T, DaemonError>;
 type Inflight = Arc<Mutex<FxHashMap<String, Vec<oneshot::Sender<Body>>>>>;
+const DAEMON_PROTOCOL: &str = "hifi-daemon-v1";
 const MAX_DAEMON_REQUEST_BYTES: usize = 8192;
 
 #[derive(Debug, Error)]
@@ -47,6 +48,74 @@ pub struct DaemonReply {
     pub stdout: String,
     #[serde(default)]
     pub stderr: String,
+}
+
+#[derive(Debug)]
+pub enum DaemonRequest {
+    Reply(DaemonReply),
+    StaleDaemon,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct DaemonIdentity {
+    version: String,
+    build: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireRequest {
+    protocol: String,
+    client: DaemonIdentity,
+    no_cache: bool,
+    url: String,
+}
+
+impl WireRequest {
+    fn scan(url: &str, no_cache: bool) -> Self {
+        Self {
+            protocol: DAEMON_PROTOCOL.to_string(),
+            client: current_identity(),
+            no_cache,
+            url: url.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireReply {
+    protocol: String,
+    daemon: DaemonIdentity,
+    status: WireStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply: Option<DaemonReply>,
+}
+
+impl WireReply {
+    fn ok(reply: DaemonReply) -> Self {
+        Self {
+            protocol: DAEMON_PROTOCOL.to_string(),
+            daemon: current_identity(),
+            status: WireStatus::Ok,
+            reply: Some(reply),
+        }
+    }
+
+    fn version_mismatch() -> Self {
+        Self {
+            protocol: DAEMON_PROTOCOL.to_string(),
+            daemon: current_identity(),
+            status: WireStatus::VersionMismatch,
+            reply: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireStatus {
+    Ok,
+    VersionMismatch,
 }
 
 #[derive(Clone)]
@@ -85,27 +154,72 @@ pub fn start() -> bool {
     std::env::current_exe()
         .ok()
         .and_then(|exe| {
-            Command::new(exe)
+            let mut command = Command::new(exe);
+            command
                 .arg("serve")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()
+                .stderr(Stdio::null());
+            detach_daemon(&mut command);
+            command.spawn().ok()
         })
         .is_some()
 }
 
-pub async fn request(url: &str, no_cache: bool) -> Option<DaemonReply> {
-    let mut stream = UnixStream::connect(socket_path()).await.ok()?;
-    stream.write_all(&[b'0' + no_cache as u8]).await.ok()?;
-    stream.write_all(url.as_bytes()).await.ok()?;
-    stream.shutdown().await.ok();
+#[cfg(unix)]
+fn detach_daemon(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_daemon(_command: &mut Command) {}
+
+pub async fn request(url: &str, no_cache: bool) -> DaemonRequest {
+    let mut stream = match UnixStream::connect(socket_path()).await {
+        Ok(stream) => stream,
+        Err(_) => return DaemonRequest::Unavailable,
+    };
+    let peer_pid = peer_pid(&stream);
+    let body = match serde_json::to_vec(&WireRequest::scan(url, no_cache)) {
+        Ok(body) => body,
+        Err(_) => return DaemonRequest::Unavailable,
+    };
+    if stream.write_all(&body).await.is_err() || stream.shutdown().await.is_err() {
+        return DaemonRequest::Unavailable;
+    }
 
     let mut buf = Vec::with_capacity(4096);
-    stream.read_to_end(&mut buf).await.ok()?;
-    let body = String::from_utf8(buf).ok()?;
-    serde_json::from_str(&body).ok()
+    if stream.read_to_end(&mut buf).await.is_err() {
+        return DaemonRequest::Unavailable;
+    }
+    let reply = match serde_json::from_slice::<WireReply>(&buf) {
+        Ok(reply) => reply,
+        Err(_) => {
+            retire_daemon(peer_pid);
+            return DaemonRequest::StaleDaemon;
+        }
+    };
+    if reply.protocol != DAEMON_PROTOCOL
+        || reply.daemon != current_identity()
+        || reply.status == WireStatus::VersionMismatch
+    {
+        retire_daemon(peer_pid);
+        return DaemonRequest::StaleDaemon;
+    }
+    match reply.reply {
+        Some(reply) => DaemonRequest::Reply(reply),
+        None => DaemonRequest::Unavailable,
+    }
 }
 
 pub async fn serve(client: Client, config: RuntimeConfig) -> Result {
@@ -133,6 +247,73 @@ fn socket_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| private_runtime_dir());
     dir.join("hifi.sock")
+}
+
+fn current_identity() -> DaemonIdentity {
+    DaemonIdentity {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build: env!("HIFI_BUILD_HASH").to_string(),
+    }
+}
+
+fn client_matches_daemon(client: &DaemonIdentity) -> bool {
+    *client == current_identity()
+}
+
+fn retire_daemon(peer_pid: Option<u32>) {
+    if let Some(pid) = peer_pid.filter(|pid| *pid != std::process::id()) {
+        terminate_process(pid);
+    }
+    let _ = std::fs::remove_file(socket_path());
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32) {
+    let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+}
+
+#[cfg(not(unix))]
+fn terminate_process(_pid: u32) {}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    use std::{mem, os::fd::AsRawFd};
+
+    let mut cred: libc::ucred = unsafe { mem::zeroed() };
+    let mut len = mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ok = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    } == 0;
+    (ok && cred.pid > 0).then_some(cred.pid as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    use std::{mem, os::fd::AsRawFd};
+
+    let mut pid: libc::pid_t = 0;
+    let mut len = mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let ok = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            &mut pid as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    } == 0;
+    (ok && pid > 0).then_some(pid as u32)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn peer_pid(_stream: &UnixStream) -> Option<u32> {
+    None
 }
 
 fn private_runtime_dir() -> PathBuf {
@@ -189,8 +370,26 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
         )
         .await;
     }
-    let no_cache = req.first() == Some(&b'1');
-    let url = std::str::from_utf8(req.get(1..).unwrap_or_default())?;
+    let wire = match serde_json::from_slice::<WireRequest>(&req) {
+        Ok(wire) if wire.protocol == DAEMON_PROTOCOL => wire,
+        _ => {
+            return reply_legacy(
+                &mut stream,
+                DaemonReply {
+                    exit_code: 2,
+                    stdout: String::new(),
+                    stderr: "hifi: daemon protocol mismatch; restart hifi\n".into(),
+                },
+            )
+            .await;
+        }
+    };
+    if !client_matches_daemon(&wire.client) {
+        reply_wire(&mut stream, WireReply::version_mismatch()).await?;
+        std::process::exit(0);
+    }
+    let no_cache = wire.no_cache;
+    let url = wire.url.as_str();
     if let Ok(parsed) = url::Url::parse(url) {
         if let Err(e) = super::net::validate_url(&parsed, state.config.allow_private) {
             return reply(
@@ -293,6 +492,16 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
 }
 
 async fn reply(stream: &mut UnixStream, body: DaemonReply) -> Result {
+    reply_wire(stream, WireReply::ok(body)).await
+}
+
+async fn reply_wire(stream: &mut UnixStream, body: WireReply) -> Result {
+    let body = serde_json::to_string(&body)?;
+    stream.write_all(body.as_bytes()).await?;
+    Ok(())
+}
+
+async fn reply_legacy(stream: &mut UnixStream, body: DaemonReply) -> Result {
     let body = serde_json::to_string(&body)?;
     stream.write_all(body.as_bytes()).await?;
     Ok(())
@@ -365,4 +574,27 @@ fn set_socket_private(path: &std::path::Path) -> io::Result<()> {
     }
     let _ = path;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_request_carries_current_identity() {
+        let request = WireRequest::scan("https://example.com/", true);
+
+        assert_eq!(request.protocol, DAEMON_PROTOCOL);
+        assert_eq!(request.client, current_identity());
+        assert!(request.no_cache);
+        assert_eq!(request.url, "https://example.com/");
+    }
+
+    #[test]
+    fn mismatched_client_identity_is_rejected() {
+        let mut stale = current_identity();
+        stale.build.push_str("-stale");
+
+        assert!(!client_matches_daemon(&stale));
+    }
 }

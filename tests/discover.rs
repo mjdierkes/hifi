@@ -63,6 +63,78 @@ fn next_html_revision_adds_manifests() {
 }
 
 #[test]
+fn non_next_build_id_does_not_create_revision_or_manifests() {
+    let result = scan_html(
+        r#"
+        <script>window.__APP_DATA__={"buildId":"viteish"};</script>
+        <script type="module" src="/assets/app.js"></script>
+    "#,
+    );
+    let assets = asset_urls(&result);
+
+    assert_eq!(result.revision, None);
+    assert!(assets.contains(&"https://example.com/assets/app.js".to_string()));
+    assert!(!assets
+        .iter()
+        .any(|asset| asset.contains("/_next/static/viteish/")));
+}
+
+#[test]
+fn next_payloads_and_rsc_prefetches_are_fetchable_assets() {
+    let result = scan_html(
+        r#"
+        <script>
+        const data="/_next/data/b1/dashboard.json";
+        const rsc="/dashboard?_rsc=abc";
+        const segment="/dashboard.segments/a.segment.rsc";
+        </script>
+    "#,
+    );
+    let assets = asset_urls(&result);
+
+    assert!(assets.contains(&"https://example.com/_next/data/b1/dashboard.json".to_string()));
+    assert!(assets.contains(&"https://example.com/dashboard?_rsc=abc".to_string()));
+    assert!(assets.contains(&"https://example.com/dashboard.segments/a.segment.rsc".to_string()));
+}
+
+#[test]
+fn next_manifests_follow_observed_static_mount() {
+    let result = scan_document(
+        br#"
+        <script id="__NEXT_DATA__" type="application/json">{"buildId":"b1"}</script>
+        <script src="https://cdn.example.com/docs/_next/static/chunks/app.js"></script>
+    "#,
+        &Url::parse("https://example.com/docs/").unwrap(),
+        DocumentKind::Html,
+    );
+    let assets = asset_urls(&result);
+
+    assert!(assets
+        .contains(&"https://cdn.example.com/docs/_next/static/b1/_buildManifest.js".to_string()));
+    assert!(assets
+        .contains(&"https://cdn.example.com/docs/_next/static/b1/_ssgManifest.js".to_string()));
+}
+
+#[test]
+fn next_flight_and_action_markers_add_browser_surface() {
+    let result = scan_document(
+        br#"
+        <script>self.__next_f.push([1,"fetch(\"/api/flight\",{method:\"POST\"})"])</script>
+        <form><input type="hidden" name="$ACTION_ID_abc"></form>
+    "#,
+        &Url::parse("https://example.com/checkout").unwrap(),
+        DocumentKind::Html,
+    );
+
+    assert_eq!(result.findings.apis["/api/flight"].methods_csv(), "POST");
+    assert_eq!(result.findings.apis["/checkout"].methods_csv(), "POST");
+    assert_eq!(
+        result.findings.apis["/checkout"].flags_csv(),
+        "body,next-action"
+    );
+}
+
+#[test]
 fn nuxt_and_angular_assets_are_generic_artifacts() {
     let result = scan_html(
         r#"

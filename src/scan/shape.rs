@@ -56,6 +56,8 @@ pub struct Shape {
     has_headers: bool,
     content_types: u8,
     auth: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    next_server_action: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     query_params: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -72,7 +74,7 @@ impl Shape {
     }
 
     pub fn flags_csv(&self) -> String {
-        let mut flags = Vec::with_capacity(6);
+        let mut flags = Vec::with_capacity(7);
         if self.has_body {
             flags.push("body");
         }
@@ -93,6 +95,9 @@ impl Shape {
         if !self.body_params.is_empty() {
             flags.push("body-shape");
         }
+        if self.next_server_action {
+            flags.push("next-action");
+        }
         flags.join(",")
     }
 
@@ -102,6 +107,7 @@ impl Shape {
         self.has_headers |= other.has_headers;
         self.content_types |= other.content_types;
         self.auth |= other.auth;
+        self.next_server_action |= other.next_server_action;
         for key in &other.query_params {
             push_unique_sorted(&mut self.query_params, key);
         }
@@ -129,6 +135,19 @@ impl Shape {
             push_unique_sorted(&mut self.query_params, key);
         }
     }
+
+    pub(crate) fn next_server_action() -> Self {
+        Self {
+            methods: METHOD_POST,
+            has_body: true,
+            next_server_action: true,
+            ..Self::default()
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 // Shape extraction is deliberately heuristic. It should capture useful request

@@ -294,16 +294,22 @@ fn render_flat(json: &str) -> String {
 }
 
 async fn daemon_output(url: &str, no_cache: bool, mode: OutputMode) -> Option<daemon::DaemonReply> {
-    if let Some(mut out) = daemon::request(url, no_cache).await {
-        render_daemon_reply(&mut out, mode);
-        return Some(out);
+    match daemon::request(url, no_cache).await {
+        daemon::DaemonRequest::Reply(mut out) => {
+            render_daemon_reply(&mut out, mode);
+            return Some(out);
+        }
+        daemon::DaemonRequest::StaleDaemon | daemon::DaemonRequest::Unavailable => {}
     }
     if daemon::start() {
-        for _ in 0..20 {
+        for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(25));
-            if let Some(mut out) = daemon::request(url, no_cache).await {
-                render_daemon_reply(&mut out, mode);
-                return Some(out);
+            match daemon::request(url, no_cache).await {
+                daemon::DaemonRequest::Reply(mut out) => {
+                    render_daemon_reply(&mut out, mode);
+                    return Some(out);
+                }
+                daemon::DaemonRequest::StaleDaemon | daemon::DaemonRequest::Unavailable => {}
             }
         }
     }

@@ -246,6 +246,9 @@ async fn fetch_asset_body(
 ) -> Result<FetchedBody, ()> {
     net::validate_url(&asset.url, allow_private).map_err(|_| ())?;
     let mut request = client.get(asset.url.clone());
+    if is_next_rsc_payload(&asset.url) {
+        request = request.header("RSC", "1");
+    }
     if let Some(validators) = validators {
         if let Some(etag) = &validators.etag {
             request = request.header(IF_NONE_MATCH, etag);
@@ -286,6 +289,13 @@ async fn fetch_asset_body(
         .await
         .map_err(|_| ())?;
     Ok(FetchedBody::Body(scan, validators))
+}
+
+fn is_next_rsc_payload(url: &Url) -> bool {
+    url.path().ends_with(".rsc")
+        || url
+            .query_pairs()
+            .any(|(key, _)| key.eq_ignore_ascii_case("_rsc"))
 }
 
 fn asset_validators(headers: &HeaderMap) -> cache::AssetValidators {

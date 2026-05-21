@@ -16,6 +16,8 @@ use std::{
 };
 use url::Url;
 
+const SCANNER_CACHE_VERSION: &str = env!("HIFI_BUILD_HASH");
+
 pub fn fingerprint_assets(assets: &[AssetRef]) -> String {
     let mut paths: Vec<&str> = assets.iter().map(|asset| asset.url.path()).collect();
     paths.sort();
@@ -37,7 +39,7 @@ fn hash_parts<'a>(parts: impl Iterator<Item = &'a str>) -> u64 {
 }
 
 pub fn path_for(base: &Url) -> PathBuf {
-    hashed_path("processed", base, "json")
+    scanner_hashed_path("processed", base, None, "json")
 }
 
 pub type AssetData = DocumentScan;
@@ -101,7 +103,7 @@ pub fn write_page(url: &Url, final_url: &Url, bytes: &[u8]) {
 }
 
 fn asset_path_for(url: &Url, cache_key: Option<&str>) -> PathBuf {
-    keyed_hashed_path("assets", url, cache_key, "json")
+    scanner_hashed_path("assets", url, cache_key, "json")
 }
 
 fn page_path_for(url: &Url) -> PathBuf {
@@ -116,8 +118,12 @@ fn hashed_path(kind: &str, url: &Url, ext: &str) -> PathBuf {
         .join(format!("{hash:016x}.{ext}"))
 }
 
-fn keyed_hashed_path(kind: &str, url: &Url, cache_key: Option<&str>, ext: &str) -> PathBuf {
-    let hash = hash_parts(cache_key.into_iter().chain(std::iter::once(url.as_str())));
+fn scanner_hashed_path(kind: &str, url: &Url, cache_key: Option<&str>, ext: &str) -> PathBuf {
+    let hash = hash_parts(
+        std::iter::once(SCANNER_CACHE_VERSION)
+            .chain(cache_key)
+            .chain(std::iter::once(url.as_str())),
+    );
     dir()
         .join(kind)
         .join(host(url))

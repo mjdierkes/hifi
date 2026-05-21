@@ -32,6 +32,7 @@ pub(crate) fn is_url_like(s: &str) -> bool {
         && s != "/"
         && !has_bare_dynamic_suffix(s)
         && !bad_ext(bytes, BAD_EXTS, false)
+        && !has_markup_noise(bytes)
         && bytes.iter().any(u8::is_ascii_alphanumeric)
 }
 
@@ -59,6 +60,32 @@ fn is_route_like(s: &str) -> bool {
         && !s.starts_with("//")
         && bytes.iter().any(u8::is_ascii_alphanumeric)
         && !bad_ext(bytes, ROUTE_BAD_EXTS, true)
+        && !has_markup_noise(bytes)
+}
+
+// Reject strings that contain raw or percent-encoded markup. They are
+// produced by inline SVG/HTML literals (e.g. Next.js's blur-SVG generator
+// emitting "...%3E%3CfeGaussianBlur..."), never by real route or URL literals.
+fn has_markup_noise(bytes: &[u8]) -> bool {
+    if bytes
+        .iter()
+        .any(|b| matches!(*b, b'<' | b'>' | b'"' | b'\'' | b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        return true;
+    }
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'%' {
+            // %3C/%3E = <,>  %22 = "  %27 = '
+            match (bytes[i + 1], bytes[i + 2] | 0x20) {
+                (b'3', b'c') | (b'3', b'e') => return true,
+                (b'2', b'2') | (b'2', b'7') => return true,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn has_bare_dynamic_suffix(s: &str) -> bool {
