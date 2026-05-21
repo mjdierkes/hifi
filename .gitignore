@@ -1,1 +1,4 @@
 /target
+samply-profile*.json
+*.profraw
+.DS_Store
