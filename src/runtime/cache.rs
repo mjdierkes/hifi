@@ -200,6 +200,28 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     meta.into()
 }
 
+/// Hostnames present in the on-disk cache, sorted and deduplicated across cache kinds.
+/// Used by shell completion to suggest previously scanned sites.
+pub fn cached_hosts() -> Vec<String> {
+    let mut hosts = std::collections::BTreeSet::new();
+    for kind in ["processed", "pages", "assets"] {
+        let Ok(entries) = fs::read_dir(dir().join(kind)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                if !name.is_empty() && name != "unknown" {
+                    hosts.insert(name.to_string());
+                }
+            }
+        }
+    }
+    hosts.into_iter().collect()
+}
+
 fn dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".cache/hifi")
