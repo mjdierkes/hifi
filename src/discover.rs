@@ -6,7 +6,7 @@
 //! the runtime to schedule and deduplicate.
 
 use crate::scan::next::{self, NextConfig};
-use crate::scan::{ScanResult, Shape};
+use crate::scan::{FindingSource, ScanResult, Shape};
 use crate::source::{self, TemplateMode};
 use aho_corasick::{AhoCorasick, MatchKind};
 use rustc_hash::FxHashSet;
@@ -146,7 +146,9 @@ pub fn scan_document_with_config(
 
     if let Some(routes) = parse_manifest_routes(bytes, base, kind) {
         for route in routes {
-            out.findings.routes.entry(route).or_default();
+            out.findings.routes.entry(route.clone()).or_default();
+            out.findings
+                .bump_provenance(route, FindingSource::ManifestParsed);
         }
     }
 
@@ -614,7 +616,8 @@ fn scan_next_flight(bytes: &[u8], findings: &mut ScanResult) {
     // First pass: typed walk of the React Flight payload extracts href, src,
     // and action references with high precision (no quote-noise).
     for route in next::extract_flight_routes(bytes) {
-        findings.routes.entry(route).or_default();
+        findings.routes.entry(route.clone()).or_default();
+        findings.bump_provenance(route, FindingSource::FlightTyped);
     }
     // Second pass kept for now: the legacy "scan every quoted string" sweep
     // still catches API calls embedded inside flight strings that the typed
@@ -662,9 +665,10 @@ fn scan_next_server_action(
     };
     findings
         .apis
-        .entry(route)
+        .entry(route.clone())
         .or_default()
         .merge(&Shape::next_server_action());
+    findings.bump_provenance(route, FindingSource::ServerAction);
 }
 
 fn next_route_from_payload(base: &Url, config: Option<&NextConfig>) -> Option<String> {

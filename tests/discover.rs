@@ -259,6 +259,63 @@ fn app_build_manifest_routes_decode_groups() {
 }
 
 #[test]
+fn provenance_tags_distinguish_finding_sources() {
+    use hifi::scan::FindingSource;
+    let base = url::Url::parse("https://example.com/_next/static/b1/app-build-manifest.json")
+        .unwrap();
+    let result = scan_document(
+        br#"{"pages":{"/dashboard/page":["a.js"]}}"#,
+        &base,
+        hifi::discover::DocumentKind::Manifest,
+    );
+    assert_eq!(
+        result.findings.provenance.get("/dashboard"),
+        Some(&FindingSource::ManifestParsed),
+    );
+    assert!(FindingSource::ManifestParsed.is_high_confidence());
+    assert!(!FindingSource::Literal.is_high_confidence());
+}
+
+#[test]
+fn provenance_promotes_to_highest_seen_source() {
+    use hifi::scan::FindingSource;
+    // The same route appears both as a literal-grep candidate and as a typed
+    // flight href. Provenance should reflect the higher-confidence source.
+    let result = scan_html(
+        r#"<script>const r="/dashboard";</script><script>self.__next_f.push([1,"0:{\"href\":\"/dashboard\"}"])</script>"#,
+    );
+    assert_eq!(
+        result.findings.provenance.get("/dashboard"),
+        Some(&FindingSource::FlightTyped),
+    );
+}
+
+#[test]
+fn server_action_is_marked_high_confidence() {
+    use hifi::scan::FindingSource;
+    let base = url::Url::parse("https://example.com/checkout").unwrap();
+    let result = scan_document(
+        br#"<form><input name="$ACTION_xyz"></form>"#,
+        &base,
+        hifi::discover::DocumentKind::Html,
+    );
+    assert_eq!(
+        result.findings.provenance.get("/checkout"),
+        Some(&FindingSource::ServerAction),
+    );
+}
+
+#[test]
+fn api_call_sites_record_api_call_provenance() {
+    use hifi::scan::FindingSource;
+    let result = scan_html(r#"<script>fetch("/api/widgets",{method:"POST"})</script>"#);
+    assert_eq!(
+        result.findings.provenance.get("/api/widgets"),
+        Some(&FindingSource::ApiCall),
+    );
+}
+
+#[test]
 fn flight_typed_walk_extracts_href_routes() {
     let result = scan_html(
         r#"<script>self.__next_f.push([1,"0:[\"$\",\"a\",null,{\"href\":\"/profile\",\"action\":\"/api/save\"}]\n"])</script>"#,

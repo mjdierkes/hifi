@@ -6,7 +6,7 @@
 //! assets, then build display output.
 
 use crate::discover::{self, DocumentKind};
-use crate::scan::{ApiMap, CandidateMap, RouteMap};
+use crate::scan::{ApiMap, CandidateMap, ProvenanceMap, RouteMap};
 
 use super::{cache, config::RuntimeConfig, fetch, net};
 use lru::LruCache;
@@ -49,6 +49,10 @@ pub struct Output {
     pub routes: RouteMap,
     #[serde(default, skip_serializing_if = "CandidateMap::is_empty")]
     pub candidates: CandidateMap,
+    /// Per-finding provenance: how each URL entered the result. Consumers can
+    /// filter to the high-confidence subset by inspecting `is_high_confidence`.
+    #[serde(default, skip_serializing_if = "ProvenanceMap::is_empty")]
+    pub provenance: ProvenanceMap,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
     #[serde(default, skip_serializing_if = "CacheStatus::is_stored")]
@@ -59,6 +63,35 @@ pub struct Output {
     pub elapsed_us: Option<u128>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+impl Output {
+    /// Subset of `apis` derived from high-confidence provenance sources
+    /// (manifests, HTML attributes, typed flight, explicit call sites, server
+    /// actions). Useful when you want the precision-first slice without
+    /// post-processing.
+    pub fn high_confidence_apis(&self) -> ApiMap {
+        self.apis
+            .iter()
+            .filter(|(url, _)| self.is_high_confidence(url))
+            .map(|(url, shape)| (url.clone(), shape.clone()))
+            .collect()
+    }
+
+    pub fn high_confidence_routes(&self) -> RouteMap {
+        self.routes
+            .iter()
+            .filter(|(url, _)| self.is_high_confidence(url))
+            .map(|(url, _)| (url.clone(), ()))
+            .collect()
+    }
+
+    fn is_high_confidence(&self, url: &str) -> bool {
+        self.provenance
+            .get(url)
+            .map(|source| source.is_high_confidence())
+            .unwrap_or(false)
+    }
 }
 
 impl Output {
@@ -301,6 +334,7 @@ impl<'a> Processor<'a> {
                 apis: found.apis,
                 routes: found.routes,
                 candidates: found.candidates,
+                provenance: found.provenance,
                 revision,
                 cache: CacheStatus::Miss,
                 cache_age_secs: None,
