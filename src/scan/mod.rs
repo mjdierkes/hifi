@@ -27,7 +27,7 @@ pub type ApiMap = FxHashMap<String, Shape>;
 pub type CandidateMap = FxHashMap<String, ()>;
 pub type RouteMap = FxHashMap<String, ()>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
     Api,
@@ -35,7 +35,7 @@ pub enum EvidenceKind {
     Candidate,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Extractor {
     Literal,
@@ -46,7 +46,7 @@ pub enum Extractor {
     ServerAction,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Confidence {
     Observed,

@@ -6,7 +6,7 @@
 //! assets, then build display output.
 
 use crate::discover::{self, DocumentKind};
-use crate::scan::{ApiMap, CandidateMap, Evidence, RouteMap};
+use crate::scan::Evidence;
 
 use super::{cache, config::RuntimeConfig, fetch, net};
 use lru::LruCache;
@@ -55,36 +55,6 @@ pub struct Output {
     pub elapsed_us: Option<u128>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
-}
-
-impl Output {
-    pub fn apis(&self) -> ApiMap {
-        let mut out = ApiMap::default();
-        for evidence in &self.evidence {
-            if evidence.kind == crate::scan::EvidenceKind::Api {
-                if let Some(shape) = &evidence.shape {
-                    out.entry(evidence.url.clone()).or_default().merge(shape);
-                }
-            }
-        }
-        out
-    }
-
-    pub fn routes(&self) -> RouteMap {
-        self.evidence
-            .iter()
-            .filter(|e| e.kind == crate::scan::EvidenceKind::Route)
-            .map(|e| (e.url.clone(), ()))
-            .collect()
-    }
-
-    pub fn candidates(&self) -> CandidateMap {
-        self.evidence
-            .iter()
-            .filter(|e| e.kind == crate::scan::EvidenceKind::Candidate)
-            .map(|e| (e.url.clone(), ()))
-            .collect()
-    }
 }
 
 impl Output {
@@ -442,8 +412,16 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(out.apis().contains_key("/api/from-chunk"));
-        assert!(out.candidates().contains_key("/api/from-manifest"));
+        assert!(has_evidence(
+            &out,
+            crate::scan::EvidenceKind::Api,
+            "/api/from-chunk"
+        ));
+        assert!(has_evidence(
+            &out,
+            crate::scan::EvidenceKind::Candidate,
+            "/api/from-manifest"
+        ));
     }
 
     #[tokio::test]
@@ -475,8 +453,16 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(out.apis().contains_key("/api/from-generic-script"));
-        assert!(out.candidates().contains_key("/api/from-html-asset"));
+        assert!(has_evidence(
+            &out,
+            crate::scan::EvidenceKind::Api,
+            "/api/from-generic-script"
+        ));
+        assert!(has_evidence(
+            &out,
+            crate::scan::EvidenceKind::Candidate,
+            "/api/from-html-asset"
+        ));
     }
 
     #[test]
@@ -535,7 +521,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(out.apis().contains_key("/api/ok"));
+        assert!(has_evidence(
+            &out,
+            crate::scan::EvidenceKind::Api,
+            "/api/ok"
+        ));
         assert_eq!(
             out.warnings,
             vec!["failed to read 1 assets; results may be incomplete"]
@@ -570,9 +560,27 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(first.apis().contains_key("/api/first"));
-        assert!(second.apis().contains_key("/api/second"));
-        assert!(!second.apis().contains_key("/api/first"));
+        assert!(has_evidence(
+            &first,
+            crate::scan::EvidenceKind::Api,
+            "/api/first"
+        ));
+        assert!(has_evidence(
+            &second,
+            crate::scan::EvidenceKind::Api,
+            "/api/second"
+        ));
+        assert!(!has_evidence(
+            &second,
+            crate::scan::EvidenceKind::Api,
+            "/api/first"
+        ));
+    }
+
+    fn has_evidence(out: &Output, kind: crate::scan::EvidenceKind, url: &str) -> bool {
+        out.evidence
+            .iter()
+            .any(|evidence| evidence.kind == kind && evidence.url == url)
     }
 
     async fn serve(

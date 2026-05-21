@@ -369,14 +369,6 @@ fn route_from_app_key(key: &str) -> String {
     }
 }
 
-/// Extract middleware matcher patterns from `middleware-manifest.json`.
-/// Matchers may appear at the top level or nested per-middleware; the manifest
-/// shape has shifted across Next versions so we accept both.
-pub fn parse_middleware_manifest(bytes: &[u8]) -> Vec<String> {
-    let _ = bytes;
-    Vec::new()
-}
-
 /// Pull server action IDs and their backing routes from
 /// `_clientReferenceManifest.json`. The exact shape varies by Next version, so
 /// we walk the structure defensively and collect any `name`/`id` pairs that
@@ -616,12 +608,5 @@ mod tests {
         let html = br#"<script>self.__next_f.push([1,"0:[\"$L1\",null,{\"foo\":\"not a route\",\"href\":\"http://other.example.com\"}]"])</script>"#;
         let routes = extract_flight_routes(html);
         assert!(routes.is_empty(), "got: {routes:?}");
-    }
-
-    #[test]
-    fn parses_middleware_matchers() {
-        let src = br#"{"middleware":{"/":{"matchers":[{"regexp":"^/dashboard(?:/.*)?$"}]}}}"#;
-        let matchers = parse_middleware_manifest(src);
-        assert!(matchers.is_empty());
     }
 }

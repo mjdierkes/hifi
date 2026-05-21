@@ -301,30 +301,40 @@ fn render_warnings(out: &Output) {
 }
 
 fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
-    let apis = v.apis();
-    let mut keys: Vec<&String> = apis.keys().collect();
-    keys.sort_unstable();
-    for k in keys {
-        let shape = &apis[k];
-        writeln!(
-            out,
-            "{}\t{}\t{}\tobserved",
-            shape.methods_csv(),
-            escape_terminal(k),
-            shape.flags_csv()
-        )?;
-    }
-    let candidates = v.candidates();
-    let mut keys: Vec<&String> = candidates.keys().collect();
-    keys.sort_unstable();
-    for k in keys {
-        writeln!(out, "?\t{}\t\tcandidate", escape_terminal(k))?;
-    }
-    let routes = v.routes();
-    let mut keys: Vec<&String> = routes.keys().collect();
-    keys.sort_unstable();
-    for k in keys {
-        writeln!(out, "route\t{}\t\tobserved", escape_terminal(k))?;
+    let mut rows: Vec<_> = v.evidence.iter().collect();
+    rows.sort_by_key(|e| (e.kind, e.url.as_str(), e.extractor));
+    for evidence in rows {
+        match evidence.kind {
+            crate::scan::EvidenceKind::Api => {
+                let Some(shape) = &evidence.shape else {
+                    continue;
+                };
+                writeln!(
+                    out,
+                    "{}\t{}\t{}\t{:?}",
+                    shape.methods_csv(),
+                    escape_terminal(&evidence.url),
+                    shape.flags_csv(),
+                    evidence.confidence
+                )?;
+            }
+            crate::scan::EvidenceKind::Candidate => {
+                writeln!(
+                    out,
+                    "?\t{}\t\t{:?}",
+                    escape_terminal(&evidence.url),
+                    evidence.confidence
+                )?;
+            }
+            crate::scan::EvidenceKind::Route => {
+                writeln!(
+                    out,
+                    "route\t{}\t\t{:?}",
+                    escape_terminal(&evidence.url),
+                    evidence.confidence
+                )?;
+            }
+        }
     }
     Ok(())
 }

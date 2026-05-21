@@ -54,8 +54,6 @@ pub struct Shape {
     next_server_action: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     query_params: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    body_params: Vec<String>,
 }
 
 impl Shape {
@@ -68,7 +66,7 @@ impl Shape {
     }
 
     pub fn flags_csv(&self) -> String {
-        let mut flags = Vec::with_capacity(7);
+        let mut flags = Vec::with_capacity(6);
         if self.has_body {
             flags.push("body");
         }
@@ -86,9 +84,6 @@ impl Shape {
         if !self.query_params.is_empty() {
             flags.push("query");
         }
-        if !self.body_params.is_empty() {
-            flags.push("body-shape");
-        }
         if self.next_server_action {
             flags.push("next-action");
         }
@@ -104,9 +99,6 @@ impl Shape {
         self.next_server_action |= other.next_server_action;
         for key in &other.query_params {
             push_unique_sorted(&mut self.query_params, key);
-        }
-        for key in &other.body_params {
-            push_unique_sorted(&mut self.body_params, key);
         }
     }
 
@@ -257,84 +249,9 @@ fn apply_second_arg_body_shape(bytes: &[u8], start: usize, shape: &mut Shape) {
         return;
     }
     shape.has_body = true;
-    if let Some(keys) = object_keys(bytes, i) {
+    if bytes.get(i) == Some(&b'{') {
         shape.content_types |= CONTENT_JSON;
-        for key in keys {
-            push_unique_sorted(&mut shape.body_params, &key);
-        }
     }
-}
-
-// Supported object forms are deliberately small: `{ key }`, `{ key: value }`,
-// and quoted keys at the top level. Nested objects are skipped structurally so
-// the result describes the request body surface, not every nested value.
-fn object_keys(bytes: &[u8], start: usize) -> Option<Vec<String>> {
-    if bytes.get(start) != Some(&b'{') {
-        return None;
-    }
-    let mut keys = Vec::new();
-    let mut i = start + 1;
-    let mut depth = 1usize;
-    let mut read_key = true;
-    while i < bytes.len() && depth > 0 {
-        match bytes[i] {
-            b'{' | b'[' | b'(' => {
-                depth += 1;
-                i += 1;
-            }
-            b'}' | b']' | b')' => {
-                depth -= 1;
-                i += 1;
-                read_key = depth == 1;
-            }
-            b'"' | b'\'' | b'`' => {
-                if depth == 1 && read_key {
-                    let quote = bytes[i];
-                    if let Some(end) = source::quoted_end(bytes, i + 1, quote) {
-                        let key = std::str::from_utf8(&bytes[i + 1..end]).ok()?.to_string();
-                        let after = source::skip_ws(bytes, end + 1);
-                        if bytes.get(after) == Some(&b':') {
-                            keys.push(key);
-                            read_key = false;
-                        }
-                        i = end + 1;
-                    } else {
-                        return Some(keys);
-                    }
-                } else {
-                    i = source::quoted_end(bytes, i + 1, bytes[i])
-                        .map(|end| end + 1)
-                        .unwrap_or(bytes.len());
-                }
-            }
-            b',' if depth == 1 => {
-                read_key = true;
-                i += 1;
-            }
-            b':' if depth == 1 => {
-                read_key = false;
-                i += 1;
-            }
-            b if depth == 1 && read_key && (b == b'_' || b == b'$' || b.is_ascii_alphabetic()) => {
-                let key_start = i;
-                i += 1;
-                while bytes
-                    .get(i)
-                    .is_some_and(|b| *b == b'_' || *b == b'$' || b.is_ascii_alphanumeric())
-                {
-                    i += 1;
-                }
-                let key = std::str::from_utf8(&bytes[key_start..i]).ok()?.to_string();
-                let after = source::skip_ws(bytes, i);
-                if matches!(bytes.get(after), Some(b':' | b',' | b'}')) {
-                    keys.push(key);
-                    read_key = !matches!(bytes.get(after), Some(b':'));
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    Some(keys)
 }
 
 fn method_hint(anchor: &str) -> u8 {

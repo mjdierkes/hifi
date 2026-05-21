@@ -1,12 +1,10 @@
 use hifi::scan::{scan_endpoints, ScanResult};
-use serde_json::Value;
-
 #[rustfmt::skip]
 const API_CASES: &[(&str, &str, &str, &str)] = &[
     (r#"fetch("/api/users", {method:"POST", body:x, headers:{"Content-Type":"application/json"}})"#, "/api/users", "POST", "body,headers,json"),
     (r#"fetch("/api/users?team=red&page=1", { method: "post", body: new URLSearchParams() })"#, "/api/users", "POST", "body,urlencoded,query"),
     (r#"fetch("/api/ping", { method: "HEAD" }); fetch("/api/cors", { method: "OPTIONS" });"#, "/api/ping", "HEAD", ""),
-    (r#"axios.post(`/machines/${id}/image`, { name: imageName })"#, "/machines/{dynamic}/image", "POST", "body,json,body-shape"),
+    (r#"axios.post(`/machines/${id}/image`, { name: imageName })"#, "/machines/{dynamic}/image", "POST", "body,json"),
     (r#"ky.get(`/server-types?provider=${provider}`)"#, "/server-types", "GET", "query"),
 ];
 
@@ -28,21 +26,6 @@ fn ignores_non_urls_and_assets() {
     let apis = result.api_map();
     assert_eq!(apis.len(), 1);
     assert!(apis.contains_key("/api/users"));
-}
-
-#[test]
-fn body_shape_records_static_object_keys() {
-    let result = scan(r#"axios.patch("/account/password", { current_password, new_password })"#);
-    let apis = result.api_map();
-    let json = serde_json::to_value(&apis["/account/password"]).unwrap();
-
-    assert_eq!(
-        json.get("body_params").and_then(Value::as_array).unwrap(),
-        &vec![
-            Value::String("current_password".into()),
-            Value::String("new_password".into())
-        ]
-    );
 }
 
 #[test]
