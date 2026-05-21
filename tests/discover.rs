@@ -259,6 +259,44 @@ fn app_build_manifest_routes_decode_groups() {
 }
 
 #[test]
+fn comment_and_identifier_substrings_are_not_assets() {
+    // Without quoted-string context, these regions look like asset
+    // literals after walk_token_start. They should now be rejected.
+    let result = scan_html(
+        r#"
+        <script>
+        // /_next/data/b1/notes.json -- comment, not a real URL
+        var path = _next_data_lookup(/_next/data/b1/inline);
+        const valid = "/_next/data/b1/dashboard.json";
+        </script>
+    "#,
+    );
+    assert!(result
+        .findings
+        .candidates
+        .contains_key("/_next/data/b1/dashboard.json"));
+    assert!(!result.findings.candidates.contains_key("/_next/data/b1/notes.json"));
+    assert!(!result.findings.candidates.contains_key("/_next/data/b1/inline"));
+}
+
+#[test]
+fn next_15_instrumentation_chunks_are_skipped() {
+    let base = url::Url::parse("https://example.com/").unwrap();
+    let result = scan_document(
+        br#"<script src="/_next/static/chunks/instrumentation-abc.js"></script>"#,
+        &base,
+        hifi::discover::DocumentKind::Html,
+    );
+    let assets = asset_urls(&result);
+    assert!(
+        !assets
+            .iter()
+            .any(|url| url.contains("instrumentation-abc.js")),
+        "Next 15 instrumentation chunk leaked through: {assets:?}",
+    );
+}
+
+#[test]
 fn provenance_tags_distinguish_finding_sources() {
     use hifi::scan::FindingSource;
     let base = url::Url::parse("https://example.com/_next/static/b1/app-build-manifest.json")

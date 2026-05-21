@@ -38,6 +38,9 @@ const NEXT_SKIP_FRAGMENTS: &[&str] = &[
     "[next]_internal_",
     "react-refresh",
     "next/dist/",
+    "instrumentation-",
+    "app-pages-internals-",
+    "app-client-internals-",
 ];
 const FRAMEWORK_DATA_MARKERS: &[&[u8]] = &[b"/_next/data/", b"/_payload.json", b"/__data.json"];
 const NEXT_MANIFESTS: &[&str] = &["_buildManifest.js", "_ssgManifest.js"];
@@ -269,6 +272,13 @@ fn scan_literal_assets(
 ) {
     for m in ASSET_AC.find_iter(bytes) {
         let start = source::walk_token_start(bytes, m.start());
+        // Reject tokens that aren't preceded by a string-literal delimiter.
+        // Comment substrings, property accesses, and identifier prefixes look
+        // identical to real URL literals after `walk_token_start` and produce
+        // the bulk of the regular tier's false positives.
+        if !is_string_literal_context(bytes, start) {
+            continue;
+        }
         let Some(raw) = asset_token_string(bytes, start) else {
             continue;
         };
@@ -277,6 +287,10 @@ fn scan_literal_assets(
         }
         push_asset(base, &raw, next_context, AssetSource::Literal, seen, out);
     }
+}
+
+fn is_string_literal_context(bytes: &[u8], start: usize) -> bool {
+    start > 0 && matches!(bytes[start - 1], b'"' | b'\'' | b'`')
 }
 
 fn scan_dynamic_assets(
@@ -309,6 +323,9 @@ fn push_framework_candidates(bytes: &[u8], findings: &mut ScanResult) {
     for marker in FRAMEWORK_DATA_MARKERS {
         for pos in memchr::memmem::find_iter(bytes, marker) {
             let start = source::walk_token_start(bytes, pos);
+            if !is_string_literal_context(bytes, start) {
+                continue;
+            }
             if let Some(raw) = asset_token_string(bytes, start) {
                 push_candidate(findings, &raw);
             }
