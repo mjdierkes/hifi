@@ -1,12 +1,25 @@
 use super::AppError;
 use crate::runtime::cache;
+use std::fs;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Shell {
     Bash,
     Zsh,
     Fish,
+}
+
+impl Shell {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "bash" => Some(Shell::Bash),
+            "zsh" => Some(Shell::Zsh),
+            "fish" => Some(Shell::Fish),
+            _ => None,
+        }
+    }
 }
 
 pub fn parse_completions(rest: &[String]) -> Result<Shell, AppError> {
@@ -16,12 +29,20 @@ pub fn parse_completions(rest: &[String]) -> Result<Shell, AppError> {
     if rest.len() > 1 {
         return Err(format!("unexpected argument '{}' (try --help)", rest[1]).into());
     }
-    match shell.as_str() {
-        "bash" => Ok(Shell::Bash),
-        "zsh" => Ok(Shell::Zsh),
-        "fish" => Ok(Shell::Fish),
-        other => Err(format!("unsupported shell '{other}' (use bash, zsh, or fish)").into()),
+    Shell::parse(shell)
+        .ok_or_else(|| format!("unsupported shell '{shell}' (use bash, zsh, or fish)").into())
+}
+
+pub fn parse_install(rest: &[String]) -> Result<Option<Shell>, AppError> {
+    if rest.is_empty() {
+        return Ok(None);
     }
+    if rest.len() > 1 {
+        return Err(format!("unexpected argument '{}' (try --help)", rest[1]).into());
+    }
+    Shell::parse(&rest[0])
+        .map(Some)
+        .ok_or_else(|| format!("unsupported shell '{}' (use bash, zsh, or fish)", rest[0]).into())
 }
 
 pub fn print_host_completions(prefix: &str) {
@@ -34,6 +55,120 @@ pub fn print_host_completions(prefix: &str) {
     }
 }
 
+// Suggest paths for the second positional arg by reading the cached scan
+// output for `url`. We surface both top-level resource prefixes (e.g.
+// `/machines`) and every concrete route, so the user can `<Tab>` through to
+// any nested path.
+pub fn print_path_completions(url: &str, prefix: &str) {
+    let stdout = io::stdout();
+    let mut stdout = io::BufWriter::new(stdout.lock());
+    let Some((parsed, candidates, should_persist)) = cached_completion_candidates(url) else {
+        return;
+    };
+    for path in &candidates {
+        if path.starts_with(prefix) {
+            let _ = writeln!(stdout, "{path}");
+        }
+    }
+    if should_persist {
+        cache::write_completion_candidates(&parsed, &candidates);
+    }
+}
+
+fn cached_completion_candidates(url: &str) -> Option<(url::Url, Vec<String>, bool)> {
+    let parsed = normalized_url(url)?;
+    if let Some(candidates) = cache::read_completion_candidates(&parsed) {
+        return Some((parsed, candidates, false));
+    }
+    let paths = cached_paths(&parsed)?;
+    Some((parsed, path_completion_candidates(&paths), true))
+}
+
+// Read every cached scan we have for the host (the cache path is keyed by
+// build hash, so a rebuild orphans the previous file — for completion we just
+// want any recent surface, so union them all).
+fn cached_paths(parsed: &url::Url) -> Option<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        value: crate::runtime::processor::Output,
+    }
+
+    let primary = cache::path_for(parsed);
+    let host_dir = primary.parent()?;
+
+    let mut paths = Vec::new();
+    let entries = fs::read_dir(host_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(envelope) = serde_json::from_slice::<Envelope>(&bytes) else {
+            continue;
+        };
+        for evidence in envelope.value.evidence {
+            if matches!(
+                evidence.kind,
+                crate::scan::EvidenceKind::Route | crate::scan::EvidenceKind::Api
+            ) {
+                paths.push(evidence.url);
+            }
+        }
+    }
+    if paths.is_empty() {
+        return None;
+    }
+    Some(paths)
+}
+
+fn normalized_url(url: &str) -> Option<url::Url> {
+    let normalized = super::normalize_url(url).ok()?;
+    url::Url::parse(&normalized).ok()
+}
+
+fn path_completion_candidates(paths: &[String]) -> Vec<String> {
+    let mut set = std::collections::BTreeSet::<String>::new();
+    for raw in paths {
+        let path = normalize_completion_path(raw);
+        if path.is_empty() {
+            continue;
+        }
+        set.insert(path.clone());
+        // Also offer every parent prefix so `/account/me/<Tab>` works even
+        // when `/account` isn't itself a recorded route.
+        let mut current = path.as_str();
+        while let Some(idx) = current.rfind('/') {
+            let parent = &current[..idx];
+            if parent.is_empty() {
+                break;
+            }
+            set.insert(parent.to_string());
+            current = parent;
+        }
+    }
+    set.into_iter().collect()
+}
+
+fn normalize_completion_path(raw: &str) -> String {
+    let raw = raw.split(['?', '#']).next().unwrap_or(raw);
+    let path = url::Url::parse(raw)
+        .map(|u| u.path().to_string())
+        .unwrap_or_else(|_| raw.to_string());
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let trimmed = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    trimmed.replace("{dynamic}", ":id")
+}
+
 pub fn completion_script(shell: Shell) -> &'static str {
     match shell {
         Shell::Bash => BASH_COMPLETION,
@@ -42,21 +177,150 @@ pub fn completion_script(shell: Shell) -> &'static str {
     }
 }
 
+pub fn install_completions(shell: Option<Shell>) -> Result<i32, AppError> {
+    let shell = match shell.or_else(detect_shell) {
+        Some(s) => s,
+        None => {
+            return Err(
+                "could not detect shell; pass one explicitly: hifi install <bash|zsh|fish>".into(),
+            )
+        }
+    };
+    let home = home_dir().ok_or("could not locate $HOME")?;
+    match shell {
+        Shell::Fish => install_fish(&home),
+        Shell::Zsh => install_zsh(&home),
+        Shell::Bash => install_bash(&home),
+    }
+}
+
+fn detect_shell() -> Option<Shell> {
+    let shell = std::env::var("SHELL").ok()?;
+    let name = Path::new(&shell).file_name()?.to_str()?;
+    match name {
+        n if n.ends_with("zsh") => Some(Shell::Zsh),
+        n if n.ends_with("bash") => Some(Shell::Bash),
+        n if n.ends_with("fish") => Some(Shell::Fish),
+        _ => None,
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+// Fish autoloads any file in ~/.config/fish/completions/, so we only need to
+// drop the script there.
+fn install_fish(home: &Path) -> Result<i32, AppError> {
+    let dir = home.join(".config/fish/completions");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("hifi.fish");
+    fs::write(&path, FISH_COMPLETION)?;
+    println!("installed fish completions: {}", path.display());
+    println!(
+        "open a new shell (or run `source {}`) to use them.",
+        path.display()
+    );
+    Ok(0)
+}
+
+// Zsh needs the completion file on $fpath and `compinit` to have been called.
+// We write to ~/.zsh/completions/_hifi and ensure ~/.zshrc adds that directory
+// to $fpath and initialises compinit. The marker prevents duplicate appends if
+// `install` is run again.
+fn install_zsh(home: &Path) -> Result<i32, AppError> {
+    let dir = home.join(".zsh/completions");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("_hifi");
+    fs::write(&path, ZSH_COMPLETION)?;
+
+    let zshrc = home.join(".zshrc");
+    let marker = "# >>> hifi completions >>>";
+    let block = format!(
+        "{marker}\nfpath=(\"$HOME/.zsh/completions\" $fpath)\nautoload -Uz compinit && compinit\n# <<< hifi completions <<<\n"
+    );
+    let appended = append_block_if_missing(&zshrc, marker, &block)?;
+    println!("installed zsh completions: {}", path.display());
+    if appended {
+        println!(
+            "updated {} to load completions on startup.",
+            zshrc.display()
+        );
+    }
+    println!("open a new shell to use them.");
+    Ok(0)
+}
+
+fn install_bash(home: &Path) -> Result<i32, AppError> {
+    let dir = home.join(".local/share/bash-completion/completions");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("hifi");
+    fs::write(&path, BASH_COMPLETION)?;
+
+    // Source the file directly from ~/.bashrc so users without the
+    // bash-completion package still get completions.
+    let bashrc = home.join(".bashrc");
+    let marker = "# >>> hifi completions >>>";
+    let block = format!(
+        "{marker}\n[ -r \"$HOME/.local/share/bash-completion/completions/hifi\" ] && \\\n    source \"$HOME/.local/share/bash-completion/completions/hifi\"\n# <<< hifi completions <<<\n"
+    );
+    let appended = append_block_if_missing(&bashrc, marker, &block)?;
+    println!("installed bash completions: {}", path.display());
+    if appended {
+        println!(
+            "updated {} to load completions on startup.",
+            bashrc.display()
+        );
+    }
+    println!("open a new shell to use them.");
+    Ok(0)
+}
+
+fn append_block_if_missing(rc: &Path, marker: &str, block: &str) -> io::Result<bool> {
+    let existing = fs::read_to_string(rc).unwrap_or_default();
+    if existing.contains(marker) {
+        return Ok(false);
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push('\n');
+    content.push_str(block);
+    fs::write(rc, content)?;
+    Ok(true)
+}
+
 const BASH_COMPLETION: &str = r#"_hifi() {
     local cur prev words cword
     _init_completion || return
-    local subcommands="grep serve completions help"
-    local flags="--no-cache --no-daemon --flat --json -h --help"
+    local subcommands="grep serve completions install help"
+    local flags="--routes -r --all -a --no-cache --no-daemon --flat --json -h --help"
+
+    if [[ ${cur} == -* ]]; then
+        COMPREPLY=( $(compgen -W "${flags}" -- "${cur}") )
+        return
+    fi
 
     if [[ ${cword} -eq 1 ]]; then
+        local command_matches
+        command_matches=$(compgen -W "${subcommands}" -- "${cur}")
+        if [[ -n "${command_matches}" ]]; then
+            COMPREPLY=( ${command_matches} )
+            return
+        fi
         local hosts
         hosts=$(hifi __complete "${cur}" 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${hosts} ${subcommands}" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${hosts}" -- "${cur}") )
         return
     fi
 
     case "${words[1]}" in
         completions)
+            COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") )
+            return
+            ;;
+        install)
             COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") )
             return
             ;;
@@ -70,6 +334,16 @@ const BASH_COMPLETION: &str = r#"_hifi() {
             ;;
     esac
 
+    # Second positional after a URL: suggest cached routes for that URL.
+    if [[ ${cword} -eq 2 && "${cur}" != -* ]]; then
+        local paths
+        paths=$(hifi __complete-paths "${words[1]}" "${cur}" 2>/dev/null)
+        if [[ -n "${paths}" ]]; then
+            COMPREPLY=( $(compgen -W "${paths}" -- "${cur}") )
+            return
+        fi
+    fi
+
     COMPREPLY=( $(compgen -W "${flags}" -- "${cur}") )
 }
 complete -F _hifi hifi
@@ -77,17 +351,22 @@ complete -F _hifi hifi
 
 const ZSH_COMPLETION: &str = r#"#compdef hifi
 _hifi() {
-    local -a hosts subs
-    subs=(grep serve completions help)
+    local -a hosts paths subs
+    subs=(grep serve completions install help)
+    if [[ "${words[CURRENT]}" == -* ]]; then
+        _arguments '*:flag:(--routes -r --all -a --no-cache --no-daemon --flat --json -h --help)'
+        return
+    fi
     if (( CURRENT == 2 )); then
-        hosts=("${(@f)$(hifi __complete "${words[CURRENT]}" 2>/dev/null)}")
-        _describe -t hosts 'cached host' hosts
         _describe -t commands 'command' subs
-        _arguments '*:flag:(--no-cache --no-daemon --flat --json -h --help)'
+        if (( $compstate[nmatches] == 0 )); then
+            hosts=("${(@f)$(hifi __complete "${words[CURRENT]}" 2>/dev/null)}")
+            _describe -t hosts 'cached host' hosts
+        fi
         return
     fi
     case "${words[2]}" in
-        completions)
+        completions|install)
             _values 'shell' bash zsh fish
             return
             ;;
@@ -99,7 +378,14 @@ _hifi() {
             fi
             ;;
     esac
-    _arguments '*:flag:(--no-cache --no-daemon --flat --json -h --help)'
+    if (( CURRENT == 3 )) && [[ "${words[CURRENT]}" != -* ]]; then
+        paths=("${(@f)$(hifi __complete-paths "${words[2]}" "${words[CURRENT]}" 2>/dev/null)}")
+        if (( ${#paths[@]} > 0 )) && [[ -n "${paths[1]}" ]]; then
+            _describe -t paths 'cached route' paths
+            return
+        fi
+    fi
+    _arguments '*:flag:(--routes -r --all -a --no-cache --no-daemon --flat --json -h --help)'
 }
 compdef _hifi hifi
 "#;
@@ -108,14 +394,42 @@ const FISH_COMPLETION: &str = r#"function __hifi_hosts
     hifi __complete (commandline -ct) 2>/dev/null
 end
 
+function __hifi_host_position
+    set -l token (commandline -ct)
+    if string match -q -- '-*' $token
+        return 1
+    end
+    for cmd in grep serve completions install help
+        if string match -q -- "$token*" $cmd
+            return 1
+        end
+    end
+    __fish_use_subcommand
+end
+
+function __hifi_paths
+    set -l token (commandline -ct)
+    if string match -q -- '-*' $token
+        return 1
+    end
+    set -l tokens (commandline -opc)
+    if test (count $tokens) -ge 2
+        hifi __complete-paths $tokens[2] (commandline -ct) 2>/dev/null
+    end
+end
+
 complete -c hifi -f
-complete -c hifi -n '__fish_use_subcommand' -a '(__hifi_hosts)' -d 'cached host'
+complete -c hifi -n '__hifi_host_position' -a '(__hifi_hosts)' -d 'cached host'
 complete -c hifi -n '__fish_use_subcommand' -a 'grep' -d 'grep a URL'
 complete -c hifi -n '__fish_use_subcommand' -a 'serve' -d 'run the daemon'
 complete -c hifi -n '__fish_use_subcommand' -a 'completions' -d 'print shell completions'
+complete -c hifi -n '__fish_use_subcommand' -a 'install' -d 'install tab completions'
 complete -c hifi -n '__fish_use_subcommand' -a 'help' -d 'show help'
 complete -c hifi -n '__fish_seen_subcommand_from grep' -a '(__hifi_hosts)' -d 'cached host'
-complete -c hifi -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'
+complete -c hifi -n '__fish_seen_subcommand_from completions install' -a 'bash zsh fish'
+complete -c hifi -n 'not __fish_use_subcommand; and not __fish_seen_subcommand_from grep serve completions install help' -a '(__hifi_paths)' -d 'cached route'
+complete -c hifi -s r -l routes -d 'expand the route summary into a full path list'
+complete -c hifi -s a -l all -d 'include internal/framework routes'
 complete -c hifi -l no-cache -d 'bypass cached results'
 complete -c hifi -l no-daemon -d 'skip the background daemon'
 complete -c hifi -l flat -d 'tab-separated output'

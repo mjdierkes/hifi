@@ -365,11 +365,61 @@ fn write_caches(
 ) -> Result<()> {
     let cached = out.clone().mark(None, CacheStatus::Stored, None);
     cache::write_with_revision(cache_path, &cached, out.revision.as_deref());
+    if let Ok(base) = url::Url::parse(url) {
+        let candidates = completion_candidates(&cached.evidence);
+        if !candidates.is_empty() {
+            cache::write_completion_candidates(&base, &candidates);
+        }
+    }
     if let Some(memory) = memory {
         let body = Arc::from(cached.to_json_string()?);
         write_memory(&memory, url.to_string(), body);
     }
     Ok(())
+}
+
+fn completion_candidates(evidence: &[Evidence]) -> Vec<String> {
+    let mut set = std::collections::BTreeSet::<String>::new();
+    for item in evidence {
+        if !matches!(
+            item.kind,
+            crate::scan::EvidenceKind::Route | crate::scan::EvidenceKind::Api
+        ) {
+            continue;
+        }
+        let path = normalize_completion_path(&item.url);
+        if path.is_empty() {
+            continue;
+        }
+        set.insert(path.clone());
+        let mut current = path.as_str();
+        while let Some(idx) = current.rfind('/') {
+            let parent = &current[..idx];
+            if parent.is_empty() {
+                break;
+            }
+            set.insert(parent.to_string());
+            current = parent;
+        }
+    }
+    set.into_iter().collect()
+}
+
+fn normalize_completion_path(raw: &str) -> String {
+    let raw = raw.split(['?', '#']).next().unwrap_or(raw);
+    let path = url::Url::parse(raw)
+        .map(|u| u.path().to_string())
+        .unwrap_or_else(|_| raw.to_string());
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let trimmed = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    trimmed.replace("{dynamic}", ":id")
 }
 
 fn prune_memory(entries: &mut LruCache<String, (Body, Instant)>, now: Instant) {

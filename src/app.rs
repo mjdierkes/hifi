@@ -9,9 +9,12 @@ mod completions;
 mod render;
 
 use self::client::runtime_client;
-use self::completions::{completion_script, parse_completions, print_host_completions, Shell};
+use self::completions::{
+    completion_script, install_completions, parse_completions, parse_install,
+    print_host_completions, Shell,
+};
 pub use self::render::escape_terminal;
-use self::render::{render_daemon_reply, render_processed, render_warnings};
+use self::render::{render_daemon_reply, render_processed, render_warnings, RenderOptions};
 use crate::grep;
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::daemon;
@@ -26,18 +29,22 @@ const HELP: &str = "\
 hifi — map an HTTP API surface
 
 USAGE:
-    hifi <url> [--no-cache] [--no-daemon] [--flat|--json]
+    hifi <url> [<path-filter>] [--routes] [--all] [--no-cache] [--no-daemon] [--flat|--json]
     hifi grep <url> <pattern> [-C N] [--max-hits N] [--max-bytes-per-hit N] [-a|--all]
     hifi serve
+    hifi install [bash|zsh|fish]
     hifi completions <bash|zsh|fish>
 
 EXAMPLES:
     hifi example.com
+    hifi example.com /modules        # drill into one resource
     hifi https://api.example.com/v2
     hifi grep example.com TODO -C 2
 
 FLAGS:
     -h, --help        show this help
+    -r, --routes      expand the route summary into a full path list
+    -a, --all         include internal/framework routes (e.g. _next, _index)
         --no-cache    bypass cached results
         --no-daemon   skip the background daemon
         --flat        print tab-separated output
@@ -50,10 +57,10 @@ GREP FLAGS:
     -a, --all                    print all hits
 
 SHELL COMPLETION:
-    Tab-complete cached hosts. Install with:
-        bash:  eval \"$(hifi completions bash)\"
-        zsh:   eval \"$(hifi completions zsh)\"
-        fish:  hifi completions fish | source
+    Tab-complete subcommands, flags, and cached hosts. One-shot install:
+        hifi install            # detect your shell automatically
+        hifi install zsh        # or pick a specific shell
+    To print the raw script instead, use `hifi completions <shell>`.
 ";
 
 #[derive(Debug, Error)]
@@ -111,7 +118,9 @@ enum Command {
     Grep(Vec<String>),
     Scan(ScanArgs),
     Completions(Shell),
+    Install(Option<Shell>),
     CompleteHosts(String),
+    CompletePaths { url: String, prefix: String },
 }
 
 // Keep CLI state explicit. The scanner should not need to know whether a scan
@@ -122,6 +131,7 @@ struct ScanArgs {
     no_cache: bool,
     no_daemon: bool,
     mode: OutputMode,
+    render: RenderOptions,
 }
 
 pub async fn run(raw: Vec<String>) -> Result<i32, AppError> {
@@ -135,8 +145,13 @@ pub async fn run(raw: Vec<String>) -> Result<i32, AppError> {
             print!("{}", completion_script(shell));
             Ok(0)
         }
+        Command::Install(shell) => install_completions(shell),
         Command::CompleteHosts(prefix) => {
             print_host_completions(&prefix);
+            Ok(0)
+        }
+        Command::CompletePaths { url, prefix } => {
+            self::completions::print_path_completions(&url, &prefix);
             Ok(0)
         }
         Command::Grep(args) => {
@@ -155,6 +170,29 @@ pub async fn run(raw: Vec<String>) -> Result<i32, AppError> {
     }
 }
 
+pub fn run_completion(raw: &[String]) -> Option<Result<i32, AppError>> {
+    if !matches!(
+        raw.first().map(String::as_str),
+        Some("__complete" | "__complete-paths")
+    ) {
+        return None;
+    }
+
+    let result = match parse_command(raw) {
+        Ok(Command::CompleteHosts(prefix)) => {
+            print_host_completions(&prefix);
+            Ok(0)
+        }
+        Ok(Command::CompletePaths { url, prefix }) => {
+            self::completions::print_path_completions(&url, &prefix);
+            Ok(0)
+        }
+        Ok(_) => return None,
+        Err(err) => Err(err),
+    };
+    Some(result)
+}
+
 fn parse_command(raw: &[String]) -> Result<Command, AppError> {
     if raw.is_empty() || matches!(raw[0].as_str(), "-h" | "--help" | "help") {
         return Ok(Command::Help);
@@ -168,44 +206,70 @@ fn parse_command(raw: &[String]) -> Result<Command, AppError> {
             Ok(Command::Serve)
         }
         "completions" => parse_completions(&raw[1..]).map(Command::Completions),
+        "install" => Ok(Command::Install(parse_install(&raw[1..])?)),
         "__complete" => Ok(Command::CompleteHosts(
             raw.get(1).cloned().unwrap_or_default(),
         )),
+        "__complete-paths" => Ok(Command::CompletePaths {
+            url: raw.get(1).cloned().unwrap_or_default(),
+            prefix: raw.get(2).cloned().unwrap_or_default(),
+        }),
         _ => parse_scan_args(raw).map(Command::Scan),
     }
 }
 
 fn parse_scan_args(raw: &[String]) -> Result<ScanArgs, AppError> {
     let mut url = None;
+    let mut filter: Option<String> = None;
     let (mut no_cache, mut no_daemon) = (false, false);
     let mut mode = OutputMode::Auto;
+    let mut render = RenderOptions::default();
     for arg in raw {
         match arg.as_str() {
             "--no-cache" => no_cache = true,
             "--no-daemon" => no_daemon = true,
             "--flat" => mode = set_mode(mode, OutputMode::Flat)?,
             "--json" => mode = set_mode(mode, OutputMode::Json)?,
+            "--routes" | "-r" => render.expand_routes = true,
+            "--all" | "-a" => render.show_internal = true,
             s if s.starts_with("--") || s.starts_with('-') => {
                 return Err(format!("unknown flag '{s}' (try --help)").into());
             }
             _ if url.is_none() => url = Some(arg.clone()),
+            _ if filter.is_none() => filter = Some(normalize_filter(arg)),
             _ => return Err(format!("unexpected argument '{arg}' (try --help)").into()),
         }
     }
     let url = url.ok_or("missing URL (try --help)")?;
     let url = normalize_url(&url)?;
+    if filter.is_some() {
+        render.expand_routes = true;
+    }
+    render.filter = filter;
 
     Ok(ScanArgs {
         url,
         no_cache,
         no_daemon,
         mode,
+        render,
     })
+}
+
+// Accept `/modules`, `modules`, or `/modules/` and normalize to `/modules`.
+fn normalize_filter(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
 }
 
 async fn run_scan(args: ScanArgs, client: Client, config: RuntimeConfig) -> Result<i32, AppError> {
     if !args.no_daemon {
-        if let Some(reply) = daemon_output(&args.url, args.no_cache, args.mode).await {
+        if let Some(reply) = daemon_output(&args.url, args.no_cache, args.mode, &args.render).await
+        {
             print!("{}", reply.stdout);
             eprint!("{}", reply.stderr);
             return Ok(reply.exit_code);
@@ -219,7 +283,7 @@ async fn run_scan(args: ScanArgs, client: Client, config: RuntimeConfig) -> Resu
     )
     .process_for_display(&args.url, args.no_cache, std::time::Instant::now())
     .await?;
-    render_processed(&out, args.mode)?;
+    render_processed(&out, args.mode, &args.render)?;
     render_warnings(&out);
     Ok(0)
 }
@@ -243,10 +307,15 @@ pub fn normalize_url(url: &str) -> Result<String, AppError> {
     }
 }
 
-async fn daemon_output(url: &str, no_cache: bool, mode: OutputMode) -> Option<daemon::DaemonReply> {
+async fn daemon_output(
+    url: &str,
+    no_cache: bool,
+    mode: OutputMode,
+    render: &RenderOptions,
+) -> Option<daemon::DaemonReply> {
     match daemon::request(url, no_cache).await {
         daemon::DaemonRequest::Reply(mut out) => {
-            render_daemon_reply(&mut out, mode);
+            render_daemon_reply(&mut out, mode, render);
             return Some(out);
         }
         daemon::DaemonRequest::StaleDaemon | daemon::DaemonRequest::Unavailable => {}
@@ -256,7 +325,7 @@ async fn daemon_output(url: &str, no_cache: bool, mode: OutputMode) -> Option<da
             std::thread::sleep(Duration::from_millis(25));
             match daemon::request(url, no_cache).await {
                 daemon::DaemonRequest::Reply(mut out) => {
-                    render_daemon_reply(&mut out, mode);
+                    render_daemon_reply(&mut out, mode, render);
                     return Some(out);
                 }
                 daemon::DaemonRequest::StaleDaemon | daemon::DaemonRequest::Unavailable => {}

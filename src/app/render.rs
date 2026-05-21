@@ -5,7 +5,14 @@ use crate::scan::{EvidenceKind, Shape};
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
-pub fn render_json_mode(json: &str, mode: OutputMode) -> String {
+#[derive(Clone, Debug, Default)]
+pub struct RenderOptions {
+    pub expand_routes: bool,
+    pub show_internal: bool,
+    pub filter: Option<String>,
+}
+
+pub fn render_json_mode(json: &str, mode: OutputMode, opts: &RenderOptions) -> String {
     match mode {
         OutputMode::Json => {
             let mut out = String::with_capacity(json.len() + 1);
@@ -16,11 +23,15 @@ pub fn render_json_mode(json: &str, mode: OutputMode) -> String {
             out
         }
         OutputMode::Flat => render_flat(json),
-        OutputMode::Auto => render_grouped(json),
+        OutputMode::Auto => render_grouped(json, opts),
     }
 }
 
-pub fn render_processed(out: &Output, mode: OutputMode) -> Result<(), AppError> {
+pub fn render_processed(
+    out: &Output,
+    mode: OutputMode,
+    opts: &RenderOptions,
+) -> Result<(), AppError> {
     let stdout = io::stdout();
     let mut stdout = io::BufWriter::new(stdout.lock());
     match mode {
@@ -29,17 +40,21 @@ pub fn render_processed(out: &Output, mode: OutputMode) -> Result<(), AppError> 
             stdout.write_all(b"\n")?;
         }
         OutputMode::Flat => render_flat_output(out, &mut stdout)?,
-        OutputMode::Auto => render_grouped_output(out, &mut stdout)?,
+        OutputMode::Auto => render_grouped_output(out, &mut stdout, opts)?,
     }
     Ok(())
 }
 
-pub fn render_daemon_reply(reply: &mut daemon::DaemonReply, mode: OutputMode) {
+pub fn render_daemon_reply(
+    reply: &mut daemon::DaemonReply,
+    mode: OutputMode,
+    opts: &RenderOptions,
+) {
     if reply.exit_code == 0 {
         reply
             .stderr
             .push_str(&warning_text_from_json(&reply.stdout));
-        reply.stdout = render_json_mode(&reply.stdout, mode);
+        reply.stdout = render_json_mode(&reply.stdout, mode, opts);
     }
 }
 
@@ -99,12 +114,27 @@ fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
     Ok(())
 }
 
-fn render_grouped_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
-    let apis = collect_apis(v);
-    let candidates = collect_paths(v, EvidenceKind::Candidate);
-    let (routes, internal_count) = split_internal(collect_paths(v, EvidenceKind::Route));
+fn render_grouped_output<W: Write>(
+    v: &Output,
+    out: &mut W,
+    opts: &RenderOptions,
+) -> io::Result<()> {
+    let mut apis = collect_apis(v);
+    let mut candidates = collect_paths(v, EvidenceKind::Candidate);
+    let all_routes = collect_paths(v, EvidenceKind::Route);
+    let (mut routes, internal_count) = if opts.show_internal {
+        (all_routes, 0)
+    } else {
+        split_internal(all_routes)
+    };
 
-    write_header(out, v, apis.len(), routes.len(), candidates.len())?;
+    if let Some(filter) = opts.filter.as_deref() {
+        apis.retain(|r| path_matches(&r.path, filter));
+        candidates.retain(|p| path_matches(p, filter));
+        routes.retain(|p| path_matches(p, filter));
+    }
+
+    write_header(out, v, apis.len(), routes.len(), candidates.len(), opts)?;
 
     if !apis.is_empty() {
         writeln!(out)?;
@@ -113,7 +143,13 @@ fn render_grouped_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
         for row in &apis {
             let path = escape_terminal(&row.path);
             if row.flags.is_empty() {
-                writeln!(out, "  {:<width$}  {}", row.methods, path, width = method_width)?;
+                writeln!(
+                    out,
+                    "  {:<width$}  {}",
+                    row.methods,
+                    path,
+                    width = method_width
+                )?;
             } else {
                 writeln!(
                     out,
@@ -138,7 +174,13 @@ fn render_grouped_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
     if !routes.is_empty() {
         writeln!(out)?;
         writeln!(out, "Routes")?;
-        render_resource_summary(out, &routes)?;
+        if opts.expand_routes {
+            for path in &routes {
+                writeln!(out, "  {}", escape_terminal(path))?;
+            }
+        } else {
+            render_resource_summary(out, &routes)?;
+        }
     }
 
     if internal_count > 0 {
@@ -159,6 +201,7 @@ fn write_header<W: Write>(
     api_count: usize,
     route_count: usize,
     candidate_count: usize,
+    opts: &RenderOptions,
 ) -> io::Result<()> {
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!(
@@ -175,6 +218,9 @@ fn write_header<W: Write>(
             if candidate_count == 1 { "" } else { "s" }
         ));
     }
+    if let Some(filter) = opts.filter.as_deref() {
+        parts.push(format!("filter {filter}"));
+    }
     if let Some(label) = v.framework.label() {
         parts.push(label);
     }
@@ -183,6 +229,18 @@ fn write_header<W: Write>(
         parts.push(format_elapsed(us));
     }
     writeln!(out, "{}", parts.join(" · "))
+}
+
+// A path matches a filter if it equals the filter or is nested below it
+// (so `/modules` matches `/modules` and `/modules/billing` but not `/modules-x`).
+fn path_matches(path: &str, filter: &str) -> bool {
+    if path == filter {
+        return true;
+    }
+    if let Some(rest) = path.strip_prefix(filter) {
+        return rest.starts_with('/');
+    }
+    false
 }
 
 fn cache_label(status: CacheStatus) -> &'static str {
@@ -284,74 +342,143 @@ fn prettify(path: &str) -> String {
     path.replace("{dynamic}", ":id")
 }
 
+// Show each first-segment as a "resource" row with its child count + tail names.
+// Paths whose first segment has no nested children become "top-level" entries.
+const RESOURCE_LINE_WIDTH: usize = 78;
+
 #[derive(Default)]
-struct Trie {
-    is_endpoint: bool,
-    children: BTreeMap<String, Trie>,
+struct ResourceGroup {
+    count: usize,
+    actions: std::collections::BTreeSet<String>,
 }
 
-impl Trie {
-    fn insert(&mut self, segments: &[String]) {
-        match segments.split_first() {
-            None => self.is_endpoint = true,
-            Some((head, rest)) => self
-                .children
-                .entry(head.clone())
-                .or_default()
-                .insert(rest),
+fn render_resource_summary<W: Write>(out: &mut W, paths: &[String]) -> io::Result<()> {
+    let mut resource_first_segs: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for path in paths {
+        let segs = path_segments(path);
+        if segs.len() >= 2 {
+            resource_first_segs.insert(segs[0].clone());
         }
     }
-}
 
-fn brace_collapse(paths: &[String]) -> Vec<String> {
-    let mut root = Trie::default();
+    let mut groups: BTreeMap<String, ResourceGroup> = BTreeMap::new();
+    let mut top_level: Vec<String> = Vec::new();
+
     for path in paths {
-        let segs: Vec<String> = path
-            .trim_start_matches('/')
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
-        root.insert(&segs);
+        let segs = path_segments(path);
+        if segs.is_empty() {
+            top_level.push("/".to_string());
+            continue;
+        }
+        if resource_first_segs.contains(&segs[0]) {
+            let group = groups.entry(segs[0].clone()).or_default();
+            group.count += 1;
+            // Use the first non-param segment after the resource as the action
+            // name. Fall back to ":id" so the row isn't empty when the only
+            // children are detail endpoints (e.g. /images/:id).
+            let action = segs[1..]
+                .iter()
+                .find(|s| !is_param(s))
+                .cloned()
+                .or_else(|| {
+                    segs.get(1)
+                        .filter(|s| is_param(s))
+                        .map(|_| ":id".to_string())
+                });
+            if let Some(a) = action {
+                group.actions.insert(a);
+            }
+        } else {
+            top_level.push(format!("/{}", segs.join("/")));
+        }
     }
 
-    let mut lines = Vec::new();
-    if root.is_endpoint {
-        lines.push("/".to_string());
+    let name_width = groups
+        .keys()
+        .map(|k| k.len())
+        .max()
+        .unwrap_or(0)
+        .max("top-level".len());
+    let count_width = groups
+        .values()
+        .map(|g| g.count)
+        .chain(std::iter::once(top_level.len()))
+        .map(|n| n.to_string().len())
+        .max()
+        .unwrap_or(1);
+
+    let action_budget = RESOURCE_LINE_WIDTH.saturating_sub(2 + name_width + 2 + count_width + 2);
+
+    for (name, group) in &groups {
+        let actions = truncate_actions(&group.actions, action_budget);
+        writeln!(
+            out,
+            "  {name:<name_width$}  {count:>count_width$}  {actions}",
+            name = escape_terminal(name),
+            count = group.count,
+            actions = escape_terminal(&actions),
+        )?;
     }
-    for (name, child) in &root.children {
-        lines.push(format!("/{}{}", name, render_tail(child)));
+
+    if !top_level.is_empty() {
+        top_level.sort();
+        top_level.dedup();
+        let count = top_level.len();
+        let joined = truncate_list(&top_level, action_budget);
+        writeln!(
+            out,
+            "  {name:<name_width$}  {count:>count_width$}  {joined}",
+            name = "top-level",
+            count = count,
+            joined = escape_terminal(&joined),
+        )?;
     }
-    lines
+
+    Ok(())
 }
 
-fn render_tail(node: &Trie) -> String {
-    if node.children.is_empty() {
+fn path_segments(path: &str) -> Vec<String> {
+    path.trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_param(seg: &str) -> bool {
+    seg.starts_with(':') || seg == "{dynamic}"
+}
+
+fn truncate_actions(actions: &std::collections::BTreeSet<String>, budget: usize) -> String {
+    let names: Vec<&str> = actions.iter().map(String::as_str).collect();
+    truncate_csv(&names, budget)
+}
+
+fn truncate_list(items: &[String], budget: usize) -> String {
+    let names: Vec<&str> = items.iter().map(String::as_str).collect();
+    truncate_csv(&names, budget)
+}
+
+fn truncate_csv(items: &[&str], budget: usize) -> String {
+    if items.is_empty() {
         return String::new();
     }
-    let kids: Vec<(&String, &Trie)> = node.children.iter().collect();
-
-    // Single child, not an endpoint: chain segments with /
-    if !node.is_endpoint && kids.len() == 1 {
-        let (name, child) = kids[0];
-        return format!("/{}{}", name, render_tail(child));
+    let mut out = String::new();
+    for (i, item) in items.iter().enumerate() {
+        let candidate_len = out.len() + if i == 0 { 0 } else { 2 } + item.len();
+        let remaining = items.len() - i;
+        let suffix = if remaining > 1 { 2 } else { 0 };
+        if candidate_len + suffix > budget && i > 0 {
+            out.push_str(", …");
+            return out;
+        }
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(item);
     }
-
-    // Multiple children, not an endpoint: factor the / outside the braces
-    if !node.is_endpoint {
-        let parts: Vec<String> = kids
-            .iter()
-            .map(|(n, c)| format!("{}{}", n, render_tail(c)))
-            .collect();
-        return format!("/{{{}}}", parts.join(", "));
-    }
-
-    // Endpoint + children: include an empty branch for the endpoint itself
-    let mut parts: Vec<String> = vec![String::new()];
-    for (name, child) in &kids {
-        parts.push(format!("/{}{}", name, render_tail(child)));
-    }
-    format!("{{{}}}", parts.join(","))
+    out
 }
 
 fn render_flat(json: &str) -> String {
@@ -365,12 +492,12 @@ fn render_flat(json: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| format!("{json}\n"))
 }
 
-fn render_grouped(json: &str) -> String {
+fn render_grouped(json: &str, opts: &RenderOptions) -> String {
     let Ok(v) = serde_json::from_str::<Output>(json) else {
         return format!("{json}\n");
     };
     let mut out = Vec::new();
-    if render_grouped_output(&v, &mut out).is_err() {
+    if render_grouped_output(&v, &mut out, opts).is_err() {
         return format!("{json}\n");
     }
     String::from_utf8(out).unwrap_or_else(|_| format!("{json}\n"))
@@ -405,10 +532,11 @@ mod tests {
     use crate::scan::{Confidence, Evidence, Extractor};
 
     #[test]
-    fn brace_collapses_routes_and_hides_internal() {
+    fn resource_summary_groups_routes_and_hides_internal() {
         let out = Output {
             evidence: vec![
                 route("/"),
+                route("/docs"),
                 route("/account"),
                 route("/account/billing"),
                 route("/account/billing/setup"),
@@ -429,16 +557,16 @@ mod tests {
         };
 
         let mut rendered = Vec::new();
-        render_grouped_output(&out, &mut rendered).unwrap();
+        render_grouped_output(&out, &mut rendered, &RenderOptions::default()).unwrap();
         let rendered = String::from_utf8(rendered).unwrap();
 
         let expected = "\
-9 routes · 0 APIs · fresh scan · 1.23s
+10 routes · 0 APIs · fresh scan · 1.23s
 
 Routes
-  /
-  /account{,/billing{,/setup},/password}
-  /machines{,/:id{,/cancel,/reboot}}
+  account    4  billing, password
+  machines   4  :id, cancel, reboot
+  top-level  2  /, /docs
 
 +2 internal routes (--all)
 ";
@@ -469,7 +597,7 @@ Routes
         };
 
         let mut rendered = Vec::new();
-        render_grouped_output(&out, &mut rendered).unwrap();
+        render_grouped_output(&out, &mut rendered, &RenderOptions::default()).unwrap();
         let rendered = String::from_utf8(rendered).unwrap();
 
         assert!(rendered.starts_with("0 routes · 3 APIs · 1 candidate · fresh scan\n"));

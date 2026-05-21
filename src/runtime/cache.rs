@@ -36,6 +36,10 @@ pub fn path_for(base: &Url) -> PathBuf {
     scanner_hashed_path("processed", base, None, "json")
 }
 
+pub fn completion_path_for(base: &Url) -> PathBuf {
+    hashed_path("completions", base, None, "json")
+}
+
 pub type AssetData = DocumentScan;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -146,6 +150,15 @@ fn scanner_hashed_path(kind: &str, url: &Url, cache_key: Option<&str>, ext: &str
             .chain(cache_key)
             .chain(std::iter::once(url.as_str())),
     );
+    hashed_path_with_hash(kind, url, hash, ext)
+}
+
+fn hashed_path(kind: &str, url: &Url, cache_key: Option<&str>, ext: &str) -> PathBuf {
+    let hash = hash_parts(cache_key.into_iter().chain(std::iter::once(url.as_str())));
+    hashed_path_with_hash(kind, url, hash, ext)
+}
+
+fn hashed_path_with_hash(kind: &str, url: &Url, hash: u64, ext: &str) -> PathBuf {
     dir()
         .join(kind)
         .join(host(url))
@@ -190,7 +203,15 @@ pub fn write_with_revision<T: Serialize>(path: &Path, value: &T, revision: Optio
     );
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) {
+pub fn read_completion_candidates(base: &Url) -> Option<Vec<String>> {
+    serde_json::from_slice(&fs::read(completion_path_for(base)).ok()?).ok()
+}
+
+pub fn write_completion_candidates(base: &Url, candidates: &[String]) {
+    write_json(&completion_path_for(base), candidates);
+}
+
+fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) {
     if let Ok(bytes) = serde_json::to_vec(value) {
         write_bytes(path, &bytes);
     }
