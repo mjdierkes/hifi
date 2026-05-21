@@ -7,6 +7,7 @@ fn discovers_static_dynamic_and_framework_assets() {
     let result = scan_html(
         r#"
         <script src="/app.js"></script>
+        <SCRIPT SRC="/upper.js"></SCRIPT>
         <script type="module" src="/assets/index-abc123.js"></script>
         <link rel="modulepreload" href="/assets/vendor-def456.js">
         <script src="/_nuxt/app.123.js"></script>
@@ -19,6 +20,7 @@ fn discovers_static_dynamic_and_framework_assets() {
         &result,
         &[
             "https://example.com/app.js",
+            "https://example.com/upper.js",
             "https://example.com/assets/index-abc123.js",
             "https://example.com/assets/vendor-def456.js",
             "https://example.com/_nuxt/app.123.js",

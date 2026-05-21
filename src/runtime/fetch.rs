@@ -145,15 +145,53 @@ fn enqueue_assets(
     queue: &mut VecDeque<AssetRef>,
     stats: &mut AssetScanStats,
 ) {
+    let mut pending = Vec::new();
     for asset in assets {
         if visited.len() >= MAX_TOTAL_ASSETS {
             if !visited.contains(&asset.url) {
                 stats.capped = true;
             }
         } else if visited.insert(asset.url.clone()) {
-            queue.push_back(asset);
+            pending.push(asset);
         }
     }
+    pending.sort_by_key(asset_priority);
+    queue.extend(pending);
+}
+
+fn asset_priority(asset: &AssetRef) -> u8 {
+    match (asset.source, asset.kind) {
+        (AssetSource::NextManifest, _) => 0,
+        (_, discover::AssetKind::Manifest) => 1,
+        (AssetSource::HtmlScript | AssetSource::HtmlPreload, discover::AssetKind::Script) => 2,
+        (_, discover::AssetKind::Payload) => 3,
+        (AssetSource::DynamicImport | AssetSource::NewUrl, discover::AssetKind::Script) => 4,
+        (_, discover::AssetKind::Script) => {
+            let path = asset.url.path();
+            if path.contains("app") || path.contains("page") {
+                5
+            } else if is_low_signal_script_path(path) {
+                8
+            } else {
+                6
+            }
+        }
+    }
+}
+
+fn is_low_signal_script_path(path: &str) -> bool {
+    [
+        "vendor",
+        "vendors",
+        "framework",
+        "runtime",
+        "webpack",
+        "polyfill",
+        "node_modules",
+        "analytics",
+    ]
+    .iter()
+    .any(|fragment| path.contains(fragment))
 }
 
 async fn fetch_scan(
@@ -193,6 +231,7 @@ async fn fetch_scan(
         allow_private,
         validators,
         framework_config,
+        use_cache,
     )
     .await
     .map_err(|reason| (asset.clone(), reason))?
@@ -268,6 +307,7 @@ async fn fetch_asset_body(
     allow_private: bool,
     validators: Option<&cache::AssetValidators>,
     framework_config: FrameworkConfig,
+    use_hash_cache: bool,
 ) -> Result<FetchedBody, FetchFailure> {
     let mut current_url = asset.url.clone();
     let mut redirects = 0;
@@ -331,16 +371,31 @@ async fn fetch_asset_body(
     }
 
     let validators = asset_validators(response.headers());
+    let kind = asset.document_kind();
     let body = net::read_limited(response)
         .await
         .map_err(|_| FetchFailure::Other)?;
+    let findings_hash =
+        (use_hash_cache && kind == discover::DocumentKind::Script).then(|| cache::body_hash(&body));
+    let cached_findings = findings_hash.and_then(|hash| cache::read_findings_by_hash(hash, kind));
+    let had_cached_findings = cached_findings.is_some();
     let scan_url = current_url;
-    let kind = asset.document_kind();
     let scan = tokio::task::spawn_blocking(move || {
-        discover::scan_document_with_config(&body, &scan_url, kind, framework_config.as_next())
+        discover::scan_document_with_config_and_findings(
+            &body,
+            &scan_url,
+            kind,
+            framework_config.as_next(),
+            cached_findings,
+        )
     })
     .await
     .map_err(|_| FetchFailure::Other)?;
+    if let Some(hash) = findings_hash {
+        if !had_cached_findings {
+            cache::write_findings_by_hash(hash, kind, &scan.findings);
+        }
+    }
     Ok(FetchedBody::Body(Box::new(scan), validators))
 }
 

@@ -87,11 +87,10 @@ fn rejects_non_endpoint_noise() {
     for url in ["/api/admin", "{dynamic}/api/admin", "/assets/rnnoise.wasm"] {
         assert_no_api(&result, url);
     }
-    for url in ["/{dynamic}"] {
-        assert_no_api(&result, url);
-        assert!(!result.candidate_map().contains_key(url));
-        assert_no_route(&result, url);
-    }
+    let url = "/{dynamic}";
+    assert_no_api(&result, url);
+    assert!(!result.candidate_map().contains_key(url));
+    assert_no_route(&result, url);
     for route in [
         "/%3E%3CfeGaussianBlur",
         "/%3E%3C/filter%3E",

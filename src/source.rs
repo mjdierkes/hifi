@@ -26,6 +26,94 @@ pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     memchr::memmem::find(haystack, needle).is_some()
 }
 
+pub fn find_ascii_ignore_case(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+
+    let mut offset = 0;
+    while offset + needle.len() <= haystack.len() {
+        let rel = find_first_ascii_ignore_case(&haystack[offset..], needle[0])?;
+        let pos = offset + rel;
+        if pos + needle.len() > haystack.len() {
+            return None;
+        }
+        if haystack[pos..pos + needle.len()].eq_ignore_ascii_case(needle) {
+            return Some(pos);
+        }
+        offset = pos + 1;
+    }
+    None
+}
+
+pub fn ends_with_ascii_ignore_case(haystack: &str, needle: &str) -> bool {
+    haystack.len() >= needle.len()
+        && haystack.as_bytes()[haystack.len() - needle.len()..]
+            .eq_ignore_ascii_case(needle.as_bytes())
+}
+
+fn find_first_ascii_ignore_case(haystack: &[u8], needle: u8) -> Option<usize> {
+    if needle.is_ascii_alphabetic() {
+        memchr::memchr2(
+            needle.to_ascii_lowercase(),
+            needle.to_ascii_uppercase(),
+            haystack,
+        )
+    } else {
+        memchr::memchr(needle, haystack)
+    }
+}
+
+pub fn find_token_delim(bytes: &[u8], include_equals: bool) -> Option<usize> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { find_token_delim_neon(bytes, include_equals) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        find_token_delim_scalar(bytes, include_equals)
+    }
+}
+
+fn find_token_delim_scalar(bytes: &[u8], include_equals: bool) -> Option<usize> {
+    bytes
+        .iter()
+        .position(|b| is_token_delim(*b, include_equals))
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn find_token_delim_neon(bytes: &[u8], include_equals: bool) -> Option<usize> {
+    use std::arch::aarch64::*;
+
+    let mut i = 0;
+    while i + 16 <= bytes.len() {
+        let v = vld1q_u8(bytes.as_ptr().add(i));
+        let mut m = vceqq_u8(v, vdupq_n_u8(b'"'));
+        for b in [
+            b'\'', b'`', b'<', b'>', b')', b'(', b',', b';', b'{', b'}', b'[', b']',
+        ] {
+            m = vorrq_u8(m, vceqq_u8(v, vdupq_n_u8(b)));
+        }
+        if include_equals {
+            m = vorrq_u8(m, vceqq_u8(v, vdupq_n_u8(b'=')));
+        }
+        let ws_range = vandq_u8(vcgeq_u8(v, vdupq_n_u8(9)), vcleq_u8(v, vdupq_n_u8(13)));
+        m = vorrq_u8(m, ws_range);
+        m = vorrq_u8(m, vceqq_u8(v, vdupq_n_u8(b' ')));
+
+        let mut out = [0u8; 16];
+        vst1q_u8(out.as_mut_ptr(), m);
+        if let Some(rel) = out.iter().position(|b| *b != 0) {
+            return Some(i + rel);
+        }
+        i += 16;
+    }
+    find_token_delim_scalar(&bytes[i..], include_equals).map(|rel| i + rel)
+}
+
 pub fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
     while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
         i += 1;
@@ -168,6 +256,9 @@ fn token_end(
     normalized: &mut Option<Vec<u8>>,
 ) -> usize {
     let start = i;
+    if template_mode == TemplateMode::Preserve {
+        return i + find_token_delim(&bytes[i..], true).unwrap_or(bytes.len() - i);
+    }
     while i < bytes.len() {
         if template_mode == TemplateMode::ReplaceExpressions && bytes[i..].starts_with(DYNAMIC) {
             normalized
@@ -249,5 +340,14 @@ mod tests {
             token_string(src, 0, TemplateMode::Preserve).as_deref(),
             Some("/api/$")
         );
+    }
+
+    #[test]
+    fn token_delim_search_matches_scalar_delimiters() {
+        let src = b"alpha/beta/gamma,rest";
+        assert_eq!(find_token_delim(src, true), Some(16));
+        assert_eq!(find_token_delim(b"abc=def", true), Some(3));
+        assert_eq!(find_token_delim(b"abc=def", false), None);
+        assert_eq!(find_token_delim(b"abcdef", true), None);
     }
 }

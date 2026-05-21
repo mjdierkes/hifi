@@ -193,6 +193,21 @@ impl<'a> Processor<'a> {
         t0: Option<Instant>,
         cache_ctx: &CacheContext,
     ) -> Result<ScanOutcome> {
+        if use_cache {
+            if let Some((body, age)) =
+                cache::read_cached_value_bytes(&plan.cache_path, CACHE_FRESH_SECS)
+            {
+                return Ok(ScanOutcome {
+                    output: serde_json::from_slice::<Output>(&body)?.mark(
+                        t0,
+                        CacheStatus::Fresh,
+                        Some(age),
+                    ),
+                    used_revision_cache: true,
+                });
+            }
+        }
+
         let page = self.load_page(plan, use_cache, cache_ctx).await?;
         let root_scan = scan_root_document(page.html, page.final_base).await?;
         let mut found = root_scan.findings;
@@ -575,6 +590,45 @@ mod tests {
             crate::scan::EvidenceKind::Api,
             "/api/first"
         ));
+    }
+
+    #[tokio::test]
+    async fn fresh_processed_cache_skips_network() {
+        let addr = serve(1, |_| {
+            ("200 OK", r#"<script>fetch("/api/cached")</script>"#)
+        })
+        .await;
+        let client = Client::new();
+        let processor = Processor::new(
+            &client,
+            2,
+            CacheContext {
+                allow_private: true,
+                ..CacheContext::default()
+            },
+        );
+        let url = format!("http://{addr}/");
+
+        let first = processor
+            .process_for_display(&url, false, Instant::now())
+            .await
+            .unwrap();
+        let second = processor
+            .process_for_display(&url, false, Instant::now())
+            .await
+            .unwrap();
+
+        assert!(has_evidence(
+            &first,
+            crate::scan::EvidenceKind::Api,
+            "/api/cached"
+        ));
+        assert!(has_evidence(
+            &second,
+            crate::scan::EvidenceKind::Api,
+            "/api/cached"
+        ));
+        assert_eq!(second.cache, CacheStatus::Fresh);
     }
 
     fn has_evidence(out: &Output, kind: crate::scan::EvidenceKind, url: &str) -> bool {

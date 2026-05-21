@@ -199,10 +199,9 @@ pub fn scan_flight(bytes: &[u8], findings: &mut ScanResult) {
 }
 
 fn artifact_for_path(path: &str) -> Option<&'static NextArtifact> {
-    let lower = path.to_ascii_lowercase();
     NEXT_ARTIFACTS
         .iter()
-        .find(|artifact| lower.ends_with(&artifact.name.to_ascii_lowercase()))
+        .find(|artifact| source::ends_with_ascii_ignore_case(path, artifact.name))
 }
 
 pub fn scan_server_action(

@@ -42,10 +42,10 @@ const NEXT_DATA_OPEN: &[u8] = b"<script id=\"__NEXT_DATA__\"";
 /// fields we care about. Returns `None` if the script tag is absent or the
 /// payload doesn't parse as JSON.
 pub fn parse_next_data(bytes: &[u8]) -> Option<NextConfig> {
-    let lower = bytes.to_ascii_lowercase();
-    let open = memchr::memmem::find(&lower, &NEXT_DATA_OPEN.to_ascii_lowercase())?;
+    let open = source::find_ascii_ignore_case(bytes, NEXT_DATA_OPEN)?;
     let tag_end = memchr::memchr(b'>', &bytes[open..]).map(|rel| open + rel + 1)?;
-    let close = memchr::memmem::find(&lower[tag_end..], b"</script>").map(|rel| tag_end + rel)?;
+    let close =
+        source::find_ascii_ignore_case(&bytes[tag_end..], b"</script>").map(|rel| tag_end + rel)?;
     let payload = bytes.get(tag_end..close)?;
     let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
 

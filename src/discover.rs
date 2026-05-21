@@ -111,6 +111,20 @@ pub fn scan_document_with_config(
     kind: DocumentKind,
     parent_config: Option<&NextConfig>,
 ) -> DocumentScan {
+    scan_document_with_config_and_findings(bytes, base, kind, parent_config, None)
+}
+
+pub(crate) fn scan_document_with_config_and_findings(
+    bytes: &[u8],
+    base: &Url,
+    kind: DocumentKind,
+    parent_config: Option<&NextConfig>,
+    cached_findings: Option<ScanResult>,
+) -> DocumentScan {
+    if is_empty_script(bytes, kind) {
+        return DocumentScan::default();
+    }
+
     let mut next_config = framework::next::parse_page_config(bytes, kind);
     if next_config.is_none() {
         next_config = parent_config.cloned();
@@ -118,7 +132,7 @@ pub fn scan_document_with_config(
     let next_context = framework::next::is_context(bytes, base, next_config.as_ref());
     let revision = framework::next::revision(bytes, next_context, next_config.as_ref());
     let mut out = DocumentScan {
-        findings: crate::scan::scan_endpoints(bytes),
+        findings: cached_findings.unwrap_or_else(|| crate::scan::scan_endpoints(bytes)),
         assets: Vec::new(),
         revision,
         framework_config: FrameworkConfig::from(next_config.clone()),
@@ -171,6 +185,21 @@ pub fn scan_document_with_config(
     out
 }
 
+fn is_empty_script(bytes: &[u8], kind: DocumentKind) -> bool {
+    kind == DocumentKind::Script
+        && !crate::scan::has_document_pattern(bytes)
+        && !ASSET_AC.is_match(bytes)
+        && !source::contains(bytes, b"import(")
+        && !source::contains(bytes, b"new URL(")
+        && !FRAMEWORK_DATA_MARKERS
+            .iter()
+            .any(|marker| source::contains(bytes, marker))
+        && !source::contains(bytes, b"__next_f.push")
+        && !source::contains(bytes, b"Next-Action")
+        && !source::contains(bytes, b"next-action")
+        && !source::contains(bytes, b"$ACTION_")
+}
+
 // HTML documents are the only place where tag structure is meaningful. Scripts,
 // manifests, and payloads rely on literal and dynamic-reference discovery.
 fn scan_html_assets(
@@ -210,12 +239,14 @@ fn scan_html_assets(
 }
 
 fn scan_tags(bytes: &[u8], needle: &[u8], mut f: impl FnMut(&[u8])) {
-    let lower = bytes.to_ascii_lowercase();
-    for start in memchr::memmem::find_iter(&lower, needle) {
+    let mut offset = 0;
+    while let Some(rel) = source::find_ascii_ignore_case(&bytes[offset..], needle) {
+        let start = offset + rel;
         let Some(end_rel) = memchr::memchr(b'>', &bytes[start..]) else {
             break;
         };
         f(&bytes[start..start + end_rel + 1]);
+        offset = start + 1;
     }
 }
 
@@ -380,19 +411,16 @@ fn asset_token_string(bytes: &[u8], start: usize) -> Option<String> {
         return Some(raw);
     }
 
-    let mut end = start;
-    while end < bytes.len() && !source::is_token_delim(bytes[end], false) {
-        end += 1;
-    }
+    let end =
+        start + source::find_token_delim(&bytes[start..], false).unwrap_or(bytes.len() - start);
     std::str::from_utf8(&bytes[start..end])
         .ok()
         .map(|s| s.trim_matches('\\').to_string())
 }
 
 fn attr_value<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a str> {
-    let lower = tag.to_ascii_lowercase();
     let mut offset = 0;
-    while let Some(rel) = memchr::memmem::find(&lower[offset..], name) {
+    while let Some(rel) = source::find_ascii_ignore_case(&tag[offset..], name) {
         let pos = offset + rel;
         let before_ok = pos == 0 || is_attr_delim(tag[pos - 1]);
         let mut i = pos + name.len();

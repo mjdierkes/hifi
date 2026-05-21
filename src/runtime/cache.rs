@@ -7,7 +7,8 @@
 //! The cache stores three related artifacts: processed scan output, root pages
 //! plus final redirected URL, and per-asset scan data plus HTTP validators.
 
-use crate::discover::DocumentScan;
+use crate::discover::{DocumentKind, DocumentScan};
+use crate::scan::ScanResult;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -98,8 +99,45 @@ pub fn write_asset_with_validators(
     );
 }
 
+pub fn body_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+pub fn read_findings_by_hash(hash: u64, kind: DocumentKind) -> Option<ScanResult> {
+    let path = findings_hash_path(hash, kind);
+    let (bytes, _) = read_fresh(&path, super::processor::CACHE_STALE_SECS)?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+pub fn write_findings_by_hash(hash: u64, kind: DocumentKind, findings: &ScanResult) {
+    write_json(&findings_hash_path(hash, kind), findings);
+}
+
 fn asset_path_for(url: &Url, cache_key: Option<&str>) -> PathBuf {
     scanner_hashed_path("assets", url, cache_key, "json")
+}
+
+fn findings_hash_path(hash: u64, kind: DocumentKind) -> PathBuf {
+    let kind = match kind {
+        DocumentKind::Html => "html",
+        DocumentKind::Script => "script",
+        DocumentKind::Manifest => "manifest",
+        DocumentKind::Payload => "payload",
+    };
+    let cache_hash = hash_parts(
+        [SCANNER_CACHE_VERSION, kind, &format!("{hash:016x}")]
+            .into_iter()
+            .map(|s| s as &str),
+    );
+    dir()
+        .join("findings")
+        .join(kind)
+        .join(format!("{cache_hash:016x}.json"))
 }
 
 fn scanner_hashed_path(kind: &str, url: &Url, cache_key: Option<&str>, ext: &str) -> PathBuf {
@@ -124,6 +162,12 @@ pub fn read_revision_bytes(path: &Path, revision: Option<&str>) -> Option<Vec<u8
         serde_json::from_slice(&fs::read(path).ok()?).ok()?;
     (envelope.revision.as_deref() == Some(expected))
         .then(|| serde_json::to_vec(&envelope.value).ok())?
+}
+
+pub fn read_cached_value_bytes(path: &Path, max_age_secs: u64) -> Option<(Vec<u8>, u64)> {
+    let (bytes, age_secs) = read_fresh(path, max_age_secs)?;
+    let envelope: RevisionEnvelope<serde_json::Value> = serde_json::from_slice(&bytes).ok()?;
+    Some((serde_json::to_vec(&envelope.value).ok()?, age_secs))
 }
 
 fn read_fresh(path: &Path, max_age_secs: u64) -> Option<(Vec<u8>, u64)> {

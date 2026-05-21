@@ -228,6 +228,10 @@ pub fn scan_endpoints(bytes: &[u8]) -> ScanResult {
     out
 }
 
+pub(crate) fn has_document_pattern(bytes: &[u8]) -> bool {
+    DOCUMENT_AC.is_match(bytes)
+}
+
 fn record_api_call(bytes: &[u8], start: usize, after: usize, anchor: &str, out: &mut ScanResult) {
     let Some((url, mut shape)) = shape::scan_call(bytes, start, after, anchor) else {
         return;
