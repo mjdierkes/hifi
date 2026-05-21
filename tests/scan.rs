@@ -95,6 +95,77 @@ fn routes_and_api_candidates_are_classified_separately() {
     assert!(!result.routes.contains_key("/images/logo.png"));
 }
 
+#[test]
+fn variable_hoisted_urls_get_call_shape() {
+    // Real-world pattern from Convex's client: the URL is built into a
+    // template, stored in a local, and passed as the first arg to fetch.
+    // hifi must follow the assignment so the call shape is attached.
+    let result = scan(
+        r#"
+        let t=`${this.address}/api/debug_event`;
+        fetch(t,{method:`POST`,headers:{"Content-Type":`application/json`},body:JSON.stringify({foo:1})});
+    "#,
+    );
+    let shape = result
+        .apis
+        .get("/api/debug_event")
+        .expect("expected /api/debug_event to be promoted to an API call");
+    assert_eq!(shape.methods_csv(), "POST");
+    let flags = shape.flags_csv();
+    assert!(flags.contains("body"), "flags = {flags}");
+    assert!(flags.contains("headers"), "flags = {flags}");
+    assert!(flags.contains("json"), "flags = {flags}");
+}
+
+#[test]
+fn url_consisting_only_of_dynamic_segments_is_ignored() {
+    // When the entire URL is interpolation (`/${id}`), the resolved literal
+    // collapses to `/{dynamic}` which carries no information.
+    let result = scan(
+        r#"
+        const u = `/${id}`;
+        fetch(u, {method:"GET"});
+    "#,
+    );
+    assert!(!result.apis.contains_key("/{dynamic}"));
+    assert!(!result.candidates.contains_key("/{dynamic}"));
+    assert!(!result.routes.contains_key("/{dynamic}"));
+}
+
+#[test]
+fn wasm_assets_are_not_endpoints() {
+    let result = scan(
+        r#"
+        const u = "/assets/rnnoise.wasm";
+        fetch(u);
+    "#,
+    );
+    assert!(!result.apis.contains_key("/assets/rnnoise.wasm"));
+}
+
+#[test]
+fn percent_encoded_svg_does_not_become_a_route() {
+    // Reproduces a real false-positive from Next.js's getImageBlurSvg, which
+    // emits literals like "...%3E%3CfeGaussianBlur stdDeviation='20'/%3E..."
+    let result = scan(
+        r#"
+        let svg = "%3Csvg xmlns='http://www.w3.org/2000/svg' %3E%3Cfilter id='b'%3E%3CfeGaussianBlur stdDeviation='20'/%3E%3C/filter%3E%3C/svg%3E";
+        router.push("/dashboard");
+    "#,
+    );
+    assert!(result.routes.contains_key("/dashboard"));
+    for noise in [
+        "/%3E%3CfeGaussianBlur",
+        "/%3E%3C/filter%3E",
+        "/%3E%3C/svg%3E",
+    ] {
+        assert!(
+            !result.routes.contains_key(noise),
+            "encoded-markup leak became a route: {noise}"
+        );
+    }
+}
+
 fn scan(src: &str) -> ScanResult {
     scan_endpoints(src.as_bytes())
 }

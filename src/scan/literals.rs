@@ -47,11 +47,11 @@ pub const ROUTE_START_LITERALS: &[&str] = &["\"/", "'/", "`/", "\\\"/", "\\'/"];
 
 #[rustfmt::skip]
 pub const ROUTE_BAD_EXTS: &[&str] = &[
-    ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf",
-    ".ico", ".webp", ".mp4", ".webm", ".map", ".json", ".txt", ".xml",
+    ".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf",
+    ".ico", ".webp", ".mp4", ".webm", ".map", ".json", ".txt", ".xml", ".wasm",
 ];
 #[rustfmt::skip]
 pub const BAD_EXTS: &[&str] = &[
-    ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf",
-    ".ico", ".webp", ".mp4", ".webm", ".map",
+    ".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf",
+    ".ico", ".webp", ".mp4", ".webm", ".map", ".wasm",
 ];

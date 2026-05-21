@@ -223,7 +223,7 @@ fn parse_method(mut bytes: &[u8]) -> u8 {
 }
 
 fn apply_second_arg_body_shape(bytes: &[u8], start: usize, shape: &mut Shape) {
-    let Some(first_end) = source::quoted_arg_end(bytes, start) else {
+    let Some(first_end) = first_arg_end(bytes, start) else {
         return;
     };
     let mut i = source::skip_ws(bytes, first_end);
@@ -346,6 +346,26 @@ fn method_hint(anchor: &str) -> u8 {
 
 fn method_allows_body(method: u8) -> bool {
     method & (METHOD_POST | METHOD_PUT | METHOD_PATCH) != 0
+}
+
+// The first argument to a `fetch`-style call may be a quoted URL or a bare
+// identifier that holds a previously-built URL. Body-shape extraction only
+// needs to skip past it to reach the options object.
+fn first_arg_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if let Some(end) = source::quoted_arg_end(bytes, start) {
+        return Some(end);
+    }
+    let i = source::skip_ws(bytes, start);
+    let first = *bytes.get(i)?;
+    if !(first == b'_' || first == b'$' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    let end = bytes[i..]
+        .iter()
+        .position(|b| !(*b == b'_' || *b == b'$' || b.is_ascii_alphanumeric()))
+        .map(|rel| i + rel)
+        .unwrap_or(bytes.len());
+    Some(end)
 }
 
 fn push_unique_sorted(dst: &mut Vec<String>, value: &str) {

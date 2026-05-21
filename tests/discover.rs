@@ -86,7 +86,7 @@ fn next_payloads_and_rsc_prefetches_are_fetchable_assets() {
         <script>
         const data="/_next/data/b1/dashboard.json";
         const rsc="/dashboard?_rsc=abc";
-        const segment="/dashboard.segments/a.segment.rsc";
+        const segment="/dashboard.segments/dashboard.segment.rsc";
         </script>
     "#,
     );
@@ -94,7 +94,39 @@ fn next_payloads_and_rsc_prefetches_are_fetchable_assets() {
 
     assert!(assets.contains(&"https://example.com/_next/data/b1/dashboard.json".to_string()));
     assert!(assets.contains(&"https://example.com/dashboard?_rsc=abc".to_string()));
-    assert!(assets.contains(&"https://example.com/dashboard.segments/a.segment.rsc".to_string()));
+    assert!(assets
+        .contains(&"https://example.com/dashboard.segments/dashboard.segment.rsc".to_string()));
+}
+
+#[test]
+fn minified_rsc_property_accesses_are_not_treated_as_assets() {
+    // Real-world false positives from Next.js minified RSC code: property
+    // accesses like `x.rsc`, `rsc:E.rsc`, and concatenated chunk paths like
+    // `"_next/static/chunks/" + n + ".rsc"` produce `.rsc` substrings that
+    // are not real URLs.
+    let result = scan_html(
+        r#"
+        <script>
+        var t={children:x.rsc,rsc:E.rsc};
+        var u="/_next/static/chunks/"+n+".rsc";
+        var v="/_next/static/chunks/.segment.rsc";
+        var w="/_next/static/chunks/"+s+".head.rsc";
+        </script>
+    "#,
+    );
+    for noise in [
+        "x.rsc",
+        "E.rsc",
+        ".segment.rsc",
+        "/_next/static/chunks/.rsc",
+        "/_next/static/chunks/.segment.rsc",
+        "/_next/static/chunks/s.head.rsc",
+    ] {
+        assert!(
+            !asset_urls(&result).iter().any(|u| u.ends_with(noise)),
+            "garbage `.rsc` token became a fetchable asset: {noise}"
+        );
+    }
 }
 
 #[test]

@@ -370,10 +370,21 @@ async fn scan_root_document(html: bytes::Bytes, final_base: Url) -> Result<disco
 fn warnings_from_assets(asset_stats: &fetch::AssetScanStats) -> Vec<String> {
     let mut warnings = Vec::new();
     if asset_stats.failed > 0 {
-        warnings.push(format!(
-            "failed to read {} assets; results may be incomplete",
-            asset_stats.failed
-        ));
+        let total = asset_stats.failed;
+        let auth = asset_stats.unauthorized;
+        let message = if auth == total {
+            format!(
+                "{total} assets blocked by auth (401/403); scan limited to public bundle surface"
+            )
+        } else if auth > 0 {
+            let other = total - auth;
+            format!(
+                "failed to read {total} assets ({auth} auth-gated, {other} other); results may be incomplete"
+            )
+        } else {
+            format!("failed to read {total} assets; results may be incomplete")
+        };
+        warnings.push(message);
     }
     if asset_stats.capped {
         warnings.push(format!(

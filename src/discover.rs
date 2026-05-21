@@ -354,9 +354,37 @@ fn is_framework_data(raw: &str, path: &str) -> bool {
 
 fn is_framework_payload(raw: &str, path: &str) -> bool {
     (path.ends_with(".json") && is_framework_data(raw, path))
-        || path.ends_with(".rsc")
+        || (path.ends_with(".rsc") && has_meaningful_rsc_stem(path))
         || raw.contains("?_rsc=")
         || raw.contains("&_rsc=")
+}
+
+// Minified RSC framework code contains `.rsc` substrings inside property
+// accesses (`x.rsc`, `rsc:E.rsc`) and concatenated chunk paths
+// (`"_next/static/chunks/" + n + ".rsc"`). Their tokens look like real `.rsc`
+// URLs but produce 404s. Require a non-trivial filename stem before the
+// extension so we only enqueue plausible payload paths.
+fn has_meaningful_rsc_stem(path: &str) -> bool {
+    let Some(stem) = path
+        .rsplit('/')
+        .next()
+        .and_then(|file| file.strip_suffix(".rsc"))
+    else {
+        return false;
+    };
+    if stem.is_empty()
+        || !stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return false;
+    }
+    // Reject synthesized stems from minified concatenations like
+    // `"/chunks/" + s + ".head.rsc"`, where the first dot-segment is a
+    // single-character variable name. Real route-segment payloads use the
+    // route name (e.g. `dashboard.head.rsc`).
+    let first_segment = stem.split('.').next().unwrap_or(stem);
+    first_segment.len() >= 2
 }
 
 // Bundlers often emit relative chunk names that are only meaningful in a

@@ -50,8 +50,15 @@ pub struct AssetScanStats {
     pub discovered: usize,
     pub memory_hits: usize,
     pub failed: usize,
+    pub unauthorized: usize,
     pub capped: bool,
     pub failed_urls: Vec<Url>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FetchFailure {
+    Unauthorized,
+    Other,
 }
 
 struct ScannedAsset {
@@ -109,8 +116,11 @@ pub async fn scan_assets(
                     &mut stats,
                 );
             }
-            Err(asset) => {
+            Err((asset, reason)) => {
                 stats.failed += 1;
+                if matches!(reason, FetchFailure::Unauthorized) {
+                    stats.unauthorized += 1;
+                }
                 stats.failed_urls.push(asset.url);
             }
         }
@@ -146,7 +156,7 @@ async fn fetch_scan(
     cache_key: Option<&str>,
     allow_private: bool,
     memory: Option<AssetMemoryCache>,
-) -> Result<ScannedAsset, AssetRef> {
+) -> Result<ScannedAsset, (AssetRef, FetchFailure)> {
     let mut cached = None;
     if use_cache {
         if let Some(asset_data) = read_memory_asset(memory.as_ref(), &asset.url, cache_key) {
@@ -171,10 +181,10 @@ async fn fetch_scan(
     let validators = cached.as_ref().map(|asset_data| &asset_data.validators);
     match fetch_asset_body(&client, asset.clone(), allow_private, validators)
         .await
-        .map_err(|_| asset.clone())?
+        .map_err(|reason| (asset.clone(), reason))?
     {
         FetchedBody::NotModified => {
-            let cached = cached.ok_or_else(|| asset.clone())?;
+            let cached = cached.ok_or_else(|| (asset.clone(), FetchFailure::Other))?;
             cache::write_asset_with_validators(
                 &asset.url,
                 &cached.data,
@@ -243,8 +253,8 @@ async fn fetch_asset_body(
     asset: AssetRef,
     allow_private: bool,
     validators: Option<&cache::AssetValidators>,
-) -> Result<FetchedBody, ()> {
-    net::validate_url(&asset.url, allow_private).map_err(|_| ())?;
+) -> Result<FetchedBody, FetchFailure> {
+    net::validate_url(&asset.url, allow_private).map_err(|_| FetchFailure::Other)?;
     let mut request = client.get(asset.url.clone());
     if is_next_rsc_payload(&asset.url) {
         request = request.header("RSC", "1");
@@ -258,7 +268,7 @@ async fn fetch_asset_body(
         }
     }
 
-    let response = request.send().await.map_err(|_| ())?;
+    let response = request.send().await.map_err(|_| FetchFailure::Other)?;
     if !FIRST_ASSET_RESPONSE_TRACED.swap(true, Ordering::Relaxed) {
         net::trace_response_version("asset", &asset.url, &response);
     }
@@ -278,16 +288,21 @@ async fn fetch_asset_body(
                 cache::AssetValidators::default(),
             ));
         }
-        return Err(());
+        return Err(match status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => FetchFailure::Unauthorized,
+            _ => FetchFailure::Other,
+        });
     }
 
     let validators = asset_validators(response.headers());
-    let body = net::read_limited(response).await.map_err(|_| ())?;
+    let body = net::read_limited(response)
+        .await
+        .map_err(|_| FetchFailure::Other)?;
     let scan_url = asset.url.clone();
     let kind = asset.document_kind();
     let scan = tokio::task::spawn_blocking(move || discover::scan_document(&body, &scan_url, kind))
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| FetchFailure::Other)?;
     Ok(FetchedBody::Body(scan, validators))
 }
 

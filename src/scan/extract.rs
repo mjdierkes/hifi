@@ -11,15 +11,87 @@ pub(crate) fn url_arg(bytes: &[u8], start: usize) -> Option<String> {
     }
 
     let mut i = source::skip_ws(bytes, start);
-    let quote = *bytes.get(i)?;
-    if !matches!(quote, b'"' | b'\'' | b'`') {
+    let next = *bytes.get(i)?;
+    if matches!(next, b'"' | b'\'' | b'`') {
+        i += 1;
+        if next == b'`' && bytes.get(i..i + 2) == Some(b"${") {
+            i = source::skip_template_expr(bytes, i + 2);
+        }
+        return source::quoted_string(bytes, i, next, TemplateMode::ReplaceExpressions);
+    }
+    // Bundlers commonly hoist URLs into a local variable: `let t = `${base}/api/foo`; fetch(t, {...})`.
+    // When the call argument is a bare identifier, look backward for its most
+    // recent assignment so we can still attach the call shape to the URL.
+    resolve_var_url(bytes, i)
+}
+
+fn resolve_var_url(bytes: &[u8], pos: usize) -> Option<String> {
+    let ident = read_identifier(bytes, pos)?;
+    if ident.is_empty() || !is_ident_continue(ident[0]) {
         return None;
     }
-    i += 1;
-    if quote == b'`' && bytes.get(i..i + 2) == Some(b"${") {
-        i = source::skip_template_expr(bytes, i + 2);
+
+    const LOOKBACK_WINDOW: usize = 2048;
+    let start = pos.saturating_sub(LOOKBACK_WINDOW);
+    let mut search_from = start;
+    let mut latest_url: Option<String> = None;
+    while let Some(rel) = memchr::memmem::find(&bytes[search_from..pos], ident) {
+        let match_pos = search_from + rel;
+        let after = match_pos + ident.len();
+        search_from = match_pos + 1;
+
+        if match_pos > 0 && is_ident_continue(bytes[match_pos - 1]) {
+            continue;
+        }
+        if bytes.get(after).is_some_and(|b| is_ident_continue(*b)) {
+            continue;
+        }
+
+        let mut j = source::skip_ws(bytes, after);
+        if bytes.get(j) != Some(&b'=') {
+            continue;
+        }
+        // Skip `==` and `===`; those are comparisons, not assignments.
+        if bytes.get(j + 1) == Some(&b'=') {
+            continue;
+        }
+        j = source::skip_ws(bytes, j + 1);
+        let quote = match bytes.get(j) {
+            Some(&q) if matches!(q, b'"' | b'\'' | b'`') => q,
+            _ => continue,
+        };
+        let mut value_start = j + 1;
+        if quote == b'`' && bytes.get(value_start..value_start + 2) == Some(b"${") {
+            value_start = source::skip_template_expr(bytes, value_start + 2);
+        }
+        if let Some(url) =
+            source::quoted_string(bytes, value_start, quote, TemplateMode::ReplaceExpressions)
+        {
+            latest_url = Some(url);
+        }
     }
-    source::quoted_string(bytes, i, quote, TemplateMode::ReplaceExpressions)
+    latest_url
+}
+
+fn read_identifier(bytes: &[u8], start: usize) -> Option<&[u8]> {
+    let first = *bytes.get(start)?;
+    if !is_ident_start(first) {
+        return None;
+    }
+    let end = bytes[start..]
+        .iter()
+        .position(|b| !is_ident_continue(*b))
+        .map(|rel| start + rel)
+        .unwrap_or(bytes.len());
+    Some(&bytes[start..end])
+}
+
+fn is_ident_start(b: u8) -> bool {
+    b == b'_' || b == b'$' || b.is_ascii_alphabetic()
+}
+
+fn is_ident_continue(b: u8) -> bool {
+    b == b'_' || b == b'$' || b.is_ascii_alphanumeric()
 }
 
 pub(crate) fn value_after_anchor(bytes: &[u8], mut i: usize) -> Option<String> {

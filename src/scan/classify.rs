@@ -31,6 +31,7 @@ pub(crate) fn is_url_like(s: &str) -> bool {
         && (s.starts_with('/') || s.starts_with("http://") || s.starts_with("https://"))
         && s != "/"
         && !has_bare_dynamic_suffix(s)
+        && !is_only_dynamic_segments(s)
         && !bad_ext(bytes, BAD_EXTS, false)
         && !has_markup_noise(bytes)
         && bytes.iter().any(u8::is_ascii_alphanumeric)
@@ -61,16 +62,19 @@ fn is_route_like(s: &str) -> bool {
         && bytes.iter().any(u8::is_ascii_alphanumeric)
         && !bad_ext(bytes, ROUTE_BAD_EXTS, true)
         && !has_markup_noise(bytes)
+        && !is_only_dynamic_segments(s)
 }
 
 // Reject strings that contain raw or percent-encoded markup. They are
 // produced by inline SVG/HTML literals (e.g. Next.js's blur-SVG generator
 // emitting "...%3E%3CfeGaussianBlur..."), never by real route or URL literals.
 fn has_markup_noise(bytes: &[u8]) -> bool {
-    if bytes
-        .iter()
-        .any(|b| matches!(*b, b'<' | b'>' | b'"' | b'\'' | b' ' | b'\n' | b'\r' | b'\t'))
-    {
+    if bytes.iter().any(|b| {
+        matches!(
+            *b,
+            b'<' | b'>' | b'"' | b'\'' | b' ' | b'\n' | b'\r' | b'\t'
+        )
+    }) {
         return true;
     }
     let mut i = 0;
@@ -93,6 +97,18 @@ fn has_bare_dynamic_suffix(s: &str) -> bool {
         return false;
     };
     pos > 0 && s.as_bytes()[pos - 1].is_ascii_alphanumeric()
+}
+
+// A URL whose only non-empty segments are `{dynamic}` carries no information
+// — it can only come from a template that interpolates a variable with no
+// surrounding literal text (e.g. `fetch(`/${x}`)`).
+fn is_only_dynamic_segments(s: &str) -> bool {
+    let path = s.split('?').next().unwrap_or(s);
+    let path = path.strip_prefix("http://").unwrap_or(path);
+    let path = path.strip_prefix("https://").unwrap_or(path);
+    let path = path.split_once('/').map(|(_, rest)| rest).unwrap_or(path);
+    path.split('/')
+        .all(|seg| seg.is_empty() || seg == "{dynamic}")
 }
 
 fn bad_ext(s: &[u8], exts: &[&str], strip_fragment: bool) -> bool {
