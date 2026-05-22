@@ -14,8 +14,7 @@ use crate::runtime::config::RuntimeConfig;
 use crate::runtime::engine;
 use crate::runtime::http::Client;
 use crate::runtime::net;
-use std::io;
-use thiserror::Error;
+use std::{fmt, io};
 
 const HELP: &str = "\
 hifi - extract internal APIs from web app bytes
@@ -41,20 +40,40 @@ GREP FLAGS:
     -a, --all                    print all hits
 ";
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum AppError {
-    #[error("{0}")]
     Message(String),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    #[error(transparent)]
-    Net(#[from] net::NetError),
-    #[error(transparent)]
-    Http(#[from] crate::runtime::http::Error),
-    #[error(transparent)]
-    Runtime(#[from] crate::runtime::engine::RuntimeError),
-    #[error(transparent)]
-    Url(#[from] crate::url::ParseError),
+    Io(io::Error),
+    Net(net::NetError),
+    Http(crate::runtime::http::Error),
+    Runtime(crate::runtime::engine::RuntimeError),
+    Url(crate::url::ParseError),
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Message(message) => f.write_str(message),
+            Self::Io(err) => err.fmt(f),
+            Self::Net(err) => err.fmt(f),
+            Self::Http(err) => err.fmt(f),
+            Self::Runtime(err) => err.fmt(f),
+            Self::Url(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for AppError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Message(_) => None,
+            Self::Io(err) => Some(err),
+            Self::Net(err) => Some(err),
+            Self::Http(err) => Some(err),
+            Self::Runtime(err) => Some(err),
+            Self::Url(err) => Some(err),
+        }
+    }
 }
 
 impl From<String> for AppError {
@@ -66,6 +85,36 @@ impl From<String> for AppError {
 impl From<&'static str> for AppError {
     fn from(value: &'static str) -> Self {
         Self::Message(value.to_string())
+    }
+}
+
+impl From<io::Error> for AppError {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<net::NetError> for AppError {
+    fn from(err: net::NetError) -> Self {
+        Self::Net(err)
+    }
+}
+
+impl From<crate::runtime::http::Error> for AppError {
+    fn from(err: crate::runtime::http::Error) -> Self {
+        Self::Http(err)
+    }
+}
+
+impl From<crate::runtime::engine::RuntimeError> for AppError {
+    fn from(err: crate::runtime::engine::RuntimeError) -> Self {
+        Self::Runtime(err)
+    }
+}
+
+impl From<crate::url::ParseError> for AppError {
+    fn from(err: crate::url::ParseError) -> Self {
+        Self::Url(err)
     }
 }
 

@@ -9,14 +9,13 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rustls::{client::Resumption, RootCertStore};
 use rustls_pki_types::ServerName;
 use std::{
-    fmt, io,
+    error, fmt, io,
     io::IoSlice,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
     },
 };
-use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::TcpStream,
@@ -73,24 +72,46 @@ pub struct Request {
     headers: Vec<(String, String)>,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum Error {
-    #[error("unsupported URL scheme '{0}'")]
     BadScheme(String),
-    #[error("URL has no host")]
     MissingHost,
-    #[error("invalid TLS server name '{0}'")]
     BadDnsName(String),
-    #[error("HTTP/2 protocol error: {0}")]
     H2(&'static str),
-    #[error("HTTP/2 peer error code {0}")]
     H2Code(u32),
-    #[error("HTTP/2 connection closed")]
     H2Closed,
-    #[error("HTTP/1.1 response parse error")]
     BadHttp1,
-    #[error(transparent)]
-    Io(#[from] io::Error),
+    Io(io::Error),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadScheme(scheme) => write!(f, "unsupported URL scheme '{scheme}'"),
+            Self::MissingHost => f.write_str("URL has no host"),
+            Self::BadDnsName(name) => write!(f, "invalid TLS server name '{name}'"),
+            Self::H2(message) => write!(f, "HTTP/2 protocol error: {message}"),
+            Self::H2Code(code) => write!(f, "HTTP/2 peer error code {code}"),
+            Self::H2Closed => f.write_str("HTTP/2 connection closed"),
+            Self::BadHttp1 => f.write_str("HTTP/1.1 response parse error"),
+            Self::Io(err) => err.fmt(f),
+        }
+    }
+}
+
+impl error::Error for Error {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
+    }
 }
 
 impl Client {

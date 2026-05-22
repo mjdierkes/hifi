@@ -6,20 +6,54 @@ use crate::scan::{Evidence, EvidenceKind, Shape};
 use super::{cache, fetch, http::Client, net};
 use crate::url::Url;
 use std::collections::BTreeMap;
-use std::{sync::Arc, time::Instant};
-use thiserror::Error;
+use std::{fmt, sync::Arc, time::Instant};
 
 type Result<T, E = RuntimeError> = std::result::Result<T, E>;
 pub use fetch::MAX_TOTAL_ASSETS;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum RuntimeError {
-    #[error(transparent)]
-    Net(#[from] net::NetError),
-    #[error(transparent)]
-    Url(#[from] crate::url::ParseError),
-    #[error(transparent)]
-    Join(#[from] tokio::task::JoinError),
+    Net(net::NetError),
+    Url(crate::url::ParseError),
+    Join(tokio::task::JoinError),
+}
+
+impl fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Net(err) => err.fmt(f),
+            Self::Url(err) => err.fmt(f),
+            Self::Join(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Net(err) => Some(err),
+            Self::Url(err) => Some(err),
+            Self::Join(err) => Some(err),
+        }
+    }
+}
+
+impl From<net::NetError> for RuntimeError {
+    fn from(err: net::NetError) -> Self {
+        Self::Net(err)
+    }
+}
+
+impl From<crate::url::ParseError> for RuntimeError {
+    fn from(err: crate::url::ParseError) -> Self {
+        Self::Url(err)
+    }
+}
+
+impl From<tokio::task::JoinError> for RuntimeError {
+    fn from(err: tokio::task::JoinError) -> Self {
+        Self::Join(err)
+    }
 }
 
 #[derive(Clone, Debug)]
