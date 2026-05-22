@@ -33,7 +33,6 @@ pub const CHUNK_URL_FRESH_SECS: u64 = 24 * 60 * 60;
 /// background revalidate. Past this point we still revalidate in the
 /// foreground via a conditional GET; the content cache makes that cheap.
 pub const CHUNK_URL_STALE_SECS: u64 = 30 * 24 * 60 * 60;
-const CHUNK_CACHE_MAX_BYTES: u64 = 500 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ScanCache {
@@ -43,25 +42,20 @@ pub struct ScanCache {
 impl ScanCache {
     pub fn for_base(base: &Url) -> Self {
         Self {
-            path: path_for(base),
+            path: scanner_hashed_path("processed", base, None, "bin"),
         }
     }
 
     pub fn read_fresh_binary(&self) -> Option<(Vec<u8>, u64)> {
-        read_fresh(&binary_path_for(&self.path), CACHE_FRESH_SECS)
+        read_fresh(&self.path, CACHE_FRESH_SECS)
     }
 
     pub fn read_stale_binary(&self) -> Option<Vec<u8>> {
-        read_fresh(&binary_path_for(&self.path), CACHE_STALE_SECS).map(|(bytes, _)| bytes)
-    }
-
-    #[allow(dead_code)]
-    pub fn write_binary(&self, bytes: &[u8]) {
-        write_bytes(&binary_path_for(&self.path), bytes);
+        read_fresh(&self.path, CACHE_STALE_SECS).map(|(bytes, _)| bytes)
     }
 
     pub fn write_binary_deferred(&self, bytes: Arc<[u8]>) {
-        let path = binary_path_for(&self.path);
+        let path = self.path.clone();
         spawn_cache_write(move || write_bytes(&path, &bytes));
     }
 }
@@ -75,24 +69,19 @@ impl ChunkCache {
     }
 
     pub fn read_fresh_url(&self, url: &Url) -> Option<CachedChunk> {
-        if let Some(entry) = url_index_memory_get(url) {
-            if entry.age_secs < CHUNK_URL_FRESH_SECS {
-                return Some(entry.into_cached());
-            }
-        }
-        let cached = read_chunk_url(url, CHUNK_URL_FRESH_SECS)?;
-        url_index_memory_put(url, &cached);
-        Some(cached)
+        self.read_url(url, CHUNK_URL_FRESH_SECS)
     }
 
     pub fn read_stale_url(&self, url: &Url) -> Option<CachedChunk> {
-        if let Some(entry) = url_index_memory_get(url) {
-            if entry.age_secs < CHUNK_URL_STALE_SECS {
-                return Some(entry.into_cached());
-            }
+        self.read_url(url, CHUNK_URL_STALE_SECS)
+    }
+
+    fn read_url(&self, url: &Url, max_age_secs: u64) -> Option<CachedChunk> {
+        if let Some(cached) = url_index_memory_get(url, max_age_secs) {
+            return Some(cached);
         }
-        let cached = read_chunk_url(url, CHUNK_URL_STALE_SECS)?;
-        url_index_memory_put(url, &cached);
+        let (cached, age_secs) = read_chunk_url(url, max_age_secs)?;
+        url_index_memory_put(url, &cached, age_secs);
         Some(cached)
     }
 
@@ -115,27 +104,8 @@ impl ChunkCache {
         asset: &AssetData,
         validators: &AssetValidators,
     ) {
-        self.write_arc(url, content_hash, Arc::new(asset.clone()), validators);
-    }
-
-    #[allow(dead_code)]
-    pub fn write_arc(
-        &self,
-        url: &Url,
-        content_hash: &str,
-        asset: Arc<AssetData>,
-        validators: &AssetValidators,
-    ) {
-        content_memory_put(content_hash, &asset.findings);
-        url_index_memory_put(
-            url,
-            &CachedChunk {
-                data: asset.clone(),
-                age_secs: 0,
-                validators: validators.clone(),
-                content_hash: content_hash.to_owned(),
-            },
-        );
+        let asset = Arc::new(asset.clone());
+        self.remember(url, content_hash, asset.clone(), validators);
         write_chunk(url, content_hash, &asset, validators);
     }
 
@@ -146,54 +116,37 @@ impl ChunkCache {
         asset: Arc<AssetData>,
         validators: &AssetValidators,
     ) {
-        content_memory_put(content_hash, &asset.findings);
-        url_index_memory_put(
-            url,
-            &CachedChunk {
-                data: asset.clone(),
-                age_secs: 0,
-                validators: validators.clone(),
-                content_hash: content_hash.to_owned(),
-            },
-        );
+        self.remember(url, content_hash, asset.clone(), validators);
         let url = url.clone();
         let content_hash = content_hash.to_owned();
         let validators = validators.clone();
         spawn_cache_write(move || write_chunk(&url, &content_hash, &asset, &validators));
     }
+
+    fn remember(
+        &self,
+        url: &Url,
+        content_hash: &str,
+        asset: Arc<AssetData>,
+        validators: &AssetValidators,
+    ) {
+        content_memory_put(content_hash, &asset.findings);
+        url_index_memory_put(
+            url,
+            &CachedChunk {
+                data: asset,
+                validators: validators.clone(),
+                content_hash: content_hash.to_owned(),
+            },
+            0,
+        );
+    }
 }
 
 #[derive(Clone)]
 struct UrlIndexEntry {
-    data: Arc<AssetData>,
-    validators: AssetValidators,
-    content_hash: String,
+    cached: CachedChunk,
     inserted_at: SystemTime,
-}
-
-impl UrlIndexEntry {
-    fn age_secs(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(self.inserted_at)
-            .map(|d| d.as_secs())
-            .unwrap_or(u64::MAX)
-    }
-}
-
-struct UrlIndexHit {
-    entry: UrlIndexEntry,
-    age_secs: u64,
-}
-
-impl UrlIndexHit {
-    fn into_cached(self) -> CachedChunk {
-        CachedChunk {
-            data: self.entry.data,
-            age_secs: self.age_secs,
-            validators: self.entry.validators,
-            content_hash: self.entry.content_hash,
-        }
-    }
 }
 
 // Conservative caps: each entry holds a full DocumentScan or findings struct,
@@ -215,26 +168,30 @@ fn url_index_memory() -> &'static RwLock<LruCache<String, UrlIndexEntry>> {
     })
 }
 
-fn url_index_memory_get(url: &Url) -> Option<UrlIndexHit> {
+fn url_index_memory_get(url: &Url, max_age_secs: u64) -> Option<CachedChunk> {
     let mut map = url_index_memory().write();
     let entry = map.get(url.as_str())?.clone();
-    let age_secs = entry.age_secs();
-    Some(UrlIndexHit { entry, age_secs })
+    (cache_age_secs(entry.inserted_at) < max_age_secs).then_some(entry.cached)
 }
 
-fn url_index_memory_put(url: &Url, cached: &CachedChunk) {
+fn url_index_memory_put(url: &Url, cached: &CachedChunk, age_secs: u64) {
     let mut map = url_index_memory().write();
     map.put(
         url.as_str().to_owned(),
         UrlIndexEntry {
-            data: cached.data.clone(),
-            validators: cached.validators.clone(),
-            content_hash: cached.content_hash.clone(),
+            cached: cached.clone(),
             inserted_at: SystemTime::now()
-                .checked_sub(std::time::Duration::from_secs(cached.age_secs))
+                .checked_sub(std::time::Duration::from_secs(age_secs))
                 .unwrap_or_else(SystemTime::now),
         },
     );
+}
+
+fn cache_age_secs(inserted_at: SystemTime) -> u64 {
+    SystemTime::now()
+        .duration_since(inserted_at)
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX)
 }
 
 /// Process-wide in-memory cache: content_hash -> findings.
@@ -263,10 +220,6 @@ fn content_memory_put(content_hash: &str, findings: &FindingsBuilder) {
     map.put(content_hash.to_owned(), Arc::new(findings.clone()));
 }
 
-fn binary_path_for(json_path: &Path) -> PathBuf {
-    json_path.with_extension("bin")
-}
-
 fn hash_parts<'a>(parts: impl Iterator<Item = &'a str>) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for p in parts {
@@ -278,10 +231,6 @@ fn hash_parts<'a>(parts: impl Iterator<Item = &'a str>) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
-}
-
-pub fn path_for(base: &Url) -> PathBuf {
-    scanner_hashed_path("processed", base, None, "json")
 }
 
 pub type AssetData = DocumentScan;
@@ -304,21 +253,9 @@ pub struct CachedAsset {
     pub validators: AssetValidators,
 }
 
-struct AssetEnvelope {
-    data: AssetData,
-    validators: AssetValidators,
-}
-
-struct ChunkIndex {
-    validators: AssetValidators,
-    content_hash: String,
-    data: AssetData,
-}
-
+#[derive(Clone)]
 pub struct CachedChunk {
     pub data: Arc<AssetData>,
-    #[allow(dead_code)]
-    pub age_secs: u64,
     pub validators: AssetValidators,
     pub content_hash: String,
 }
@@ -327,57 +264,53 @@ const ASSET_MAGIC: &[u8; 8] = b"HIFICA1\0";
 const CHUNK_INDEX_MAGIC: &[u8; 8] = b"HIFICI1\0";
 const FINDINGS_MAGIC: &[u8; 8] = b"HIFICF1\0";
 
-fn encode_asset_envelope(envelope: &AssetEnvelope) -> Vec<u8> {
-    let mut out = Vec::with_capacity(envelope.data.findings.evidence.len() * 48 + 128);
-    out.extend_from_slice(ASSET_MAGIC);
-    put_validators(&mut out, &envelope.validators);
-    put_document_scan(&mut out, &envelope.data);
+fn encode_cached_scan(
+    magic: &[u8; 8],
+    validators: &AssetValidators,
+    content_hash: Option<&str>,
+    data: &AssetData,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.findings.evidence.len() * 48 + 160);
+    out.extend_from_slice(magic);
+    put_validators(&mut out, validators);
+    if let Some(content_hash) = content_hash {
+        super::wire::put_string(&mut out, content_hash);
+    }
+    put_document_scan(&mut out, data);
     out
 }
 
-fn decode_asset_envelope(bytes: &[u8]) -> Option<AssetEnvelope> {
+fn decode_cached_scan(
+    bytes: &[u8],
+    magic: &[u8; 8],
+    has_content_hash: bool,
+) -> Option<(AssetValidators, Option<String>, AssetData)> {
     let mut r = super::wire::Reader::new(bytes);
-    (r.take_exact(ASSET_MAGIC.len())? == ASSET_MAGIC).then_some(())?;
+    (r.take_exact(magic.len())? == magic).then_some(())?;
     let validators = read_validators(&mut r)?;
+    let content_hash = if has_content_hash {
+        Some(r.string()?)
+    } else {
+        None
+    };
     let data = read_document_scan(&mut r)?;
     r.finish()?;
-    Some(AssetEnvelope { data, validators })
-}
-
-fn encode_chunk_index(index: &ChunkIndex) -> Vec<u8> {
-    let mut out = Vec::with_capacity(index.data.findings.evidence.len() * 48 + 160);
-    out.extend_from_slice(CHUNK_INDEX_MAGIC);
-    put_validators(&mut out, &index.validators);
-    super::wire::put_string(&mut out, &index.content_hash);
-    put_document_scan(&mut out, &index.data);
-    out
-}
-
-fn decode_chunk_index(bytes: &[u8]) -> Option<ChunkIndex> {
-    let mut r = super::wire::Reader::new(bytes);
-    (r.take_exact(CHUNK_INDEX_MAGIC.len())? == CHUNK_INDEX_MAGIC).then_some(())?;
-    let validators = read_validators(&mut r)?;
-    let content_hash = r.string()?;
-    let data = read_document_scan(&mut r)?;
-    r.finish()?;
-    Some(ChunkIndex {
-        validators,
-        content_hash,
-        data,
-    })
+    Some((validators, content_hash, data))
 }
 
 fn encode_findings(findings: &FindingsBuilder) -> Vec<u8> {
     let mut out = Vec::with_capacity(findings.evidence.len() * 48 + 16);
     out.extend_from_slice(FINDINGS_MAGIC);
-    put_findings(&mut out, findings);
+    put_evidence_vec(&mut out, &findings.evidence);
     out
 }
 
 fn decode_findings(bytes: &[u8]) -> Option<FindingsBuilder> {
     let mut r = super::wire::Reader::new(bytes);
     (r.take_exact(FINDINGS_MAGIC.len())? == FINDINGS_MAGIC).then_some(())?;
-    let findings = read_findings(&mut r)?;
+    let findings = FindingsBuilder {
+        evidence: read_evidence_vec(&mut r)?,
+    };
     r.finish()?;
     Some(findings)
 }
@@ -391,16 +324,6 @@ fn read_validators(r: &mut super::wire::Reader<'_>) -> Option<AssetValidators> {
     Some(AssetValidators {
         etag: r.opt_string()?,
         last_modified: r.opt_string()?,
-    })
-}
-
-fn put_findings(out: &mut Vec<u8>, findings: &FindingsBuilder) {
-    put_evidence_vec(out, &findings.evidence);
-}
-
-fn read_findings(r: &mut super::wire::Reader<'_>) -> Option<FindingsBuilder> {
-    Some(FindingsBuilder {
-        evidence: read_evidence_vec(r)?,
     })
 }
 
@@ -502,6 +425,23 @@ fn read_shape(r: &mut super::wire::Reader<'_>) -> Option<Shape> {
     ))
 }
 
+macro_rules! u8_codec {
+    ($to:ident, $from:ident, $ty:ty, { $($variant:path => $value:literal),+ $(,)? }) => {
+        fn $to(value: $ty) -> u8 {
+            match value {
+                $($variant => $value,)+
+            }
+        }
+
+        fn $from(value: u8) -> Option<$ty> {
+            match value {
+                $($value => Some($variant),)+
+                _ => None,
+            }
+        }
+    };
+}
+
 fn put_framework(out: &mut Vec<u8>, framework: &FrameworkConfig) {
     match framework {
         FrameworkConfig::None => out.push(0),
@@ -542,125 +482,57 @@ fn read_framework(r: &mut super::wire::Reader<'_>) -> Option<FrameworkConfig> {
     }
 }
 
-fn evidence_kind_to_u8(kind: EvidenceKind) -> u8 {
-    match kind {
-        EvidenceKind::Api => 0,
-        EvidenceKind::Route => 1,
-        EvidenceKind::Candidate => 2,
-    }
-}
+u8_codec!(evidence_kind_to_u8, evidence_kind_from_u8, EvidenceKind, {
+    EvidenceKind::Api => 0,
+    EvidenceKind::Route => 1,
+    EvidenceKind::Candidate => 2,
+});
 
-fn evidence_kind_from_u8(value: u8) -> Option<EvidenceKind> {
-    match value {
-        0 => Some(EvidenceKind::Api),
-        1 => Some(EvidenceKind::Route),
-        2 => Some(EvidenceKind::Candidate),
-        _ => None,
-    }
-}
+u8_codec!(extractor_to_u8, extractor_from_u8, Extractor, {
+    Extractor::Literal => 0,
+    Extractor::Manifest => 1,
+    Extractor::Flight => 2,
+    Extractor::ApiCall => 3,
+    Extractor::RouteCall => 4,
+    Extractor::ServerAction => 5,
+    Extractor::NuxtPayload => 6,
+    Extractor::SvelteKitData => 7,
+    Extractor::RemixManifest => 8,
+    Extractor::AstroIsland => 9,
+    Extractor::ApiClient => 10,
+});
 
-fn extractor_to_u8(extractor: Extractor) -> u8 {
-    match extractor {
-        Extractor::Literal => 0,
-        Extractor::Manifest => 1,
-        Extractor::Flight => 2,
-        Extractor::ApiCall => 3,
-        Extractor::RouteCall => 4,
-        Extractor::ServerAction => 5,
-        Extractor::NuxtPayload => 6,
-        Extractor::SvelteKitData => 7,
-        Extractor::RemixManifest => 8,
-        Extractor::AstroIsland => 9,
-        Extractor::ApiClient => 10,
-    }
-}
+u8_codec!(confidence_to_u8, confidence_from_u8, Confidence, {
+    Confidence::Observed => 0,
+    Confidence::Parsed => 1,
+    Confidence::Inferred => 2,
+    Confidence::Candidate => 3,
+});
 
-fn extractor_from_u8(value: u8) -> Option<Extractor> {
-    match value {
-        0 => Some(Extractor::Literal),
-        1 => Some(Extractor::Manifest),
-        2 => Some(Extractor::Flight),
-        3 => Some(Extractor::ApiCall),
-        4 => Some(Extractor::RouteCall),
-        5 => Some(Extractor::ServerAction),
-        6 => Some(Extractor::NuxtPayload),
-        7 => Some(Extractor::SvelteKitData),
-        8 => Some(Extractor::RemixManifest),
-        9 => Some(Extractor::AstroIsland),
-        10 => Some(Extractor::ApiClient),
-        _ => None,
-    }
-}
+u8_codec!(asset_kind_to_u8, asset_kind_from_u8, AssetKind, {
+    AssetKind::Script => 0,
+    AssetKind::Manifest => 1,
+    AssetKind::Payload => 2,
+});
 
-fn confidence_to_u8(confidence: Confidence) -> u8 {
-    match confidence {
-        Confidence::Observed => 0,
-        Confidence::Parsed => 1,
-        Confidence::Inferred => 2,
-        Confidence::Candidate => 3,
-    }
-}
-
-fn confidence_from_u8(value: u8) -> Option<Confidence> {
-    match value {
-        0 => Some(Confidence::Observed),
-        1 => Some(Confidence::Parsed),
-        2 => Some(Confidence::Inferred),
-        3 => Some(Confidence::Candidate),
-        _ => None,
-    }
-}
-
-fn asset_kind_to_u8(kind: AssetKind) -> u8 {
-    match kind {
-        AssetKind::Script => 0,
-        AssetKind::Manifest => 1,
-        AssetKind::Payload => 2,
-    }
-}
-
-fn asset_kind_from_u8(value: u8) -> Option<AssetKind> {
-    match value {
-        0 => Some(AssetKind::Script),
-        1 => Some(AssetKind::Manifest),
-        2 => Some(AssetKind::Payload),
-        _ => None,
-    }
-}
-
-fn asset_source_to_u8(source: AssetSource) -> u8 {
-    match source {
-        AssetSource::HtmlScript => 0,
-        AssetSource::HtmlPreload => 1,
-        AssetSource::Literal => 2,
-        AssetSource::DynamicImport => 3,
-        AssetSource::NewUrl => 4,
-        AssetSource::NextManifest => 5,
-        AssetSource::FrameworkManifest => 6,
-    }
-}
-
-fn asset_source_from_u8(value: u8) -> Option<AssetSource> {
-    match value {
-        0 => Some(AssetSource::HtmlScript),
-        1 => Some(AssetSource::HtmlPreload),
-        2 => Some(AssetSource::Literal),
-        3 => Some(AssetSource::DynamicImport),
-        4 => Some(AssetSource::NewUrl),
-        5 => Some(AssetSource::NextManifest),
-        6 => Some(AssetSource::FrameworkManifest),
-        _ => None,
-    }
-}
+u8_codec!(asset_source_to_u8, asset_source_from_u8, AssetSource, {
+    AssetSource::HtmlScript => 0,
+    AssetSource::HtmlPreload => 1,
+    AssetSource::Literal => 2,
+    AssetSource::DynamicImport => 3,
+    AssetSource::NewUrl => 4,
+    AssetSource::NextManifest => 5,
+    AssetSource::FrameworkManifest => 6,
+});
 
 pub fn read_asset_cached(url: &Url, cache_key: Option<&str>) -> Option<CachedAsset> {
     let path = asset_path_for(url, cache_key);
     let (bytes, age_secs) = read_fresh(&path, CACHE_STALE_SECS)?;
-    let envelope = decode_asset_envelope(&bytes)?;
+    let (validators, _, data) = decode_cached_scan(&bytes, ASSET_MAGIC, false)?;
     Some(CachedAsset {
-        data: envelope.data,
+        data,
         age_secs,
-        validators: envelope.validators,
+        validators,
     })
 }
 
@@ -674,10 +546,7 @@ pub fn write_asset_with_validators(
     let path = asset_path_for(url, cache_key);
     write_bytes(
         &path,
-        &encode_asset_envelope(&AssetEnvelope {
-            data: asset.clone(),
-            validators: validators.clone(),
-        }),
+        &encode_cached_scan(ASSET_MAGIC, validators, None, asset),
     );
 }
 
@@ -692,10 +561,7 @@ pub fn write_asset_with_validators_deferred(
     spawn_cache_write(move || {
         write_bytes(
             &path,
-            &encode_asset_envelope(&AssetEnvelope {
-                data: (*asset).clone(),
-                validators,
-            }),
+            &encode_cached_scan(ASSET_MAGIC, &validators, None, &asset),
         );
     });
 }
@@ -712,28 +578,25 @@ fn write_chunk(url: &Url, content_hash: &str, asset: &AssetData, validators: &As
     );
     write_bytes(
         &chunk_index_path_for(url),
-        &encode_chunk_index(&ChunkIndex {
-            validators: validators.clone(),
-            content_hash: content_hash.to_owned(),
-            data: asset.clone(),
-        }),
+        &encode_cached_scan(CHUNK_INDEX_MAGIC, validators, Some(content_hash), asset),
     );
-    prune_chunk_cache(CHUNK_CACHE_MAX_BYTES);
 }
 
 fn asset_path_for(url: &Url, cache_key: Option<&str>) -> PathBuf {
     scanner_hashed_path("assets", url, cache_key, "bin")
 }
 
-fn read_chunk_url(url: &Url, max_age_secs: u64) -> Option<CachedChunk> {
+fn read_chunk_url(url: &Url, max_age_secs: u64) -> Option<(CachedChunk, u64)> {
     let (bytes, age_secs) = read_fresh(&chunk_index_path_for(url), max_age_secs)?;
-    let index = decode_chunk_index(&bytes)?;
-    Some(CachedChunk {
-        data: Arc::new(index.data),
+    let (validators, content_hash, data) = decode_cached_scan(&bytes, CHUNK_INDEX_MAGIC, true)?;
+    Some((
+        CachedChunk {
+            data: Arc::new(data),
+            validators,
+            content_hash: content_hash?,
+        },
         age_secs,
-        validators: index.validators,
-        content_hash: index.content_hash,
-    })
+    ))
 }
 
 fn spawn_cache_write(write: impl FnOnce() + Send + 'static) {
@@ -769,61 +632,12 @@ fn prefixed_path(kind: &str, name: &str, ext: &str) -> PathBuf {
     p
 }
 
-fn prune_chunk_cache(max_bytes: u64) {
-    let mut files = Vec::new();
-    collect_cache_files(&dir().join("chunks"), &mut files);
-    let mut total: u64 = files.iter().map(|entry| entry.len).sum();
-    if total <= max_bytes {
-        return;
-    }
-
-    files.sort_by_key(|entry| entry.modified);
-    for entry in files {
-        if total <= max_bytes {
-            break;
-        }
-        if fs::remove_file(&entry.path).is_ok() {
-            total = total.saturating_sub(entry.len);
-        }
-    }
-}
-
-struct CacheFile {
-    path: PathBuf,
-    len: u64,
-    modified: SystemTime,
-}
-
-fn collect_cache_files(path: &Path, out: &mut Vec<CacheFile>) {
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if meta.is_dir() {
-            collect_cache_files(&entry.path(), out);
-        } else if meta.is_file() {
-            out.push(CacheFile {
-                path: entry.path(),
-                len: meta.len(),
-                modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-            });
-        }
-    }
-}
-
 fn scanner_hashed_path(kind: &str, url: &Url, cache_key: Option<&str>, ext: &str) -> PathBuf {
     let hash = hash_parts(
         std::iter::once(SCANNER_CACHE_VERSION)
             .chain(cache_key)
             .chain(std::iter::once(url.as_str())),
     );
-    hashed_path_with_hash(kind, url, hash, ext)
-}
-
-fn hashed_path_with_hash(kind: &str, url: &Url, hash: u64, ext: &str) -> PathBuf {
     use std::fmt::Write;
     let base = dir();
     let mut p = PathBuf::with_capacity(base.as_os_str().len() + kind.len() + 64);
