@@ -142,6 +142,38 @@ impl Shape {
         shape.ensure_default_method();
         shape
     }
+
+    pub(crate) fn binary_parts(&self) -> (u8, bool, bool, u8, bool, bool, &[String]) {
+        (
+            self.methods,
+            self.has_body,
+            self.has_headers,
+            self.content_types,
+            self.auth,
+            self.next_server_action,
+            &self.query_params,
+        )
+    }
+
+    pub(crate) fn from_binary_parts(
+        methods: u8,
+        has_body: bool,
+        has_headers: bool,
+        content_types: u8,
+        auth: bool,
+        next_server_action: bool,
+        query_params: Vec<String>,
+    ) -> Self {
+        Self {
+            methods,
+            has_body,
+            has_headers,
+            content_types,
+            auth,
+            next_server_action,
+            query_params,
+        }
+    }
 }
 
 fn is_false(value: &bool) -> bool {

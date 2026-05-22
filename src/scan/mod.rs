@@ -27,7 +27,7 @@ pub type ApiMap = FxHashMap<String, Shape>;
 pub type CandidateMap = FxHashMap<String, ()>;
 pub type RouteMap = FxHashMap<String, ()>;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
     Api,
@@ -35,7 +35,7 @@ pub enum EvidenceKind {
     Candidate,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Extractor {
     Literal,
@@ -159,17 +159,17 @@ impl FindingsBuilder {
     }
 
     fn compact(&mut self) {
+        let mut seen = FxHashMap::<(String, EvidenceKind, Extractor), usize>::default();
         let mut compacted: Vec<Evidence> = Vec::with_capacity(self.evidence.len());
         for evidence in self.evidence.drain(..) {
-            if let Some(existing) = compacted.iter_mut().find(|existing| {
-                existing.url == evidence.url
-                    && existing.kind == evidence.kind
-                    && existing.extractor == evidence.extractor
-            }) {
+            let key = (evidence.url.clone(), evidence.kind, evidence.extractor);
+            if let Some(index) = seen.get(&key).copied() {
+                let existing = &mut compacted[index];
                 if let (Some(dst), Some(src)) = (&mut existing.shape, &evidence.shape) {
                     dst.merge(src);
                 }
             } else {
+                seen.insert(key, compacted.len());
                 compacted.push(evidence);
             }
         }

@@ -100,6 +100,19 @@ pub async fn get_limited(
 }
 
 pub async fn read_limited(response: Response) -> Result<Bytes, NetError> {
+    read_limited_inner(response, None)
+        .await
+        .map(|(body, _)| body)
+}
+
+pub async fn read_limited_hashed(response: Response) -> Result<(Bytes, u64), NetError> {
+    read_limited_inner(response, Some(0xcbf29ce484222325)).await
+}
+
+async fn read_limited_inner(
+    response: Response,
+    mut hash: Option<u64>,
+) -> Result<(Bytes, u64), NetError> {
     let content_length = response.content_length();
     if let Some(len) = content_length {
         if len > MAX_RESPONSE_BYTES {
@@ -122,9 +135,15 @@ pub async fn read_limited(response: Response) -> Result<Bytes, NetError> {
                 limit: MAX_RESPONSE_BYTES,
             });
         }
+        if let Some(h) = hash.as_mut() {
+            for b in &chunk {
+                *h ^= *b as u64;
+                *h = h.wrapping_mul(0x100000001b3);
+            }
+        }
         body.extend_from_slice(&chunk);
     }
-    Ok(body.freeze())
+    Ok((body.freeze(), hash.unwrap_or(0)))
 }
 
 pub async fn get_bytes_limited(

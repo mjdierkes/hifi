@@ -28,6 +28,7 @@ use url::Url;
 
 const ASSET_MEMORY_CACHE_MAX_ENTRIES: usize = 1024;
 pub const MAX_TOTAL_ASSETS: usize = 2048;
+const MAX_LOW_SIGNAL_ASSETS: usize = 64;
 static FIRST_ASSET_RESPONSE_TRACED: AtomicBool = AtomicBool::new(false);
 
 pub type AssetMemoryCache = Arc<RwLock<LruCache<String, (Arc<AssetData>, Instant)>>>;
@@ -57,6 +58,7 @@ pub struct AssetScanStats {
     pub memory_hits: usize,
     pub failed: usize,
     pub unauthorized: usize,
+    pub skipped_low_signal: usize,
     pub capped: bool,
     pub failed_urls: Vec<Url>,
 }
@@ -86,7 +88,14 @@ pub async fn scan_assets(
     let mut stats = AssetScanStats::default();
     let mut visited = rustc_hash::FxHashSet::default();
     let mut queue = VecDeque::new();
-    enqueue_assets(initial, &mut visited, &mut queue, &mut stats);
+    let mut low_signal_enqueued = 0;
+    enqueue_assets(
+        initial,
+        &mut visited,
+        &mut queue,
+        &mut stats,
+        &mut low_signal_enqueued,
+    );
 
     let mut fetched = FuturesUnordered::new();
     let concurrency = opts.concurrency.max(1);
@@ -121,6 +130,7 @@ pub async fn scan_assets(
                     &mut visited,
                     &mut queue,
                     &mut stats,
+                    &mut low_signal_enqueued,
                 );
             }
             Err((asset, reason)) => {
@@ -144,6 +154,7 @@ fn enqueue_assets(
     visited: &mut rustc_hash::FxHashSet<Url>,
     queue: &mut VecDeque<AssetRef>,
     stats: &mut AssetScanStats,
+    low_signal_enqueued: &mut usize,
 ) {
     let mut pending = Vec::new();
     for asset in assets {
@@ -151,7 +162,15 @@ fn enqueue_assets(
             if !visited.contains(&asset.url) {
                 stats.capped = true;
             }
+        } else if visited.contains(&asset.url) {
+            continue;
+        } else if is_low_signal_asset(&asset) && *low_signal_enqueued >= MAX_LOW_SIGNAL_ASSETS {
+            visited.insert(asset.url.clone());
+            stats.skipped_low_signal += 1;
         } else if visited.insert(asset.url.clone()) {
+            if is_low_signal_asset(&asset) {
+                *low_signal_enqueued += 1;
+            }
             pending.push(asset);
         }
     }
@@ -177,6 +196,10 @@ fn asset_priority(asset: &AssetRef) -> u8 {
             }
         }
     }
+}
+
+fn is_low_signal_asset(asset: &AssetRef) -> bool {
+    asset.kind == discover::AssetKind::Script && is_low_signal_script_path(asset.url.path())
 }
 
 fn is_low_signal_script_path(path: &str) -> bool {
@@ -375,11 +398,20 @@ async fn fetch_asset_body(
 
     let validators = asset_validators(response.headers());
     let kind = asset.document_kind();
-    let body = net::read_limited(response)
-        .await
-        .map_err(|_| FetchFailure::Other)?;
+    let (body, streamed_hash) = if use_hash_cache && kind == discover::DocumentKind::Script {
+        net::read_limited_hashed(response)
+            .await
+            .map_err(|_| FetchFailure::Other)?
+    } else {
+        (
+            net::read_limited(response)
+                .await
+                .map_err(|_| FetchFailure::Other)?,
+            0,
+        )
+    };
     let findings_hash =
-        (use_hash_cache && kind == discover::DocumentKind::Script).then(|| cache::body_hash(&body));
+        (use_hash_cache && kind == discover::DocumentKind::Script).then_some(streamed_hash);
     let cached_findings = findings_hash.and_then(|hash| cache::read_findings_by_hash(hash, kind));
     let had_cached_findings = cached_findings.is_some();
     let scan_url = current_url;

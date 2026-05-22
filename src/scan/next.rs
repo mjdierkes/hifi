@@ -47,24 +47,14 @@ pub fn parse_next_data(bytes: &[u8]) -> Option<NextConfig> {
     let close =
         source::find_ascii_ignore_case(&bytes[tag_end..], b"</script>").map(|rel| tag_end + rel)?;
     let payload = bytes.get(tag_end..close)?;
-    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
 
-    let build_id = value.get("buildId").and_then(json_string);
-    let asset_prefix = value.get("assetPrefix").and_then(json_string);
-    let base_path = value
-        .get("basePath")
-        .and_then(json_string)
-        .filter(|s| !s.is_empty());
-    let runtime_config = value.get("runtimeConfig");
-    let locales = value
-        .get("locales")
-        .or_else(|| runtime_config.and_then(|c| c.get("locales")))
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(json_string).collect())
-        .unwrap_or_default();
-    let default_locale = value.get("defaultLocale").and_then(json_string);
-    let locale = value.get("locale").and_then(json_string);
-    let page = value.get("page").and_then(json_string);
+    let build_id = json_string_field(payload, b"buildId");
+    let asset_prefix = json_string_field(payload, b"assetPrefix");
+    let base_path = json_string_field(payload, b"basePath").filter(|s| !s.is_empty());
+    let locales = json_string_array_field(payload, b"locales");
+    let default_locale = json_string_field(payload, b"defaultLocale");
+    let locale = json_string_field(payload, b"locale");
+    let page = json_string_field(payload, b"page");
 
     let cfg = NextConfig {
         build_id,
@@ -78,8 +68,64 @@ pub fn parse_next_data(bytes: &[u8]) -> Option<NextConfig> {
     (!cfg.is_empty()).then_some(cfg)
 }
 
-fn json_string(value: &serde_json::Value) -> Option<String> {
-    value.as_str().map(str::to_string)
+fn json_string_field(bytes: &[u8], key: &[u8]) -> Option<String> {
+    let pos = json_key_pos(bytes, key)?;
+    let mut i = source::skip_ws(bytes, pos + key.len() + 2);
+    if bytes.get(i) != Some(&b':') {
+        return None;
+    }
+    i = source::skip_ws(bytes, i + 1);
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    source::quoted_string(bytes, i + 1, b'"', source::TemplateMode::Preserve)
+}
+
+fn json_string_array_field(bytes: &[u8], key: &[u8]) -> Vec<String> {
+    let Some(pos) = json_key_pos(bytes, key) else {
+        return Vec::new();
+    };
+    let mut i = source::skip_ws(bytes, pos + key.len() + 2);
+    if bytes.get(i) != Some(&b':') {
+        return Vec::new();
+    }
+    i = source::skip_ws(bytes, i + 1);
+    if bytes.get(i) != Some(&b'[') {
+        return Vec::new();
+    }
+    i += 1;
+    let mut out = Vec::new();
+    while i < bytes.len() {
+        i = source::skip_ws(bytes, i);
+        match bytes.get(i) {
+            Some(b'"') => {
+                if let Some(value) =
+                    source::quoted_string(bytes, i + 1, b'"', source::TemplateMode::Preserve)
+                {
+                    out.push(value);
+                }
+                i = source::quoted_end(bytes, i + 1, b'"').map_or(i + 1, |end| end + 1);
+            }
+            Some(b']') | None => break,
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+fn json_key_pos(bytes: &[u8], key: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
+        let pos = offset + rel;
+        let quoted_key = pos > 0
+            && bytes.get(pos - 1) == Some(&b'"')
+            && bytes.get(pos + key.len()) == Some(&b'"');
+        if quoted_key {
+            return Some(pos - 1);
+        }
+        offset = pos + key.len();
+    }
+    None
 }
 
 /// Strip the locale prefix from a route path when it matches one of the

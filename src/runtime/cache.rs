@@ -42,6 +42,14 @@ impl ScanCache {
         read_cached_value_bytes(&self.path, CACHE_FRESH_SECS)
     }
 
+    pub fn read_fresh_binary(&self) -> Option<(Vec<u8>, u64)> {
+        read_fresh(&binary_path_for(&self.path), CACHE_FRESH_SECS)
+    }
+
+    pub fn read_stale_binary(&self) -> Option<Vec<u8>> {
+        read_fresh(&binary_path_for(&self.path), CACHE_STALE_SECS).map(|(bytes, _)| bytes)
+    }
+
     pub fn read_revision_bytes(&self, revision: Option<&str>) -> Option<Vec<u8>> {
         read_revision_bytes(&self.path, revision)
     }
@@ -49,6 +57,14 @@ impl ScanCache {
     pub fn write_with_revision<T: Serialize>(&self, value: &T, revision: Option<&str>) {
         write_with_revision(&self.path, value, revision);
     }
+
+    pub fn write_binary(&self, bytes: &[u8]) {
+        write_bytes(&binary_path_for(&self.path), bytes);
+    }
+}
+
+fn binary_path_for(json_path: &Path) -> PathBuf {
+    json_path.with_extension("bin")
 }
 
 fn hash_parts<'a>(parts: impl Iterator<Item = &'a str>) -> u64 {
@@ -133,15 +149,6 @@ pub fn write_asset_with_validators(
             validators: validators.clone(),
         },
     );
-}
-
-pub fn body_hash(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
 }
 
 pub fn read_findings_by_hash(hash: u64, kind: DocumentKind) -> Option<FindingsBuilder> {
