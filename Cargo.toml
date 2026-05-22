@@ -10,7 +10,6 @@ blake3 = "1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 memchr = "2"
-lru = "0.16"
 mimalloc = { version = "0.1", default-features = false }
 parking_lot = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

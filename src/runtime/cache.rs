@@ -11,15 +11,14 @@ use super::cache_writer;
 use crate::{
     discover::{AssetKind, AssetRef, AssetSource, DocumentScan},
     framework::FrameworkConfig,
+    hash::FxHashMap,
     scan::next::NextConfig,
     scan::{Confidence, Evidence, EvidenceKind, Extractor, FindingsBuilder, Shape},
     url::Url,
 };
-use lru::LruCache;
 use parking_lot::RwLock;
 use std::{
     fs,
-    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
     time::SystemTime,
@@ -150,22 +149,15 @@ struct UrlIndexEntry {
 }
 
 // Conservative caps: each entry holds a full DocumentScan or findings struct,
-// which can run into tens of KB on big chunks. The caps below put the
-// worst-case ceiling for both LRUs around ~50 MB combined.
+// which can run into tens of KB on big chunks. Disk remains the source of truth
+// when the process-local accelerator is cleared.
 const URL_INDEX_MEMORY_MAX_ENTRIES: usize = 1024;
 const CONTENT_MEMORY_MAX_ENTRIES: usize = 512;
 
 /// Process-wide in-memory cache: chunk URL -> latest known index entry.
-///
-/// LRU-bounded so repeated scans in a long-running process cannot grow it
-/// without limit. Disk remains the source of truth past the cap.
-fn url_index_memory() -> &'static RwLock<LruCache<String, UrlIndexEntry>> {
-    static MEMORY: OnceLock<RwLock<LruCache<String, UrlIndexEntry>>> = OnceLock::new();
-    MEMORY.get_or_init(|| {
-        RwLock::new(LruCache::new(
-            NonZeroUsize::new(URL_INDEX_MEMORY_MAX_ENTRIES).expect("nonzero cache size"),
-        ))
-    })
+fn url_index_memory() -> &'static RwLock<BoundedMemory<UrlIndexEntry>> {
+    static MEMORY: OnceLock<RwLock<BoundedMemory<UrlIndexEntry>>> = OnceLock::new();
+    MEMORY.get_or_init(|| RwLock::new(BoundedMemory::new(URL_INDEX_MEMORY_MAX_ENTRIES)))
 }
 
 fn url_index_memory_get(url: &Url, max_age_secs: u64) -> Option<CachedChunk> {
@@ -199,25 +191,43 @@ fn cache_age_secs(inserted_at: SystemTime) -> u64 {
 /// Different URLs serving identical chunk bytes (same framework version across
 /// sites) collapse to a single entry. Values are reference-counted so hits are
 /// pointer clones, not deep copies of the findings struct.
-fn content_memory() -> &'static RwLock<LruCache<String, Arc<FindingsBuilder>>> {
-    static MEMORY: OnceLock<RwLock<LruCache<String, Arc<FindingsBuilder>>>> = OnceLock::new();
-    MEMORY.get_or_init(|| {
-        RwLock::new(LruCache::new(
-            NonZeroUsize::new(CONTENT_MEMORY_MAX_ENTRIES).expect("nonzero cache size"),
-        ))
-    })
+fn content_memory() -> &'static RwLock<BoundedMemory<Arc<FindingsBuilder>>> {
+    static MEMORY: OnceLock<RwLock<BoundedMemory<Arc<FindingsBuilder>>>> = OnceLock::new();
+    MEMORY.get_or_init(|| RwLock::new(BoundedMemory::new(CONTENT_MEMORY_MAX_ENTRIES)))
 }
 
 fn content_memory_get(content_hash: &str) -> Option<Arc<FindingsBuilder>> {
-    content_memory().write().get(content_hash).cloned()
+    content_memory().write().get(content_hash)
 }
 
 fn content_memory_put(content_hash: &str, findings: &FindingsBuilder) {
     let mut map = content_memory().write();
-    if map.contains(content_hash) {
-        return;
-    }
     map.put(content_hash.to_owned(), Arc::new(findings.clone()));
+}
+
+struct BoundedMemory<V> {
+    map: FxHashMap<String, V>,
+    cap: usize,
+}
+
+impl<V: Clone> BoundedMemory<V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: FxHashMap::default(),
+            cap,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<V> {
+        self.map.get(key).cloned()
+    }
+
+    fn put(&mut self, key: String, value: V) {
+        if !self.map.contains_key(&key) && self.map.len() >= self.cap {
+            self.map.clear();
+        }
+        self.map.insert(key, value);
+    }
 }
 
 fn hash_parts<'a>(parts: impl Iterator<Item = &'a str>) -> u64 {
