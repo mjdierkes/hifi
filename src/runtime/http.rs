@@ -110,6 +110,23 @@ impl Client {
         }
     }
 
+    pub async fn prewarm(&self, url: &Url) -> Result<(), Error> {
+        if url.scheme() != "https" {
+            return Ok(());
+        }
+        let origin = Origin::for_url(url)?;
+        if self.inner.h2.lock().await.contains_key(&origin) {
+            return Ok(());
+        }
+        let session = connect_h2(origin.clone(), self.inner.tls_h2.clone()).await?;
+        let mut sessions = self.inner.h2.lock().await;
+        if sessions.contains_key(&origin) {
+            return Ok(());
+        }
+        sessions.insert(origin, session);
+        Ok(())
+    }
+
     async fn execute(&self, url: Url, headers: Vec<(String, String)>) -> Result<Response, Error> {
         match url.scheme() {
             "https" => self.execute_https(url, headers).await,
