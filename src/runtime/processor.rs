@@ -6,12 +6,11 @@
 //! assets, then build display output.
 
 use crate::discover::{self, DocumentKind};
-use crate::framework::FrameworkConfig;
-use crate::scan::next::NextConfig;
-use crate::scan::{Confidence, Evidence, EvidenceKind, Extractor, Shape};
+use crate::scan::{Evidence, EvidenceKind, Shape};
 
 use super::{cache, fetch, http::Client, net};
 use crate::url::Url;
+use std::collections::BTreeMap;
 use std::{sync::Arc, time::Instant};
 use thiserror::Error;
 
@@ -29,13 +28,18 @@ pub enum RuntimeError {
 
 #[derive(Clone, Debug)]
 pub struct Output {
-    pub evidence: Vec<Evidence>,
+    pub apis: Vec<Api>,
     pub revision: Option<String>,
-    pub framework: FrameworkConfig,
     pub cache: CacheStatus,
     pub cache_age_secs: Option<u64>,
     pub elapsed_us: Option<u128>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Api {
+    pub path: String,
+    pub shape: Shape,
 }
 
 impl Output {
@@ -169,9 +173,8 @@ impl<'a> Processor<'a> {
 
         Ok(ScanOutcome {
             output: Output {
-                evidence: found.evidence,
+                apis: collect_apis(&found.evidence),
                 revision,
-                framework: root_scan.framework_config,
                 cache: CacheStatus::Miss,
                 cache_age_secs: None,
                 elapsed_us: t0.map(|t| t.elapsed().as_micros()),
@@ -243,32 +246,60 @@ fn warnings_from_assets(asset_stats: &fetch::AssetScanStats) -> Vec<String> {
     warnings
 }
 
+fn collect_apis(evidence: &[Evidence]) -> Vec<Api> {
+    let mut merged = BTreeMap::<String, Shape>::new();
+    for item in evidence {
+        if item.kind != EvidenceKind::Api {
+            continue;
+        }
+        let Some(shape) = &item.shape else {
+            continue;
+        };
+        merged
+            .entry(prettify_path(&normalize_path(&item.url)))
+            .and_modify(|existing| existing.merge(shape))
+            .or_insert_with(|| shape.clone());
+    }
+    merged
+        .into_iter()
+        .map(|(path, shape)| Api { path, shape })
+        .collect()
+}
+
+fn normalize_path(url: &str) -> String {
+    let raw = Url::parse(url)
+        .map(|u| u.path().to_string())
+        .unwrap_or_else(|_| url.split(['?', '#']).next().unwrap_or(url).to_string());
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn prettify_path(path: &str) -> String {
+    path.replace("{dynamic}", ":id")
+}
+
 fn write_caches(cache_store: &cache::ScanCache, out: &Output) -> Result<()> {
     let cached = out.clone().mark(None, CacheStatus::Stored, None);
     cache_store.write_binary_deferred(Arc::from(encode_output_binary(&cached)));
     Ok(())
 }
 
-const OUTPUT_BINARY_MAGIC: &[u8; 8] = b"HIFIOU1\0";
+const OUTPUT_BINARY_MAGIC: &[u8; 8] = b"HIFIOU2\0";
 
 pub(crate) fn encode_output_binary(out: &Output) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(out.evidence.len().saturating_mul(48) + 128);
+    let mut bytes = Vec::with_capacity(out.apis.len().saturating_mul(48) + 128);
     bytes.extend_from_slice(OUTPUT_BINARY_MAGIC);
     put_opt_string(&mut bytes, out.revision.as_deref());
-    put_framework(&mut bytes, &out.framework);
-    put_u32(&mut bytes, out.evidence.len());
-    for item in &out.evidence {
-        put_string(&mut bytes, &item.url);
-        bytes.push(evidence_kind_to_u8(item.kind));
-        bytes.push(extractor_to_u8(item.extractor));
-        bytes.push(confidence_to_u8(item.confidence));
-        match &item.shape {
-            Some(shape) => {
-                bytes.push(1);
-                put_shape(&mut bytes, shape);
-            }
-            None => bytes.push(0),
-        }
+    put_u32(&mut bytes, out.apis.len());
+    for api in &out.apis {
+        put_string(&mut bytes, &api.path);
+        put_shape(&mut bytes, &api.shape);
     }
     put_u32(&mut bytes, out.warnings.len());
     for warning in &out.warnings {
@@ -283,25 +314,12 @@ pub(crate) fn decode_output_binary(bytes: &[u8]) -> Option<Output> {
         .take_exact(OUTPUT_BINARY_MAGIC.len())
         .filter(|magic| *magic == OUTPUT_BINARY_MAGIC)?;
     let revision = reader.opt_string()?;
-    let framework = reader.framework()?;
-    let evidence_len = reader.u32()? as usize;
-    let mut evidence = Vec::with_capacity(evidence_len);
-    for _ in 0..evidence_len {
-        let url = reader.string()?;
-        let kind = evidence_kind_from_u8(reader.u8()?)?;
-        let extractor = extractor_from_u8(reader.u8()?)?;
-        let confidence = confidence_from_u8(reader.u8()?)?;
-        let shape = match reader.u8()? {
-            0 => None,
-            1 => Some(reader.shape()?),
-            _ => return None,
-        };
-        evidence.push(Evidence {
-            url,
-            kind,
-            extractor,
-            confidence,
-            shape,
+    let api_len = reader.u32()? as usize;
+    let mut apis = Vec::with_capacity(api_len);
+    for _ in 0..api_len {
+        apis.push(Api {
+            path: reader.string()?,
+            shape: reader.shape()?,
         });
     }
     let warnings_len = reader.u32()? as usize;
@@ -311,9 +329,8 @@ pub(crate) fn decode_output_binary(bytes: &[u8]) -> Option<Output> {
     }
     reader.finish()?;
     Some(Output {
-        evidence,
+        apis,
         revision,
-        framework,
         cache: CacheStatus::Stored,
         cache_age_secs: None,
         elapsed_us: None,
@@ -336,54 +353,13 @@ fn put_shape(bytes: &mut Vec<u8>, shape: &Shape) {
     }
 }
 
-fn put_framework(bytes: &mut Vec<u8>, framework: &FrameworkConfig) {
-    match framework {
-        FrameworkConfig::None => bytes.push(0),
-        FrameworkConfig::Next(config) => {
-            bytes.push(1);
-            put_opt_string(bytes, config.build_id.as_deref());
-            put_opt_string(bytes, config.asset_prefix.as_deref());
-            put_opt_string(bytes, config.base_path.as_deref());
-            put_string_vec(bytes, &config.locales);
-            put_opt_string(bytes, config.default_locale.as_deref());
-            put_opt_string(bytes, config.locale.as_deref());
-            put_opt_string(bytes, config.page.as_deref());
-        }
-        FrameworkConfig::Nuxt => bytes.push(2),
-        FrameworkConfig::SvelteKit => bytes.push(3),
-        FrameworkConfig::Astro => bytes.push(4),
-        FrameworkConfig::Remix => bytes.push(5),
-    }
-}
-
-use super::wire::{put_opt_string, put_string, put_string_vec, put_u32, Reader as BinaryReader};
+use super::wire::{put_opt_string, put_string, put_u32, Reader as BinaryReader};
 
 trait ReaderExt {
-    fn framework(&mut self) -> Option<FrameworkConfig>;
     fn shape(&mut self) -> Option<Shape>;
 }
 
 impl<'a> ReaderExt for BinaryReader<'a> {
-    fn framework(&mut self) -> Option<FrameworkConfig> {
-        match self.u8()? {
-            0 => Some(FrameworkConfig::None),
-            1 => Some(FrameworkConfig::Next(NextConfig {
-                build_id: self.opt_string()?,
-                asset_prefix: self.opt_string()?,
-                base_path: self.opt_string()?,
-                locales: self.string_vec()?,
-                default_locale: self.opt_string()?,
-                locale: self.opt_string()?,
-                page: self.opt_string()?,
-            })),
-            2 => Some(FrameworkConfig::Nuxt),
-            3 => Some(FrameworkConfig::SvelteKit),
-            4 => Some(FrameworkConfig::Astro),
-            5 => Some(FrameworkConfig::Remix),
-            _ => None,
-        }
-    }
-
     fn shape(&mut self) -> Option<Shape> {
         let methods = self.u8()?;
         let has_body = self.bool()?;
@@ -401,75 +377,6 @@ impl<'a> ReaderExt for BinaryReader<'a> {
             next_server_action,
             query_params,
         ))
-    }
-}
-
-fn evidence_kind_to_u8(kind: EvidenceKind) -> u8 {
-    match kind {
-        EvidenceKind::Api => 0,
-        EvidenceKind::Route => 1,
-        EvidenceKind::Candidate => 2,
-    }
-}
-
-fn evidence_kind_from_u8(value: u8) -> Option<EvidenceKind> {
-    match value {
-        0 => Some(EvidenceKind::Api),
-        1 => Some(EvidenceKind::Route),
-        2 => Some(EvidenceKind::Candidate),
-        _ => None,
-    }
-}
-
-fn extractor_to_u8(extractor: Extractor) -> u8 {
-    match extractor {
-        Extractor::Literal => 0,
-        Extractor::Manifest => 1,
-        Extractor::Flight => 2,
-        Extractor::ApiCall => 3,
-        Extractor::RouteCall => 4,
-        Extractor::ServerAction => 5,
-        Extractor::NuxtPayload => 6,
-        Extractor::SvelteKitData => 7,
-        Extractor::RemixManifest => 8,
-        Extractor::AstroIsland => 9,
-        Extractor::ApiClient => 10,
-    }
-}
-
-fn extractor_from_u8(value: u8) -> Option<Extractor> {
-    match value {
-        0 => Some(Extractor::Literal),
-        1 => Some(Extractor::Manifest),
-        2 => Some(Extractor::Flight),
-        3 => Some(Extractor::ApiCall),
-        4 => Some(Extractor::RouteCall),
-        5 => Some(Extractor::ServerAction),
-        6 => Some(Extractor::NuxtPayload),
-        7 => Some(Extractor::SvelteKitData),
-        8 => Some(Extractor::RemixManifest),
-        9 => Some(Extractor::AstroIsland),
-        10 => Some(Extractor::ApiClient),
-        _ => None,
-    }
-}
-
-fn confidence_to_u8(confidence: Confidence) -> u8 {
-    match confidence {
-        Confidence::Observed => 0,
-        Confidence::Parsed => 1,
-        Confidence::Inferred => 2,
-        Confidence::Candidate => 3,
-    }
-}
-
-fn confidence_from_u8(value: u8) -> Option<Confidence> {
-    match value {
-        0 => Some(Confidence::Observed),
-        1 => Some(Confidence::Parsed),
-        2 => Some(Confidence::Inferred),
-        3 => Some(Confidence::Candidate),
-        _ => None,
     }
 }
 
@@ -512,16 +419,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(has_evidence(
-            &out,
-            crate::scan::EvidenceKind::Api,
-            "/api/from-chunk"
-        ));
-        assert!(has_evidence(
-            &out,
-            crate::scan::EvidenceKind::Candidate,
-            "/api/from-manifest"
-        ));
+        assert!(has_api(&out, "/api/from-chunk"));
     }
 
     #[tokio::test]
@@ -546,16 +444,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(has_evidence(
-            &out,
-            crate::scan::EvidenceKind::Api,
-            "/api/from-generic-script"
-        ));
-        assert!(has_evidence(
-            &out,
-            crate::scan::EvidenceKind::Candidate,
-            "/api/from-html-asset"
-        ));
+        assert!(has_api(&out, "/api/from-generic-script"));
     }
 
     #[tokio::test]
@@ -579,11 +468,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(has_evidence(
-            &out,
-            crate::scan::EvidenceKind::Api,
-            "/api/ok"
-        ));
+        assert!(has_api(&out, "/api/ok"));
         assert_eq!(
             out.warnings,
             vec!["failed to read 1 assets; results may be incomplete"]
@@ -611,21 +496,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(has_evidence(
-            &first,
-            crate::scan::EvidenceKind::Api,
-            "/api/first"
-        ));
-        assert!(has_evidence(
-            &second,
-            crate::scan::EvidenceKind::Api,
-            "/api/second"
-        ));
-        assert!(!has_evidence(
-            &second,
-            crate::scan::EvidenceKind::Api,
-            "/api/first"
-        ));
+        assert!(has_api(&first, "/api/first"));
+        assert!(has_api(&second, "/api/second"));
+        assert!(!has_api(&second, "/api/first"));
     }
 
     #[tokio::test]
@@ -647,23 +520,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(has_evidence(
-            &first,
-            crate::scan::EvidenceKind::Api,
-            "/api/cached"
-        ));
-        assert!(has_evidence(
-            &second,
-            crate::scan::EvidenceKind::Api,
-            "/api/cached"
-        ));
+        assert!(has_api(&first, "/api/cached"));
+        assert!(has_api(&second, "/api/cached"));
         assert_eq!(second.cache, CacheStatus::Fresh);
     }
 
-    fn has_evidence(out: &Output, kind: crate::scan::EvidenceKind, url: &str) -> bool {
-        out.evidence
-            .iter()
-            .any(|evidence| evidence.kind == kind && evidence.url == url)
+    fn has_api(out: &Output, path: &str) -> bool {
+        out.apis.iter().any(|api| api.path == path)
     }
 
     async fn serve(

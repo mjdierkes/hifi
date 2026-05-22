@@ -158,34 +158,9 @@ pub(crate) fn scan_document_with_config_and_findings(
     if next_config.is_none() {
         next_config = parent_config.cloned();
     }
-    let next_context = framework::next::is_context(bytes, base, next_config.as_ref());
-    let nuxt_context = framework::nuxt::is_context(bytes, base);
-    let sveltekit_context = framework::sveltekit::is_context(bytes, base);
-    let astro_context = framework::astro::is_context(bytes, base);
-    let remix_context = framework::remix::is_context(bytes, base);
-    let contexts = FrameworkContexts {
-        next: next_context,
-        nuxt: nuxt_context,
-        sveltekit: sveltekit_context,
-        sveltekit_immutable_root: sveltekit_context
-            .then(|| framework::sveltekit::primary_immutable_root(bytes, base))
-            .flatten(),
-        astro: astro_context,
-        remix: remix_context,
-    };
-    let revision = framework::next::revision(bytes, next_context, next_config.as_ref());
-    // If we recognized this as a Next context (e.g. via `/_next/` paths) but had
-    // no parseable __NEXT_DATA__, still mark the framework so callers can label
-    // the output. The build_id stays empty in that case.
-    let framework_config = match next_config.clone() {
-        Some(cfg) => FrameworkConfig::Next(cfg),
-        None if next_context => FrameworkConfig::Next(crate::scan::next::NextConfig::default()),
-        None if nuxt_context => FrameworkConfig::Nuxt,
-        None if sveltekit_context => FrameworkConfig::SvelteKit,
-        None if astro_context => FrameworkConfig::Astro,
-        None if remix_context => FrameworkConfig::Remix,
-        None => FrameworkConfig::None,
-    };
+    let contexts = FrameworkContexts::detect(bytes, base, next_config.as_ref());
+    let revision = framework::next::revision(bytes, contexts.next, next_config.as_ref());
+    let framework_config = FrameworkConfig::from_context(next_config.clone(), &contexts);
     let mut out = DocumentScan {
         findings: cached_findings.unwrap_or_else(|| crate::scan::scan_endpoints(bytes)),
         assets: Vec::new(),
@@ -222,17 +197,17 @@ pub(crate) fn scan_document_with_config_and_findings(
         );
     }
     if kind == DocumentKind::Html {
-        scan_html_assets(bytes, base, contexts.clone(), &mut seen, &mut out.assets);
+        scan_html_assets(bytes, base, &contexts, &mut seen, &mut out.assets);
     }
     scan_literal_assets(
         bytes,
         base,
-        contexts.clone(),
+        &contexts,
         &mut out.findings,
         &mut seen,
         &mut out.assets,
     );
-    scan_dynamic_assets(bytes, base, contexts, &mut seen, &mut out.assets);
+    scan_dynamic_assets(bytes, base, &contexts, &mut seen, &mut out.assets);
 
     if kind == DocumentKind::Html {
         if let Some(revision) = out.revision.as_deref() {
@@ -241,15 +216,15 @@ pub(crate) fn scan_document_with_config_and_findings(
                 base,
                 revision,
                 next_config.as_ref(),
-                next_context,
+                contexts.next,
                 &mut seen,
                 &mut out.assets,
             );
         }
-        if nuxt_context {
+        if contexts.nuxt {
             framework::nuxt::push_manifests(bytes, base, &mut seen, &mut out.assets);
         }
-        if sveltekit_context {
+        if contexts.sveltekit {
             framework::sveltekit::push_manifests(bytes, base, &mut seen, &mut out.assets);
         }
     }
@@ -281,7 +256,7 @@ fn is_empty_script(bytes: &[u8], kind: DocumentKind) -> bool {
 fn scan_html_assets(
     bytes: &[u8],
     base: &Url,
-    contexts: FrameworkContexts,
+    contexts: &FrameworkContexts,
     seen: &mut FxHashSet<Url>,
     out: &mut Vec<AssetRef>,
 ) {
@@ -289,7 +264,7 @@ fn scan_html_assets(
         let Some(src) = attr_value(tag, b"src") else {
             return;
         };
-        push_asset(base, src, &contexts, AssetSource::HtmlScript, seen, out);
+        push_asset(base, src, contexts, AssetSource::HtmlScript, seen, out);
     });
 
     scan_tags(bytes, b"<link", |tag| {
@@ -302,7 +277,7 @@ fn scan_html_assets(
                 || matches_ignore_ascii_case(v, "modulepreload")
                 || matches_ignore_ascii_case(v, "prefetch")
         }) {
-            push_asset(base, href, &contexts, AssetSource::HtmlPreload, seen, out);
+            push_asset(base, href, contexts, AssetSource::HtmlPreload, seen, out);
         }
     });
     scan_tags(bytes, b"<astro-island", |tag| {
@@ -310,7 +285,7 @@ fn scan_html_assets(
             let Some(raw) = attr_value(tag, attr) else {
                 continue;
             };
-            push_asset(base, raw, &contexts, AssetSource::HtmlPreload, seen, out);
+            push_asset(base, raw, contexts, AssetSource::HtmlPreload, seen, out);
         }
     });
 }
@@ -330,7 +305,7 @@ fn scan_tags(bytes: &[u8], needle: &[u8], mut f: impl FnMut(&[u8])) {
 fn scan_literal_assets(
     bytes: &[u8],
     base: &Url,
-    contexts: FrameworkContexts,
+    contexts: &FrameworkContexts,
     findings: &mut FindingsBuilder,
     seen: &mut FxHashSet<Url>,
     out: &mut Vec<AssetRef>,
@@ -350,25 +325,25 @@ fn scan_literal_assets(
         if raw.starts_with("/_next/data/") {
             push_candidate(findings, &raw);
         }
-        push_asset(base, &raw, &contexts, AssetSource::Literal, seen, out);
+        push_asset(base, &raw, contexts, AssetSource::Literal, seen, out);
     }
 }
 
 fn scan_dynamic_assets(
     bytes: &[u8],
     base: &Url,
-    contexts: FrameworkContexts,
+    contexts: &FrameworkContexts,
     seen: &mut FxHashSet<Url>,
     out: &mut Vec<AssetRef>,
 ) {
     for pos in memchr::memmem::find_iter(bytes, b"import(") {
         if let Some(raw) = source::quoted_arg(bytes, pos + b"import(".len()) {
-            push_asset(base, raw, &contexts, AssetSource::DynamicImport, seen, out);
+            push_asset(base, raw, contexts, AssetSource::DynamicImport, seen, out);
         }
     }
     for pos in memchr::memmem::find_iter(bytes, b"new URL(") {
         if let Some(raw) = source::quoted_arg(bytes, pos + b"new URL(".len()) {
-            push_asset(base, raw, &contexts, AssetSource::NewUrl, seen, out);
+            push_asset(base, raw, contexts, AssetSource::NewUrl, seen, out);
         }
     }
 }

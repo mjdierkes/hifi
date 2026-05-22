@@ -333,63 +333,68 @@ fn push_candidate(bytes: &[u8], pos: usize, out: &mut FindingsBuilder) -> bool {
 
 fn scan_api_clients(bytes: &[u8], out: &mut FindingsBuilder) {
     let bindings = collect_string_bindings(bytes);
-    for anchor in [
-        b"$fetch(".as_slice(),
-        b"useFetch(".as_slice(),
-        b"useLazyFetch(".as_slice(),
-        b"ofetch(".as_slice(),
-        b"useRequestFetch()(".as_slice(),
-        b"useNuxtApp().$fetch(".as_slice(),
-        b"nuxtApp.$fetch(".as_slice(),
-        b"ky(".as_slice(),
-    ] {
+    for &(anchor, method, mode) in CLIENT_PATTERNS {
         for pos in memchr::memmem::find_iter(bytes, anchor) {
-            record_first_arg_client(bytes, pos + anchor.len(), &bindings, out);
+            let after = pos + anchor.len();
+            match mode {
+                ClientMode::FirstArg => record_first_arg_client_with_method(
+                    bytes,
+                    after,
+                    method.or_else(|| method_near(bytes, after)),
+                    &bindings,
+                    out,
+                ),
+                ClientMode::Object => record_object_client(bytes, after, &bindings, out),
+                ClientMode::GenericMethod if apiish_receiver_context(bytes, pos) => {
+                    record_first_arg_client_with_method(bytes, after, method, &bindings, out);
+                }
+                ClientMode::GenericMethod => {}
+            }
         }
     }
-    for anchor in [b"axios(".as_slice(), b"axios.request(".as_slice()] {
-        for pos in memchr::memmem::find_iter(bytes, anchor) {
-            record_object_client(bytes, pos + anchor.len(), &bindings, out);
-        }
-    }
-    for (anchor, method) in [
-        (b"$api.$get(".as_slice(), "GET"),
-        (b"$api.get(".as_slice(), "GET"),
-        (b"$api.$post(".as_slice(), "POST"),
-        (b"$api.post(".as_slice(), "POST"),
-        (b"$api.$put(".as_slice(), "PUT"),
-        (b"$api.put(".as_slice(), "PUT"),
-        (b"$api.$patch(".as_slice(), "PATCH"),
-        (b"$api.patch(".as_slice(), "PATCH"),
-        (b"$api.$delete(".as_slice(), "DELETE"),
-        (b"$api.delete(".as_slice(), "DELETE"),
-        (b"$axios.$get(".as_slice(), "GET"),
-        (b"$axios.$post(".as_slice(), "POST"),
-        (b"$axios.$put(".as_slice(), "PUT"),
-        (b"$axios.$patch(".as_slice(), "PATCH"),
-        (b"$axios.$delete(".as_slice(), "DELETE"),
-    ] {
-        for pos in memchr::memmem::find_iter(bytes, anchor) {
-            record_first_arg_client_with_method(
-                bytes,
-                pos + anchor.len(),
-                Some(method),
-                &bindings,
-                out,
-            );
-        }
-    }
-    scan_generic_method_clients(bytes, &bindings, out);
 }
 
-fn record_first_arg_client(
-    bytes: &[u8],
-    after: usize,
-    bindings: &FxHashMap<String, String>,
-    out: &mut FindingsBuilder,
-) {
-    record_first_arg_client_with_method(bytes, after, method_near(bytes, after), bindings, out);
+#[derive(Clone, Copy)]
+enum ClientMode {
+    FirstArg,
+    Object,
+    GenericMethod,
 }
+
+type ClientPattern = (&'static [u8], Option<&'static str>, ClientMode);
+
+const CLIENT_PATTERNS: &[ClientPattern] = &[
+    (b"$fetch(", None, ClientMode::FirstArg),
+    (b"useFetch(", None, ClientMode::FirstArg),
+    (b"useLazyFetch(", None, ClientMode::FirstArg),
+    (b"ofetch(", None, ClientMode::FirstArg),
+    (b"useRequestFetch()(", None, ClientMode::FirstArg),
+    (b"useNuxtApp().$fetch(", None, ClientMode::FirstArg),
+    (b"nuxtApp.$fetch(", None, ClientMode::FirstArg),
+    (b"ky(", None, ClientMode::FirstArg),
+    (b"axios(", None, ClientMode::Object),
+    (b"axios.request(", None, ClientMode::Object),
+    (b"$api.$get(", Some("GET"), ClientMode::FirstArg),
+    (b"$api.get(", Some("GET"), ClientMode::FirstArg),
+    (b"$api.$post(", Some("POST"), ClientMode::FirstArg),
+    (b"$api.post(", Some("POST"), ClientMode::FirstArg),
+    (b"$api.$put(", Some("PUT"), ClientMode::FirstArg),
+    (b"$api.put(", Some("PUT"), ClientMode::FirstArg),
+    (b"$api.$patch(", Some("PATCH"), ClientMode::FirstArg),
+    (b"$api.patch(", Some("PATCH"), ClientMode::FirstArg),
+    (b"$api.$delete(", Some("DELETE"), ClientMode::FirstArg),
+    (b"$api.delete(", Some("DELETE"), ClientMode::FirstArg),
+    (b"$axios.$get(", Some("GET"), ClientMode::FirstArg),
+    (b"$axios.$post(", Some("POST"), ClientMode::FirstArg),
+    (b"$axios.$put(", Some("PUT"), ClientMode::FirstArg),
+    (b"$axios.$patch(", Some("PATCH"), ClientMode::FirstArg),
+    (b"$axios.$delete(", Some("DELETE"), ClientMode::FirstArg),
+    (b".get(", Some("GET"), ClientMode::GenericMethod),
+    (b".post(", Some("POST"), ClientMode::GenericMethod),
+    (b".put(", Some("PUT"), ClientMode::GenericMethod),
+    (b".patch(", Some("PATCH"), ClientMode::GenericMethod),
+    (b".delete(", Some("DELETE"), ClientMode::GenericMethod),
+];
 
 fn record_first_arg_client_with_method(
     bytes: &[u8],
@@ -445,33 +450,6 @@ fn record_object_client(
         shape,
         Extractor::ApiClient,
     );
-}
-
-fn scan_generic_method_clients(
-    bytes: &[u8],
-    bindings: &FxHashMap<String, String>,
-    out: &mut FindingsBuilder,
-) {
-    for (anchor, method) in [
-        (b".get(".as_slice(), "GET"),
-        (b".post(".as_slice(), "POST"),
-        (b".put(".as_slice(), "PUT"),
-        (b".patch(".as_slice(), "PATCH"),
-        (b".delete(".as_slice(), "DELETE"),
-    ] {
-        for pos in memchr::memmem::find_iter(bytes, anchor) {
-            if !apiish_receiver_context(bytes, pos) {
-                continue;
-            }
-            record_first_arg_client_with_method(
-                bytes,
-                pos + anchor.len(),
-                Some(method),
-                bindings,
-                out,
-            );
-        }
-    }
 }
 
 fn collect_string_bindings(bytes: &[u8]) -> FxHashMap<String, String> {

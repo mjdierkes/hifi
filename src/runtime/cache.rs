@@ -7,14 +7,12 @@
 //! The cache stores processed scan output, per-site asset scan data plus HTTP
 //! validators, and content-addressed chunk scan data.
 
-use super::{
-    cache_writer,
-    processor::{decode_output_binary, encode_output_binary, Output},
-};
+use super::cache_writer;
 use crate::{
     discover::{AssetKind, AssetRef, AssetSource, DocumentScan},
     framework::FrameworkConfig,
-    scan::FindingsBuilder,
+    scan::next::NextConfig,
+    scan::{Confidence, Evidence, EvidenceKind, Extractor, FindingsBuilder, Shape},
     url::Url,
 };
 use lru::LruCache;
@@ -397,41 +395,19 @@ fn read_validators(r: &mut super::wire::Reader<'_>) -> Option<AssetValidators> {
 }
 
 fn put_findings(out: &mut Vec<u8>, findings: &FindingsBuilder) {
-    let wrapped = Output {
-        evidence: findings.evidence.clone(),
-        revision: None,
-        framework: FrameworkConfig::None,
-        cache: Default::default(),
-        cache_age_secs: None,
-        elapsed_us: None,
-        warnings: Vec::new(),
-    };
-    let bytes = encode_output_binary(&wrapped);
-    super::wire::put_u32(out, bytes.len());
-    out.extend_from_slice(&bytes);
+    put_evidence_vec(out, &findings.evidence);
 }
 
 fn read_findings(r: &mut super::wire::Reader<'_>) -> Option<FindingsBuilder> {
-    let len = r.u32()? as usize;
-    let bytes = r.take_exact(len)?;
     Some(FindingsBuilder {
-        evidence: decode_output_binary(bytes)?.evidence,
+        evidence: read_evidence_vec(r)?,
     })
 }
 
 fn put_document_scan(out: &mut Vec<u8>, data: &DocumentScan) {
-    let wrapped = Output {
-        evidence: data.findings.evidence.clone(),
-        revision: data.revision.clone(),
-        framework: data.framework_config.clone(),
-        cache: Default::default(),
-        cache_age_secs: None,
-        elapsed_us: None,
-        warnings: Vec::new(),
-    };
-    let bytes = encode_output_binary(&wrapped);
-    super::wire::put_u32(out, bytes.len());
-    out.extend_from_slice(&bytes);
+    put_evidence_vec(out, &data.findings.evidence);
+    super::wire::put_opt_string(out, data.revision.as_deref());
+    put_framework(out, &data.framework_config);
     super::wire::put_u32(out, data.assets.len());
     for asset in &data.assets {
         super::wire::put_string(out, asset.url.as_str());
@@ -441,8 +417,9 @@ fn put_document_scan(out: &mut Vec<u8>, data: &DocumentScan) {
 }
 
 fn read_document_scan(r: &mut super::wire::Reader<'_>) -> Option<DocumentScan> {
-    let len = r.u32()? as usize;
-    let wrapped = decode_output_binary(r.take_exact(len)?)?;
+    let evidence = read_evidence_vec(r)?;
+    let revision = r.opt_string()?;
+    let framework_config = read_framework(r)?;
     let asset_len = r.u32()? as usize;
     let mut assets = Vec::with_capacity(asset_len);
     for _ in 0..asset_len {
@@ -453,13 +430,185 @@ fn read_document_scan(r: &mut super::wire::Reader<'_>) -> Option<DocumentScan> {
         });
     }
     Some(DocumentScan {
-        findings: FindingsBuilder {
-            evidence: wrapped.evidence,
-        },
+        findings: FindingsBuilder { evidence },
         assets,
-        revision: wrapped.revision,
-        framework_config: wrapped.framework,
+        revision,
+        framework_config,
     })
+}
+
+fn put_evidence_vec(out: &mut Vec<u8>, evidence: &[Evidence]) {
+    super::wire::put_u32(out, evidence.len());
+    for item in evidence {
+        super::wire::put_string(out, &item.url);
+        out.push(evidence_kind_to_u8(item.kind));
+        out.push(extractor_to_u8(item.extractor));
+        out.push(confidence_to_u8(item.confidence));
+        match &item.shape {
+            Some(shape) => {
+                out.push(1);
+                put_shape(out, shape);
+            }
+            None => out.push(0),
+        }
+    }
+}
+
+fn read_evidence_vec(r: &mut super::wire::Reader<'_>) -> Option<Vec<Evidence>> {
+    let len = r.u32()? as usize;
+    let mut evidence = Vec::with_capacity(len);
+    for _ in 0..len {
+        let url = r.string()?;
+        let kind = evidence_kind_from_u8(r.u8()?)?;
+        let extractor = extractor_from_u8(r.u8()?)?;
+        let confidence = confidence_from_u8(r.u8()?)?;
+        let shape = match r.u8()? {
+            0 => None,
+            1 => Some(read_shape(r)?),
+            _ => return None,
+        };
+        evidence.push(Evidence {
+            url,
+            kind,
+            extractor,
+            confidence,
+            shape,
+        });
+    }
+    Some(evidence)
+}
+
+fn put_shape(out: &mut Vec<u8>, shape: &Shape) {
+    let (methods, has_body, has_headers, content_types, auth, next_server_action, query_params) =
+        shape.binary_parts();
+    out.push(methods);
+    out.push(has_body as u8);
+    out.push(has_headers as u8);
+    out.push(content_types);
+    out.push(auth as u8);
+    out.push(next_server_action as u8);
+    super::wire::put_string_vec(out, query_params);
+}
+
+fn read_shape(r: &mut super::wire::Reader<'_>) -> Option<Shape> {
+    Some(Shape::from_binary_parts(
+        r.u8()?,
+        r.bool()?,
+        r.bool()?,
+        r.u8()?,
+        r.bool()?,
+        r.bool()?,
+        r.string_vec()?,
+    ))
+}
+
+fn put_framework(out: &mut Vec<u8>, framework: &FrameworkConfig) {
+    match framework {
+        FrameworkConfig::None => out.push(0),
+        FrameworkConfig::Next(config) => {
+            out.push(1);
+            super::wire::put_opt_string(out, config.build_id.as_deref());
+            super::wire::put_opt_string(out, config.asset_prefix.as_deref());
+            super::wire::put_opt_string(out, config.base_path.as_deref());
+            super::wire::put_string_vec(out, &config.locales);
+            super::wire::put_opt_string(out, config.default_locale.as_deref());
+            super::wire::put_opt_string(out, config.locale.as_deref());
+            super::wire::put_opt_string(out, config.page.as_deref());
+        }
+        FrameworkConfig::Nuxt => out.push(2),
+        FrameworkConfig::SvelteKit => out.push(3),
+        FrameworkConfig::Astro => out.push(4),
+        FrameworkConfig::Remix => out.push(5),
+    }
+}
+
+fn read_framework(r: &mut super::wire::Reader<'_>) -> Option<FrameworkConfig> {
+    match r.u8()? {
+        0 => Some(FrameworkConfig::None),
+        1 => Some(FrameworkConfig::Next(NextConfig {
+            build_id: r.opt_string()?,
+            asset_prefix: r.opt_string()?,
+            base_path: r.opt_string()?,
+            locales: r.string_vec()?,
+            default_locale: r.opt_string()?,
+            locale: r.opt_string()?,
+            page: r.opt_string()?,
+        })),
+        2 => Some(FrameworkConfig::Nuxt),
+        3 => Some(FrameworkConfig::SvelteKit),
+        4 => Some(FrameworkConfig::Astro),
+        5 => Some(FrameworkConfig::Remix),
+        _ => None,
+    }
+}
+
+fn evidence_kind_to_u8(kind: EvidenceKind) -> u8 {
+    match kind {
+        EvidenceKind::Api => 0,
+        EvidenceKind::Route => 1,
+        EvidenceKind::Candidate => 2,
+    }
+}
+
+fn evidence_kind_from_u8(value: u8) -> Option<EvidenceKind> {
+    match value {
+        0 => Some(EvidenceKind::Api),
+        1 => Some(EvidenceKind::Route),
+        2 => Some(EvidenceKind::Candidate),
+        _ => None,
+    }
+}
+
+fn extractor_to_u8(extractor: Extractor) -> u8 {
+    match extractor {
+        Extractor::Literal => 0,
+        Extractor::Manifest => 1,
+        Extractor::Flight => 2,
+        Extractor::ApiCall => 3,
+        Extractor::RouteCall => 4,
+        Extractor::ServerAction => 5,
+        Extractor::NuxtPayload => 6,
+        Extractor::SvelteKitData => 7,
+        Extractor::RemixManifest => 8,
+        Extractor::AstroIsland => 9,
+        Extractor::ApiClient => 10,
+    }
+}
+
+fn extractor_from_u8(value: u8) -> Option<Extractor> {
+    match value {
+        0 => Some(Extractor::Literal),
+        1 => Some(Extractor::Manifest),
+        2 => Some(Extractor::Flight),
+        3 => Some(Extractor::ApiCall),
+        4 => Some(Extractor::RouteCall),
+        5 => Some(Extractor::ServerAction),
+        6 => Some(Extractor::NuxtPayload),
+        7 => Some(Extractor::SvelteKitData),
+        8 => Some(Extractor::RemixManifest),
+        9 => Some(Extractor::AstroIsland),
+        10 => Some(Extractor::ApiClient),
+        _ => None,
+    }
+}
+
+fn confidence_to_u8(confidence: Confidence) -> u8 {
+    match confidence {
+        Confidence::Observed => 0,
+        Confidence::Parsed => 1,
+        Confidence::Inferred => 2,
+        Confidence::Candidate => 3,
+    }
+}
+
+fn confidence_from_u8(value: u8) -> Option<Confidence> {
+    match value {
+        0 => Some(Confidence::Observed),
+        1 => Some(Confidence::Parsed),
+        2 => Some(Confidence::Inferred),
+        3 => Some(Confidence::Candidate),
+        _ => None,
+    }
 }
 
 fn asset_kind_to_u8(kind: AssetKind) -> u8 {

@@ -1,7 +1,5 @@
 use super::{AppError, OutputMode};
 use crate::runtime::processor::Output;
-use crate::scan::{EvidenceKind, Shape};
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{self, Write};
 
@@ -27,16 +25,18 @@ pub fn render_warnings(out: &Output) {
 }
 
 fn render_api_text<W: Write>(out: &Output, writer: &mut W) -> io::Result<()> {
-    for row in collect_apis(out) {
-        if row.flags.is_empty() {
-            writeln!(writer, "{}\t{}", row.methods, escape_terminal(&row.path))?;
+    for api in &out.apis {
+        let methods = api.shape.methods_csv();
+        let flags = api.shape.flags_csv();
+        if flags.is_empty() {
+            writeln!(writer, "{}\t{}", methods, escape_terminal(&api.path))?;
         } else {
             writeln!(
                 writer,
                 "{}\t{}\t{}",
-                row.methods,
-                escape_terminal(&row.path),
-                row.flags
+                methods,
+                escape_terminal(&api.path),
+                flags
             )?;
         }
     }
@@ -44,76 +44,26 @@ fn render_api_text<W: Write>(out: &Output, writer: &mut W) -> io::Result<()> {
 }
 
 fn render_api_json<W: Write>(out: &Output, writer: &mut W) -> io::Result<()> {
-    let apis = collect_apis(out);
     let mut body = String::new();
     body.push_str("{\"apis\":[");
-    for (i, row) in apis.iter().enumerate() {
+    for (i, api) in out.apis.iter().enumerate() {
         if i > 0 {
             body.push(',');
         }
         body.push_str("{\"path\":");
-        push_json_string(&mut body, &row.path);
+        push_json_string(&mut body, &api.path);
         body.push_str(",\"methods\":");
-        push_json_array(&mut body, row.methods.split(',').filter(|s| !s.is_empty()));
-        let flags = row.flags.split(',').filter(|s| !s.is_empty());
+        let methods = api.shape.methods_csv();
+        push_json_array(&mut body, methods.split(',').filter(|s| !s.is_empty()));
         body.push_str(",\"flags\":");
-        push_json_array(&mut body, flags);
+        let flags = api.shape.flags_csv();
+        push_json_array(&mut body, flags.split(',').filter(|s| !s.is_empty()));
         body.push('}');
     }
     body.push_str("],\"warnings\":");
     push_json_array(&mut body, out.warnings.iter().map(String::as_str));
     body.push_str("}\n");
     writer.write_all(body.as_bytes())
-}
-
-struct ApiRow {
-    path: String,
-    methods: String,
-    flags: String,
-}
-
-fn collect_apis(out: &Output) -> Vec<ApiRow> {
-    let mut merged = BTreeMap::<String, Shape>::new();
-    for evidence in &out.evidence {
-        if evidence.kind != EvidenceKind::Api {
-            continue;
-        }
-        let Some(shape) = &evidence.shape else {
-            continue;
-        };
-        merged
-            .entry(prettify(&normalize_path(&evidence.url)))
-            .and_modify(|existing| existing.merge(shape))
-            .or_insert_with(|| shape.clone());
-    }
-    let mut rows: Vec<ApiRow> = merged
-        .into_iter()
-        .map(|(path, shape)| ApiRow {
-            path,
-            methods: shape.methods_csv(),
-            flags: shape.flags_csv(),
-        })
-        .collect();
-    rows.sort_by(|a, b| a.path.cmp(&b.path).then(a.methods.cmp(&b.methods)));
-    rows
-}
-
-fn normalize_path(url: &str) -> String {
-    let raw = crate::url::Url::parse(url)
-        .map(|u| u.path().to_string())
-        .unwrap_or_else(|_| url.split(['?', '#']).next().unwrap_or(url).to_string());
-    let trimmed = raw.trim_end_matches('/');
-    if trimmed.is_empty() {
-        "/".to_string()
-    } else if trimmed.starts_with('/') {
-        trimmed.to_string()
-    } else {
-        format!("/{trimmed}")
-    }
-}
-
-fn prettify(path: &str) -> String {
-    path.replace("{dynamic}", ":id")
 }
 
 fn push_json_array<'a>(out: &mut String, values: impl Iterator<Item = &'a str>) {
@@ -172,8 +122,8 @@ fn is_visual_spoofing_char(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::processor::{CacheStatus, Output};
-    use crate::scan::{Confidence, Evidence, Extractor};
+    use crate::runtime::processor::{Api, CacheStatus, Output};
+    use crate::scan::Shape;
 
     #[test]
     fn text_output_is_api_only() {
@@ -205,30 +155,15 @@ mod tests {
 
     fn fixture() -> Output {
         Output {
-            evidence: vec![
+            apis: vec![
                 api("/api/users?team=1", Shape::inferred(Some("GET"), false)),
                 api("/v1/login", {
                     let mut shape = Shape::inferred(Some("POST"), true);
                     shape.merge(&shape_with_json());
                     shape
                 }),
-                Evidence {
-                    url: "/dashboard".to_string(),
-                    kind: EvidenceKind::Route,
-                    extractor: Extractor::Literal,
-                    confidence: Confidence::Candidate,
-                    shape: None,
-                },
-                Evidence {
-                    url: "/api/maybe".to_string(),
-                    kind: EvidenceKind::Candidate,
-                    extractor: Extractor::Literal,
-                    confidence: Confidence::Candidate,
-                    shape: None,
-                },
             ],
             revision: None,
-            framework: Default::default(),
             cache: CacheStatus::Miss,
             cache_age_secs: None,
             elapsed_us: None,
@@ -236,14 +171,11 @@ mod tests {
         }
     }
 
-    fn api(url: &str, mut shape: Shape) -> Evidence {
+    fn api(url: &str, mut shape: Shape) -> Api {
         shape.apply_query_params(url);
-        Evidence {
-            url: url.to_string(),
-            kind: EvidenceKind::Api,
-            extractor: Extractor::ApiCall,
-            confidence: Confidence::Observed,
-            shape: Some(shape),
+        Api {
+            path: url.split('?').next().unwrap_or(url).to_string(),
+            shape,
         }
     }
 

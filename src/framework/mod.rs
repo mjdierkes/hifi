@@ -41,6 +41,24 @@ pub struct AssetContext {
     pub remix: bool,
 }
 
+impl AssetContext {
+    pub fn detect(bytes: &[u8], base: &Url, next_config: Option<&NextConfig>) -> Self {
+        let next = next::is_context(bytes, base, next_config);
+        let nuxt = nuxt::is_context(bytes, base);
+        let sveltekit = sveltekit::is_context(bytes, base);
+        Self {
+            next,
+            nuxt,
+            sveltekit,
+            sveltekit_immutable_root: sveltekit
+                .then(|| sveltekit::primary_immutable_root(bytes, base))
+                .flatten(),
+            astro: astro::is_context(bytes, base),
+            remix: remix::is_context(bytes, base),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub enum FrameworkConfig {
     #[default]
@@ -53,8 +71,16 @@ pub enum FrameworkConfig {
 }
 
 impl FrameworkConfig {
-    pub fn is_none(&self) -> bool {
-        matches!(self, Self::None)
+    pub fn from_context(next_config: Option<NextConfig>, context: &AssetContext) -> Self {
+        match next_config {
+            Some(cfg) => Self::Next(cfg),
+            None if context.next => Self::Next(NextConfig::default()),
+            None if context.nuxt => Self::Nuxt,
+            None if context.sveltekit => Self::SvelteKit,
+            None if context.astro => Self::Astro,
+            None if context.remix => Self::Remix,
+            None => Self::None,
+        }
     }
 
     pub fn as_next(&self) -> Option<&NextConfig> {
@@ -76,12 +102,6 @@ impl FrameworkConfig {
             Self::Astro => Some("Astro".to_string()),
             Self::Remix => Some("Remix".to_string()),
         }
-    }
-}
-
-impl From<Option<NextConfig>> for FrameworkConfig {
-    fn from(value: Option<NextConfig>) -> Self {
-        value.map(Self::Next).unwrap_or_default()
     }
 }
 
