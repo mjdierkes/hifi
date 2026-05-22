@@ -7,9 +7,8 @@
 //! The cache stores processed scan output, per-site asset scan data plus HTTP
 //! validators, and content-addressed chunk scan data.
 
-use crate::discover::DocumentScan;
-use crate::scan::FindingsBuilder;
-use crate::url::Url;
+use super::cache_writer;
+use crate::{discover::DocumentScan, scan::FindingsBuilder, url::Url};
 use lru::LruCache;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -414,16 +413,7 @@ fn read_chunk_url(url: &Url, max_age_secs: u64) -> Option<CachedChunk> {
 }
 
 fn spawn_cache_write(write: impl FnOnce() + Send + 'static) {
-    #[cfg(test)]
-    {
-        write();
-    }
-    #[cfg(not(test))]
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn_blocking(write);
-    } else {
-        write();
-    }
+    cache_writer::defer(write);
 }
 
 fn chunk_index_path_for(url: &Url) -> PathBuf {

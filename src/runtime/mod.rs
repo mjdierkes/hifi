@@ -1,4 +1,5 @@
 pub mod cache;
+mod cache_writer;
 pub mod config;
 pub mod daemon;
 pub mod fetch;
