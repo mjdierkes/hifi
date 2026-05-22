@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "sync"] }
 aho-corasick = "1"
+blake3 = "1"
 bytes = "1"
 directories = "6"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

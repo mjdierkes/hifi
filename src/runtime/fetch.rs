@@ -28,6 +28,7 @@ use url::Url;
 const ASSET_MEMORY_CACHE_MAX_ENTRIES: usize = 1024;
 pub const MAX_TOTAL_ASSETS: usize = 2048;
 const MAX_LOW_SIGNAL_ASSETS: usize = 64;
+const MAX_PREWARM_HOSTS: usize = 16;
 static FIRST_ASSET_RESPONSE_TRACED: AtomicBool = AtomicBool::new(false);
 
 pub type AssetMemoryCache = Arc<RwLock<LruCache<String, (Arc<AssetData>, Instant)>>>;
@@ -74,7 +75,7 @@ struct ScannedAsset {
 }
 
 enum FetchedBody {
-    Body(Box<DocumentScan>, cache::AssetValidators),
+    Body(Box<DocumentScan>, cache::AssetValidators, Option<String>),
     NotModified,
 }
 
@@ -95,6 +96,7 @@ pub async fn scan_assets(
         &mut stats,
         &mut low_signal_enqueued,
     );
+    prewarm_asset_hosts(&client, &queue, opts.allow_private);
 
     let mut fetched = FuturesUnordered::new();
     let concurrency = opts.concurrency.max(1);
@@ -216,6 +218,35 @@ fn is_low_signal_script_path(path: &str) -> bool {
     .any(|fragment| path.contains(fragment))
 }
 
+fn prewarm_asset_hosts(client: &Client, assets: &VecDeque<AssetRef>, allow_private: bool) {
+    let mut seen = rustc_hash::FxHashSet::default();
+    for url in assets
+        .iter()
+        .filter(|asset| asset.url.scheme() == "https")
+        .filter_map(|asset| prewarm_key(&asset.url).map(|key| (key, asset.url.clone())))
+    {
+        let (key, url) = url;
+        if !seen.insert(key) {
+            continue;
+        }
+        let client = client.clone();
+        tokio::spawn(async move {
+            if net::validate_request_url(&url, allow_private).await.is_ok() {
+                let _ = client.prewarm(&url).await;
+            }
+        });
+        if seen.len() >= MAX_PREWARM_HOSTS {
+            break;
+        }
+    }
+}
+
+fn prewarm_key(url: &Url) -> Option<String> {
+    let host = url.host_str()?.to_ascii_lowercase();
+    let port = url.port_or_known_default()?;
+    Some(format!("{}://{host}:{port}", url.scheme()))
+}
+
 async fn fetch_scan(
     client: Client,
     asset: AssetRef,
@@ -226,14 +257,39 @@ async fn fetch_scan(
     framework_config: FrameworkConfig,
 ) -> Result<ScannedAsset, (AssetRef, FetchFailure)> {
     let mut cached = None;
+    let mut cached_content_hash = None;
     if use_cache {
+        let chunk_cache = cache::ChunkCache::new();
         if let Some(asset_data) = read_memory_asset(memory.as_ref(), &asset.url, cache_key) {
             return Ok(ScannedAsset {
                 asset: asset_data,
                 memory_hit: true,
             });
         }
-        if let Some(asset_data) = cache::read_asset_cached(&asset.url, cache_key) {
+        if asset.kind == discover::AssetKind::Script {
+            if let Some(chunk) = chunk_cache.read_fresh_url(&asset.url) {
+                let asset_data = Arc::new(chunk.data);
+                write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
+                return Ok(ScannedAsset {
+                    asset: asset_data,
+                    memory_hit: false,
+                });
+            }
+        }
+        if asset.kind == discover::AssetKind::Script {
+            if let Some(chunk) = chunk_cache.read_stale_url(&asset.url) {
+                cached_content_hash = Some(chunk.content_hash);
+                cached = Some(cache::CachedAsset {
+                    data: chunk.data,
+                    age_secs: chunk.age_secs,
+                    validators: chunk.validators,
+                });
+            }
+        }
+        if cached.is_none() {
+            cached = cache::read_asset_cached(&asset.url, cache_key);
+        }
+        if let Some(asset_data) = cached.take() {
             if asset_data.age_secs < cache::CACHE_FRESH_SECS {
                 let asset_data = Arc::new(asset_data.data);
                 write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
@@ -266,6 +322,14 @@ async fn fetch_scan(
                 cache_key,
                 &cached.validators,
             );
+            if let Some(content_hash) = cached_content_hash.as_deref() {
+                cache::ChunkCache::new().write(
+                    &asset.url,
+                    content_hash,
+                    &cached.data,
+                    &cached.validators,
+                );
+            }
             let asset_data = Arc::new(cached.data);
             write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
             Ok(ScannedAsset {
@@ -273,10 +337,18 @@ async fn fetch_scan(
                 memory_hit: false,
             })
         }
-        FetchedBody::Body(scan, validators) => {
+        FetchedBody::Body(scan, validators, content_hash) => {
             let asset_data = Arc::new(*scan);
             if use_cache {
                 cache::write_asset_with_validators(&asset.url, &asset_data, cache_key, &validators);
+                if let Some(content_hash) = content_hash.as_deref() {
+                    cache::ChunkCache::new().write(
+                        &asset.url,
+                        content_hash,
+                        &asset_data,
+                        &validators,
+                    );
+                }
                 write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
             }
             Ok(ScannedAsset {
@@ -390,6 +462,7 @@ async fn fetch_asset_body(
             return Ok(FetchedBody::Body(
                 Box::default(),
                 cache::AssetValidators::default(),
+                None,
             ));
         }
         trace_asset_status(&current_url, status);
@@ -399,27 +472,18 @@ async fn fetch_asset_body(
         });
     }
 
-    let validators = asset_validators(response.headers());
     let kind = asset.document_kind();
-    let (body, streamed_hash) = if use_hash_cache && kind == discover::DocumentKind::Script {
-        net::read_limited_hashed(response).await.map_err(|err| {
-            trace_net_error(&current_url, &err);
-            FetchFailure::Other
-        })?
-    } else {
-        (
-            net::read_limited(response).await.map_err(|err| {
-                trace_net_error(&current_url, &err);
-                FetchFailure::Other
-            })?,
-            0,
-        )
-    };
-    let findings_hash =
-        (use_hash_cache && kind == discover::DocumentKind::Script).then_some(streamed_hash);
-    let cached_findings = findings_hash.and_then(|hash| cache::read_findings_by_hash(hash, kind));
-    let had_cached_findings = cached_findings.is_some();
-    let scan_url = current_url;
+    let validators = asset_validators(response.headers());
+    let body = net::read_limited(response).await.map_err(|err| {
+        trace_net_error(&current_url, &err);
+        FetchFailure::Other
+    })?;
+    let content_hash = (use_hash_cache && kind == discover::DocumentKind::Script)
+        .then(|| blake3::hash(&body).to_hex().to_string());
+    let cached_findings = content_hash
+        .as_deref()
+        .and_then(|hash| cache::ChunkCache::new().read_content_findings(hash));
+    let scan_url = current_url.clone();
     let scan = tokio::task::spawn_blocking(move || {
         discover::scan_document_with_config_and_findings(
             &body,
@@ -436,12 +500,7 @@ async fn fetch_asset_body(
         }
         FetchFailure::Other
     })?;
-    if let Some(hash) = findings_hash {
-        if !had_cached_findings {
-            cache::write_findings_by_hash(hash, kind, &scan.findings);
-        }
-    }
-    Ok(FetchedBody::Body(Box::new(scan), validators))
+    Ok(FetchedBody::Body(Box::new(scan), validators, content_hash))
 }
 
 fn trace_asset_error(url: &Url, err: &super::http::Error) {

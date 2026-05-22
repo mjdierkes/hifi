@@ -4,10 +4,10 @@
 //! `Option` and writes intentionally swallow I/O errors; callers treat cache as
 //! an accelerator, not as required state.
 //!
-//! The cache stores three related artifacts: processed scan output, root pages
-//! plus final redirected URL, and per-asset scan data plus HTTP validators.
+//! The cache stores processed scan output, per-site asset scan data plus HTTP
+//! validators, and content-addressed chunk scan data.
 
-use crate::discover::{DocumentKind, DocumentScan};
+use crate::discover::DocumentScan;
 use crate::scan::FindingsBuilder;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,6 +20,9 @@ use url::Url;
 const SCANNER_CACHE_VERSION: &str = env!("HIFI_BUILD_HASH");
 pub const CACHE_FRESH_SECS: u64 = 300;
 pub const CACHE_STALE_SECS: u64 = 3600;
+pub const CHUNK_URL_FRESH_SECS: u64 = 24 * 60 * 60;
+pub const CHUNK_URL_STALE_SECS: u64 = 7 * 24 * 60 * 60;
+const CHUNK_CACHE_MAX_BYTES: u64 = 500 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ScanCache {
@@ -48,6 +51,37 @@ impl ScanCache {
 
     pub fn write_binary(&self, bytes: &[u8]) {
         write_bytes(&binary_path_for(&self.path), bytes);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ChunkCache;
+
+impl ChunkCache {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn read_fresh_url(&self, url: &Url) -> Option<CachedChunk> {
+        read_chunk_url(url, CHUNK_URL_FRESH_SECS)
+    }
+
+    pub fn read_stale_url(&self, url: &Url) -> Option<CachedChunk> {
+        read_chunk_url(url, CHUNK_URL_STALE_SECS)
+    }
+
+    pub fn read_content_findings(&self, content_hash: &str) -> Option<FindingsBuilder> {
+        read_chunk_findings(content_hash)
+    }
+
+    pub fn write(
+        &self,
+        url: &Url,
+        content_hash: &str,
+        asset: &AssetData,
+        validators: &AssetValidators,
+    ) {
+        write_chunk(url, content_hash, asset, validators);
     }
 }
 
@@ -105,6 +139,20 @@ struct AssetEnvelope {
     validators: AssetValidators,
 }
 
+#[derive(Serialize, Deserialize)]
+struct ChunkIndex {
+    validators: AssetValidators,
+    content_hash: String,
+    data: AssetData,
+}
+
+pub struct CachedChunk {
+    pub data: AssetData,
+    pub age_secs: u64,
+    pub validators: AssetValidators,
+    pub content_hash: String,
+}
+
 pub fn read_asset_cached(url: &Url, cache_key: Option<&str>) -> Option<CachedAsset> {
     let path = asset_path_for(url, cache_key);
     let (bytes, age_secs) = read_fresh(&path, CACHE_STALE_SECS)?;
@@ -132,36 +180,105 @@ pub fn write_asset_with_validators(
     );
 }
 
-pub fn read_findings_by_hash(hash: u64, kind: DocumentKind) -> Option<FindingsBuilder> {
-    let path = findings_hash_path(hash, kind);
-    let (bytes, _) = read_fresh(&path, CACHE_STALE_SECS)?;
+fn read_chunk_findings(content_hash: &str) -> Option<FindingsBuilder> {
+    let bytes = fs::read(chunk_content_path_for(content_hash)).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-pub fn write_findings_by_hash(hash: u64, kind: DocumentKind, findings: &FindingsBuilder) {
-    write_json(&findings_hash_path(hash, kind), findings);
+fn write_chunk(url: &Url, content_hash: &str, asset: &AssetData, validators: &AssetValidators) {
+    write_json(&chunk_content_path_for(content_hash), &asset.findings);
+    write_json(
+        &chunk_index_path_for(url),
+        &ChunkIndex {
+            validators: validators.clone(),
+            content_hash: content_hash.to_owned(),
+            data: asset.clone(),
+        },
+    );
+    prune_chunk_cache(CHUNK_CACHE_MAX_BYTES);
 }
 
 fn asset_path_for(url: &Url, cache_key: Option<&str>) -> PathBuf {
     scanner_hashed_path("assets", url, cache_key, "json")
 }
 
-fn findings_hash_path(hash: u64, kind: DocumentKind) -> PathBuf {
-    let kind = match kind {
-        DocumentKind::Html => "html",
-        DocumentKind::Script => "script",
-        DocumentKind::Manifest => "manifest",
-        DocumentKind::Payload => "payload",
-    };
-    let cache_hash = hash_parts(
-        [SCANNER_CACHE_VERSION, kind, &format!("{hash:016x}")]
-            .into_iter()
-            .map(|s| s as &str),
-    );
+fn read_chunk_url(url: &Url, max_age_secs: u64) -> Option<CachedChunk> {
+    let (bytes, age_secs) = read_fresh(&chunk_index_path_for(url), max_age_secs)?;
+    let index: ChunkIndex = serde_json::from_slice(&bytes).ok()?;
+    Some(CachedChunk {
+        data: index.data,
+        age_secs,
+        validators: index.validators,
+        content_hash: index.content_hash,
+    })
+}
+
+fn chunk_index_path_for(url: &Url) -> PathBuf {
+    let hash = hash_parts([SCANNER_CACHE_VERSION, url.as_str()].into_iter());
+    let hex = format!("{hash:016x}");
+    prefixed_path("chunks/url-index", &hex, "json")
+}
+
+fn chunk_content_path_for(content_hash: &str) -> PathBuf {
+    let storage_hash = hash_parts([SCANNER_CACHE_VERSION, content_hash].into_iter());
+    prefixed_path(
+        "chunks/content",
+        &format!("{storage_hash:016x}-{content_hash}"),
+        "bin",
+    )
+}
+
+fn prefixed_path(kind: &str, name: &str, ext: &str) -> PathBuf {
+    let prefix_len = name.len().min(2);
     dir()
-        .join("findings")
         .join(kind)
-        .join(format!("{cache_hash:016x}.json"))
+        .join(&name[..prefix_len])
+        .join(format!("{name}.{ext}"))
+}
+
+fn prune_chunk_cache(max_bytes: u64) {
+    let mut files = Vec::new();
+    collect_cache_files(&dir().join("chunks"), &mut files);
+    let mut total: u64 = files.iter().map(|entry| entry.len).sum();
+    if total <= max_bytes {
+        return;
+    }
+
+    files.sort_by_key(|entry| entry.modified);
+    for entry in files {
+        if total <= max_bytes {
+            break;
+        }
+        if fs::remove_file(&entry.path).is_ok() {
+            total = total.saturating_sub(entry.len);
+        }
+    }
+}
+
+struct CacheFile {
+    path: PathBuf,
+    len: u64,
+    modified: SystemTime,
+}
+
+fn collect_cache_files(path: &Path, out: &mut Vec<CacheFile>) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            collect_cache_files(&entry.path(), out);
+        } else if meta.is_file() {
+            out.push(CacheFile {
+                path: entry.path(),
+                len: meta.len(),
+                modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            });
+        }
+    }
 }
 
 fn scanner_hashed_path(kind: &str, url: &Url, cache_key: Option<&str>, ext: &str) -> PathBuf {
@@ -322,5 +439,40 @@ mod tests {
             .findings
             .api_map()
             .contains_key("/api/v2"));
+    }
+
+    #[test]
+    fn chunk_cache_reuses_full_scan_by_url_and_content_hash() {
+        let url = Url::parse(&format!(
+            "https://cdn.example.com/npm/next@15/dist/framework-{}.js",
+            TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+        .unwrap();
+        let scan = crate::discover::scan_document(
+            br#"fetch("/api/shared");"static/chunks/child.js""#,
+            &url,
+            DocumentKind::Script,
+        );
+        let validators = AssetValidators {
+            etag: Some(r#""framework-v1""#.to_string()),
+            last_modified: None,
+        };
+        let content_hash = blake3::hash(br#"fetch("/api/shared");"static/chunks/child.js""#)
+            .to_hex()
+            .to_string();
+
+        let chunks = ChunkCache::new();
+        chunks.write(&url, &content_hash, &scan, &validators);
+        let cached = chunks.read_fresh_url(&url).unwrap();
+
+        assert_eq!(cached.validators.etag.as_deref(), Some(r#""framework-v1""#));
+        assert_eq!(cached.content_hash, content_hash);
+        assert!(cached.data.findings.api_map().contains_key("/api/shared"));
+        assert_eq!(cached.data.assets.len(), 1);
+        assert!(chunks
+            .read_content_findings(&content_hash)
+            .unwrap()
+            .api_map()
+            .contains_key("/api/shared"));
     }
 }
