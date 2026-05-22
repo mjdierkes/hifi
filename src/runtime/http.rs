@@ -1,46 +1,28 @@
 //! Small HTTP client tailored to hifi's scanner workload.
 //!
-//! The client owns just enough HTTP/2 to multiplex many HTTPS GET requests over
-//! one TLS connection per origin. Plain HTTP uses HTTP/1.1.
+//! HTTPS uses the `h2` crate for one multiplexed HTTP/2 connection per origin.
+//! Plain HTTP uses a small HTTP/1.1 path.
 
 use crate::hash::FxHashMap;
 use crate::url::Url;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use rustls::{client::Resumption, RootCertStore};
 use rustls_pki_types::ServerName;
-use std::{
-    fmt, io,
-    io::IoSlice,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
-};
+use std::{fmt, io, sync::Arc};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
-    net::TcpStream,
-    sync::{mpsc, Mutex},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::Mutex,
 };
-use tokio_rustls::{client::TlsStream, TlsConnector};
+use tokio_rustls::TlsConnector;
 
 mod headers;
-mod hpack;
 mod origin;
 
 use headers::{http1_content_length, reserve_body};
-use hpack::{encode_headers, HpackDecoder};
 use origin::{connect_tcp, Origin};
 
-const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-const DEFAULT_H2_WINDOW: u32 = 65_535;
 const SCANNER_INITIAL_WINDOW: u32 = 16 * 1024 * 1024;
-const MAX_FRAME_SIZE: usize = 16_384;
-const MAX_FRAME_PAYLOAD: u32 = 16 * 1024 * 1024;
-const END_STREAM: u8 = 0x01;
-const END_HEADERS: u8 = 0x04;
-const PADDED: u8 = 0x08;
-const PRIORITY: u8 = 0x20;
 
 #[derive(Clone)]
 pub struct Client {
@@ -83,10 +65,14 @@ pub enum Error {
     BadDnsName(String),
     #[error("HTTP/2 protocol error: {0}")]
     H2(&'static str),
-    #[error("HTTP/2 peer error code {0}")]
-    H2Code(u32),
-    #[error("HTTP/2 connection closed")]
-    H2Closed,
+    #[error("invalid HTTP/2 request header")]
+    BadHeader,
+    #[error(transparent)]
+    H2Client(#[from] h2::Error),
+    #[error(transparent)]
+    Http(#[from] http::Error),
+    #[error(transparent)]
+    InvalidUri(#[from] http::uri::InvalidUri),
     #[error("HTTP/1.1 response parse error")]
     BadHttp1,
     #[error(transparent)]
@@ -258,21 +244,14 @@ impl Response {
 
 struct H2Session {
     origin: Origin,
-    writer: mpsc::UnboundedSender<H2Write>,
-    streams: Mutex<FxHashMap<u32, mpsc::UnboundedSender<StreamMessage>>>,
-    decoder: Mutex<HpackDecoder>,
-    next_stream_id: AtomicU32,
-}
-
-enum H2Write {
-    Frames(Vec<Bytes>),
+    sender: h2::client::SendRequest<Bytes>,
 }
 
 async fn connect_h2(origin: Origin, tls: TlsConnector) -> Result<Arc<H2Session>, Error> {
     let tcp = connect_tcp(&origin).await?;
     let name = ServerName::try_from(origin.host.clone())
         .map_err(|_| Error::BadDnsName(origin.host.clone()))?;
-    let mut stream = tls.connect(name, tcp).await?;
+    let stream = tls.connect(name, tcp).await?;
     if stream
         .get_ref()
         .1
@@ -283,41 +262,15 @@ async fn connect_h2(origin: Origin, tls: TlsConnector) -> Result<Arc<H2Session>,
         return Err(Error::H2("TLS origin did not negotiate h2"));
     }
 
-    stream.write_all(H2_PREFACE).await?;
-    write_frame(
-        &mut stream,
-        FrameHeader {
-            len: 12,
-            kind: FrameType::Settings as u8,
-            flags: 0,
-            stream_id: 0,
-        },
-        &settings_payload(),
-    )
-    .await?;
-    write_frame(
-        &mut stream,
-        FrameHeader {
-            len: 4,
-            kind: FrameType::WindowUpdate as u8,
-            flags: 0,
-            stream_id: 0,
-        },
-        &(SCANNER_INITIAL_WINDOW - DEFAULT_H2_WINDOW).to_be_bytes(),
-    )
-    .await?;
-    let (reader, writer) = tokio::io::split(stream);
-    let (writer_tx, writer_rx) = mpsc::unbounded_channel();
-    let session = Arc::new(H2Session {
-        origin,
-        writer: writer_tx,
-        streams: Mutex::new(FxHashMap::default()),
-        decoder: Mutex::new(HpackDecoder::default()),
-        next_stream_id: AtomicU32::new(1),
+    let (sender, connection) = h2::client::Builder::new()
+        .initial_window_size(SCANNER_INITIAL_WINDOW)
+        .initial_connection_window_size(SCANNER_INITIAL_WINDOW)
+        .handshake(stream)
+        .await?;
+    tokio::spawn(async move {
+        let _ = connection.await;
     });
-    tokio::spawn(write_h2(writer, writer_rx));
-    tokio::spawn(read_h2(session.clone(), reader));
-    Ok(session)
+    Ok(Arc::new(H2Session { origin, sender }))
 }
 
 impl H2Session {
@@ -327,54 +280,29 @@ impl H2Session {
         headers: Vec<(String, String)>,
         defaults: &[(String, String)],
     ) -> Result<Response, Error> {
-        let stream_id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        self.streams.lock().await.insert(stream_id, tx);
+        let request = h2_request(&url, &self.origin, headers, defaults)?;
+        let mut sender = self.sender.clone().ready().await?;
+        let (response, _stream) = sender.send_request(request, true)?;
+        let response = response.await?;
 
-        let block = encode_headers(&url, &self.origin, headers, defaults);
-        let frames = header_block_frames(stream_id, &block)?;
-        if self.writer.send(H2Write::Frames(frames)).is_err() {
-            self.streams.lock().await.remove(&stream_id);
-            return Err(Error::H2Closed);
-        }
-
-        let mut status = None;
-        let mut response_headers = Vec::new();
+        let status = response.status().as_u16();
+        let response_headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                let value = value.to_str().ok()?;
+                Some((name.as_str().to_ascii_lowercase(), value.to_string()))
+            })
+            .collect::<Vec<_>>();
         let mut body = BytesMut::new();
-        while let Some(message) = rx.recv().await {
-            match message {
-                StreamMessage::Headers {
-                    headers,
-                    end_stream,
-                } => {
-                    for (name, value) in headers {
-                        if name == ":status" {
-                            status = value.parse::<u16>().ok();
-                        } else {
-                            response_headers.push((name, value));
-                        }
-                    }
-                    reserve_body(&response_headers, &mut body);
-                    if end_stream {
-                        break;
-                    }
-                }
-                StreamMessage::Data {
-                    payload,
-                    end_stream,
-                } => {
-                    body.extend_from_slice(&payload);
-                    if end_stream {
-                        break;
-                    }
-                }
-                StreamMessage::Reset(code) => return Err(Error::H2Code(code)),
-                StreamMessage::ConnectionClosed => return Err(Error::H2Closed),
-            }
+        reserve_body(&response_headers, &mut body);
+        let mut stream = response.into_body();
+        while let Some(chunk) = stream.data().await {
+            let chunk = chunk?;
+            body.extend_from_slice(&chunk);
         }
-        self.streams.lock().await.remove(&stream_id);
         Ok(Response {
-            status: status.ok_or(Error::H2("response had no :status"))?,
+            status,
             version: Version::Http2,
             url,
             headers: response_headers,
@@ -383,341 +311,40 @@ impl H2Session {
     }
 }
 
-fn header_block_frames(stream_id: u32, block: &[u8]) -> Result<Vec<Bytes>, Error> {
-    let mut chunks = block.chunks(MAX_FRAME_SIZE).peekable();
-    let Some(first) = chunks.next() else {
-        return Err(Error::H2("empty request header block"));
-    };
-    let mut frames = Vec::with_capacity(1 + chunks.size_hint().0);
-    let first_is_last = chunks.peek().is_none();
-    frames.push(encode_frame(
-        FrameHeader {
-            len: first.len() as u32,
-            kind: FrameType::Headers as u8,
-            flags: END_STREAM | if first_is_last { END_HEADERS } else { 0 },
-            stream_id,
-        },
-        first,
-    ));
-    while let Some(chunk) = chunks.next() {
-        let is_last = chunks.peek().is_none();
-        frames.push(encode_frame(
-            FrameHeader {
-                len: chunk.len() as u32,
-                kind: FrameType::Continuation as u8,
-                flags: if is_last { END_HEADERS } else { 0 },
-                stream_id,
-            },
-            chunk,
-        ));
+fn h2_request(
+    url: &Url,
+    origin: &Origin,
+    extra: Vec<(String, String)>,
+    defaults: &[(String, String)],
+) -> Result<http::Request<()>, Error> {
+    let mut builder = http::Request::builder()
+        .method(http::Method::GET)
+        .version(http::Version::HTTP_2)
+        .uri(
+            format!(
+                "{}://{}{}",
+                url.scheme(),
+                origin.authority(),
+                request_path(url)
+            )
+            .parse::<http::Uri>()?,
+        );
+    let headers = builder.headers_mut().ok_or(Error::BadHeader)?;
+    for (k, v) in defaults {
+        append_header(headers, k, v)?;
     }
-    Ok(frames)
-}
-
-async fn write_h2(
-    mut writer: WriteHalf<TlsStream<TcpStream>>,
-    mut rx: mpsc::UnboundedReceiver<H2Write>,
-) {
-    let mut pending = Vec::new();
-    while let Some(command) = rx.recv().await {
-        append_write(command, &mut pending);
-        while let Ok(command) = rx.try_recv() {
-            append_write(command, &mut pending);
-        }
-        if write_vectored_all(&mut writer, &pending).await.is_err() {
-            break;
-        }
-        pending.clear();
+    for (k, v) in extra {
+        append_header(headers, &k, &v)?;
     }
+    Ok(builder.body(())?)
 }
 
-fn append_write(command: H2Write, pending: &mut Vec<Bytes>) {
-    match command {
-        H2Write::Frames(mut frames) => pending.append(&mut frames),
-    }
-}
-
-async fn write_vectored_all<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    frames: &[Bytes],
-) -> io::Result<()> {
-    let mut frame_index = 0usize;
-    let mut offset = 0usize;
-    while frame_index < frames.len() {
-        let ios: Vec<IoSlice<'_>> = frames[frame_index..]
-            .iter()
-            .take(64)
-            .enumerate()
-            .map(|(idx, frame)| {
-                if idx == 0 {
-                    IoSlice::new(&frame[offset..])
-                } else {
-                    IoSlice::new(frame)
-                }
-            })
-            .collect();
-        let mut written = writer.write_vectored(&ios).await?;
-        if written == 0 {
-            return Err(io::ErrorKind::WriteZero.into());
-        }
-        while frame_index < frames.len() {
-            let remaining = frames[frame_index].len() - offset;
-            if written < remaining {
-                offset += written;
-                break;
-            }
-            written -= remaining;
-            frame_index += 1;
-            offset = 0;
-            if written == 0 {
-                break;
-            }
-        }
-    }
-    writer.flush().await
-}
-
-async fn read_h2(session: Arc<H2Session>, mut reader: ReadHalf<TlsStream<TcpStream>>) {
-    let mut pending_headers: Option<PendingHeaders> = None;
-    while let Ok(frame) = read_frame(&mut reader).await {
-        if frame.header.kind == FrameType::Settings as u8 && frame.header.flags & 0x01 == 0 {
-            apply_settings(&session, &frame.payload).await;
-            let _ = session.writer.send(H2Write::Frames(vec![encode_frame(
-                FrameHeader {
-                    len: 0,
-                    kind: FrameType::Settings as u8,
-                    flags: 0x01,
-                    stream_id: 0,
-                },
-                &[],
-            )]));
-            continue;
-        }
-        if frame.header.kind == FrameType::Ping as u8 && frame.header.flags & 0x01 == 0 {
-            let _ = session.writer.send(H2Write::Frames(vec![encode_frame(
-                FrameHeader {
-                    len: frame.payload.len() as u32,
-                    kind: FrameType::Ping as u8,
-                    flags: 0x01,
-                    stream_id: 0,
-                },
-                &frame.payload,
-            )]));
-            continue;
-        }
-        if frame.header.kind == FrameType::GoAway as u8 {
-            break;
-        }
-        if frame.header.stream_id == 0 {
-            continue;
-        }
-        if pending_headers.is_some() && frame.header.kind != FrameType::Continuation as u8 {
-            break;
-        }
-        let message = match frame.header.kind {
-            x if x == FrameType::Headers as u8 => {
-                let Some(block) = header_block_payload(&frame) else {
-                    break;
-                };
-                if frame.header.flags & END_HEADERS == 0 {
-                    pending_headers = Some(PendingHeaders {
-                        stream_id: frame.header.stream_id,
-                        end_stream: frame.header.flags & END_STREAM != 0,
-                        block: BytesMut::from(block),
-                    });
-                    continue;
-                }
-                let headers = match session.decoder.lock().await.decode(block) {
-                    Ok(headers) => headers,
-                    Err(_) => break,
-                };
-                StreamMessage::Headers {
-                    headers,
-                    end_stream: frame.header.flags & END_STREAM != 0,
-                }
-            }
-            x if x == FrameType::Continuation as u8 => {
-                let Some(pending) = pending_headers.as_mut() else {
-                    break;
-                };
-                if pending.stream_id != frame.header.stream_id {
-                    break;
-                }
-                pending.block.extend_from_slice(&frame.payload);
-                if frame.header.flags & END_HEADERS == 0 {
-                    continue;
-                }
-                let pending = pending_headers.take().expect("pending headers");
-                let headers = match session.decoder.lock().await.decode(&pending.block) {
-                    Ok(headers) => headers,
-                    Err(_) => break,
-                };
-                StreamMessage::Headers {
-                    headers,
-                    end_stream: pending.end_stream,
-                }
-            }
-            x if x == FrameType::Data as u8 => StreamMessage::Data {
-                payload: match data_payload(&frame) {
-                    Some(payload) => {
-                        release_window(&session, frame.header.stream_id, payload.len());
-                        payload
-                    }
-                    None => break,
-                },
-                end_stream: frame.header.flags & END_STREAM != 0,
-            },
-            x if x == FrameType::RstStream as u8 => {
-                let code = frame.payload.as_ref().get_u32();
-                StreamMessage::Reset(code)
-            }
-            _ => continue,
-        };
-        let tx = {
-            let streams = session.streams.lock().await;
-            streams.get(&frame.header.stream_id).cloned()
-        };
-        if let Some(tx) = tx {
-            let _ = tx.send(message);
-        }
-    }
-    let streams = std::mem::take(&mut *session.streams.lock().await);
-    for (_, tx) in streams {
-        let _ = tx.send(StreamMessage::ConnectionClosed);
-    }
-}
-
-enum StreamMessage {
-    Headers {
-        headers: Vec<(String, String)>,
-        end_stream: bool,
-    },
-    Data {
-        payload: Bytes,
-        end_stream: bool,
-    },
-    Reset(u32),
-    ConnectionClosed,
-}
-
-struct PendingHeaders {
-    stream_id: u32,
-    end_stream: bool,
-    block: BytesMut,
-}
-
-#[derive(Clone)]
-struct Frame {
-    header: FrameHeader,
-    payload: Bytes,
-}
-
-#[derive(Clone, Copy)]
-struct FrameHeader {
-    len: u32,
-    kind: u8,
-    flags: u8,
-    stream_id: u32,
-}
-
-#[repr(u8)]
-enum FrameType {
-    Data = 0,
-    Headers = 1,
-    Settings = 4,
-    Ping = 6,
-    RstStream = 3,
-    GoAway = 7,
-    WindowUpdate = 8,
-    Continuation = 9,
-}
-
-fn settings_payload() -> [u8; 12] {
-    let mut out = [0u8; 12];
-    out[1] = 0x04;
-    (&mut out[2..6]).put_u32(SCANNER_INITIAL_WINDOW);
-    out[7] = 0x05;
-    (&mut out[8..12]).put_u32(MAX_FRAME_SIZE as u32);
-    out
-}
-
-async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, Error> {
-    let mut head = [0u8; 9];
-    reader.read_exact(&mut head).await?;
-    let len = ((head[0] as u32) << 16) | ((head[1] as u32) << 8) | head[2] as u32;
-    if len > MAX_FRAME_PAYLOAD {
-        return Err(Error::H2("frame payload too large"));
-    }
-    let mut payload = BytesMut::zeroed(len as usize);
-    reader.read_exact(&mut payload).await?;
-    Ok(Frame {
-        header: FrameHeader {
-            len,
-            kind: head[3],
-            flags: head[4],
-            stream_id: u32::from_be_bytes([head[5] & 0x7f, head[6], head[7], head[8]]),
-        },
-        payload: payload.freeze(),
-    })
-}
-
-async fn apply_settings(session: &H2Session, payload: &[u8]) {
-    if !payload.len().is_multiple_of(6) {
-        return;
-    }
-    for setting in payload.chunks_exact(6) {
-        let id = u16::from_be_bytes([setting[0], setting[1]]);
-        let value = u32::from_be_bytes([setting[2], setting[3], setting[4], setting[5]]);
-        if id == 0x01 {
-            session
-                .decoder
-                .lock()
-                .await
-                .set_allowed_max_size(value as usize);
-        }
-    }
-}
-
-fn release_window(session: &H2Session, stream_id: u32, len: usize) {
-    let Ok(increment) = u32::try_from(len) else {
-        return;
-    };
-    if increment == 0 {
-        return;
-    }
-    let bytes = increment.to_be_bytes();
-    let _ = session.writer.send(H2Write::Frames(vec![
-        encode_frame(
-            FrameHeader {
-                len: 4,
-                kind: FrameType::WindowUpdate as u8,
-                flags: 0,
-                stream_id: 0,
-            },
-            &bytes,
-        ),
-        encode_frame(
-            FrameHeader {
-                len: 4,
-                kind: FrameType::WindowUpdate as u8,
-                flags: 0,
-                stream_id,
-            },
-            &bytes,
-        ),
-    ]));
-}
-
-fn encode_frame(header: FrameHeader, payload: &[u8]) -> Bytes {
-    let mut out = BytesMut::with_capacity(9 + payload.len());
-    out.put_u8(((header.len >> 16) & 0xff) as u8);
-    out.put_u8(((header.len >> 8) & 0xff) as u8);
-    out.put_u8((header.len & 0xff) as u8);
-    out.put_u8(header.kind);
-    out.put_u8(header.flags);
-    out.extend_from_slice(&(header.stream_id & 0x7fff_ffff).to_be_bytes());
-    out.extend_from_slice(payload);
-    out.freeze()
+fn append_header(headers: &mut http::HeaderMap, name: &str, value: &str) -> Result<(), Error> {
+    let name = http::HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes())
+        .map_err(|_| Error::BadHeader)?;
+    let value = http::HeaderValue::from_str(value).map_err(|_| Error::BadHeader)?;
+    headers.append(name, value);
+    Ok(())
 }
 
 async fn read_http1_bytes<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Bytes, Error> {
@@ -750,42 +377,6 @@ async fn read_http1_bytes<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Bytes,
     Ok(bytes.freeze())
 }
 
-fn header_block_payload(frame: &Frame) -> Option<&[u8]> {
-    let mut start = 0usize;
-    let mut end = frame.payload.len();
-    if frame.header.flags & PADDED != 0 {
-        let pad = *frame.payload.first()? as usize;
-        start += 1;
-        end = end.checked_sub(pad)?;
-    }
-    if frame.header.flags & PRIORITY != 0 {
-        start += 5;
-    }
-    frame.payload.get(start..end)
-}
-
-fn data_payload(frame: &Frame) -> Option<Bytes> {
-    let mut start = 0usize;
-    let mut end = frame.payload.len();
-    if frame.header.flags & PADDED != 0 {
-        let pad = *frame.payload.first()? as usize;
-        start += 1;
-        end = end.checked_sub(pad)?;
-    }
-    frame.payload.get(start..end)?;
-    Some(frame.payload.slice(start..end))
-}
-
-async fn write_frame<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    header: FrameHeader,
-    payload: &[u8],
-) -> Result<(), Error> {
-    writer.write_all(&encode_frame(header, payload)).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
 async fn http1_request(
     url: Url,
     headers: Vec<(String, String)>,
@@ -804,17 +395,7 @@ async fn http1_exchange<S: AsyncRead + AsyncWrite + Unpin>(
     defaults: &[(String, String)],
     version: Version,
 ) -> Result<Response, Error> {
-    let path = match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => {
-            let path = url.path();
-            if path.is_empty() {
-                "/".to_string()
-            } else {
-                path.to_string()
-            }
-        }
-    };
+    let path = request_path(&url);
     let mut req = format!(
         "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
         origin.authority()
@@ -836,6 +417,18 @@ async fn http1_exchange<S: AsyncRead + AsyncWrite + Unpin>(
 
     let bytes = read_http1_bytes(&mut stream).await?;
     parse_http1(url, version, bytes)
+}
+
+fn request_path(url: &Url) -> String {
+    let path = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
+    match url.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    }
 }
 
 fn parse_http1(url: Url, version: Version, bytes: Bytes) -> Result<Response, Error> {
@@ -910,31 +503,6 @@ impl fmt::Debug for Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn frame_payload_helpers_strip_padding_and_priority() {
-        let frame = Frame {
-            header: FrameHeader {
-                len: 10,
-                kind: FrameType::Headers as u8,
-                flags: PADDED | PRIORITY,
-                stream_id: 1,
-            },
-            payload: Bytes::from_static(&[2, 0, 0, 0, 0, 0, b'a', b'b', 0, 0]),
-        };
-        assert_eq!(header_block_payload(&frame).unwrap(), b"ab");
-
-        let frame = Frame {
-            header: FrameHeader {
-                len: 5,
-                kind: FrameType::Data as u8,
-                flags: PADDED,
-                stream_id: 1,
-            },
-            payload: Bytes::from_static(&[1, b'x', b'y', b'z', 0]),
-        };
-        assert_eq!(data_payload(&frame).unwrap(), Bytes::from_static(b"xyz"));
-    }
 
     #[test]
     fn http1_chunked_body_is_decoded() {
