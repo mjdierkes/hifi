@@ -4,6 +4,7 @@ mod framework;
 mod grep;
 pub(crate) mod hash;
 pub(crate) mod json;
+pub(crate) mod literal;
 mod runtime;
 mod scan;
 mod source;

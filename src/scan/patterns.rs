@@ -1,7 +1,7 @@
 use super::literals::{
     CALL_LITERALS, ROUTE_CALL_LITERALS, ROUTE_START_LITERALS, ROUTE_VALUE_LITERALS,
 };
-use aho_corasick::{AhoCorasick, MatchKind};
+use crate::literal::LiteralSet;
 use std::sync::LazyLock;
 
 const CANDIDATE_LITERALS: &[&str] = &["/api", "/graphql", "/trpc"];
@@ -43,9 +43,10 @@ pub(crate) static DOCUMENT_PATTERNS: LazyLock<Vec<SearchPattern>> = LazyLock::ne
         .collect()
 });
 
-pub(crate) static DOCUMENT_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
-    AhoCorasick::builder()
-        .match_kind(MatchKind::LeftmostLongest)
-        .build(DOCUMENT_PATTERNS.iter().map(|pattern| pattern.literal))
-        .expect("valid scan literals")
+pub(crate) static DOCUMENT_LITERALS: LazyLock<LiteralSet<SearchPattern>> = LazyLock::new(|| {
+    LiteralSet::from_strs(
+        DOCUMENT_PATTERNS
+            .iter()
+            .map(|pattern| (pattern.literal, *pattern)),
+    )
 });

@@ -11,7 +11,7 @@
 
 use crate::hash::FxHashMap;
 use crate::source;
-use patterns::{PatternKind, DOCUMENT_AC, DOCUMENT_PATTERNS};
+use patterns::{PatternKind, DOCUMENT_LITERALS};
 
 pub mod classify;
 mod extract;
@@ -247,8 +247,8 @@ fn canonicalize_route(s: &str) -> String {
 pub fn scan_endpoints(bytes: &[u8]) -> FindingsBuilder {
     let mut out = FindingsBuilder::default();
 
-    for m in DOCUMENT_AC.find_iter(bytes) {
-        let pattern = DOCUMENT_PATTERNS[m.pattern().as_usize()];
+    for m in DOCUMENT_LITERALS.find_iter(bytes) {
+        let pattern = m.value;
         match pattern.kind {
             PatternKind::ApiCall => {
                 record_api_call(bytes, m.start(), m.end(), pattern.literal, &mut out)
@@ -267,7 +267,7 @@ pub fn scan_endpoints(bytes: &[u8]) -> FindingsBuilder {
 }
 
 pub(crate) fn has_document_pattern(bytes: &[u8]) -> bool {
-    DOCUMENT_AC.is_match(bytes)
+    DOCUMENT_LITERALS.is_match(bytes)
 }
 
 fn record_api_call(

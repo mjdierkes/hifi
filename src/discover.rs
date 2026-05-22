@@ -8,11 +8,11 @@
 use crate::framework;
 use crate::framework::{AssetContext as FrameworkContexts, FrameworkConfig};
 use crate::hash::FxHashSet;
+use crate::literal::LiteralSet;
 use crate::scan::next::NextConfig;
 use crate::scan::{Extractor, FindingsBuilder};
 use crate::source::{self, TemplateMode};
 use crate::url::Url;
-use aho_corasick::{AhoCorasick, MatchKind};
 use std::sync::LazyLock;
 
 const ASSET_LITERALS: &[&str] = &[
@@ -62,11 +62,8 @@ const FRAMEWORK_DATA_MARKERS: &[&[u8]] = &[
     b"/_actions/",
 ];
 
-static ASSET_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
-    AhoCorasick::builder()
-        .match_kind(MatchKind::LeftmostLongest)
-        .build(ASSET_LITERALS)
-        .expect("valid asset literals")
+static ASSET_LITERALS_SET: LazyLock<LiteralSet<()>> = LazyLock::new(|| {
+    LiteralSet::from_strs(ASSET_LITERALS.iter().copied().map(|literal| (literal, ())))
 });
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -235,7 +232,7 @@ pub(crate) fn scan_document_with_config_and_findings(
 fn is_empty_script(bytes: &[u8], kind: DocumentKind) -> bool {
     kind == DocumentKind::Script
         && !crate::scan::has_document_pattern(bytes)
-        && !ASSET_AC.is_match(bytes)
+        && !ASSET_LITERALS_SET.is_match(bytes)
         && !source::contains(bytes, b"import(")
         && !source::contains(bytes, b"new URL(")
         && !FRAMEWORK_DATA_MARKERS
@@ -310,7 +307,7 @@ fn scan_literal_assets(
     seen: &mut FxHashSet<Url>,
     out: &mut Vec<AssetRef>,
 ) {
-    for m in ASSET_AC.find_iter(bytes) {
+    for m in ASSET_LITERALS_SET.find_iter(bytes) {
         let start = source::walk_token_start(bytes, m.start());
         // Reject tokens that aren't preceded by a string-literal delimiter.
         // Comment substrings, property accesses, and identifier prefixes look
