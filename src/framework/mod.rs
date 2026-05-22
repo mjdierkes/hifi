@@ -159,6 +159,63 @@ fn route_from_suffix(base: &Url, suffix: &str) -> Option<String> {
     })
 }
 
+fn scan_string_tokens(
+    bytes: &[u8],
+    markers: &[&[u8]],
+    mode: source::TemplateMode,
+    mut visit: impl FnMut(&str),
+) {
+    for marker in markers {
+        for pos in memchr::memmem::find_iter(bytes, marker) {
+            let start = source::walk_token_start(bytes, pos);
+            if !source::is_string_literal_start(bytes, start) {
+                continue;
+            }
+            if let Some(raw) = source::token_string(bytes, start, mode) {
+                visit(&raw);
+            }
+        }
+    }
+}
+
+fn scan_quoted_strings(bytes: &[u8], mode: source::TemplateMode, mut visit: impl FnMut(&str)) {
+    let mut i = 0;
+    while i < bytes.len() {
+        let quote = bytes[i];
+        if matches!(quote, b'"' | b'\'' | b'`') {
+            if let Some(raw) = source::quoted_string(bytes, i + 1, quote, mode) {
+                visit(&raw);
+            }
+            i = source::quoted_end(bytes, i + 1, quote).map_or(i + 1, |end| end + 1);
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn scan_key_windows(
+    bytes: &[u8],
+    keys: &[&[u8]],
+    window_len: usize,
+    mut visit: impl FnMut(usize, &[u8], &[u8]),
+) {
+    for key in keys {
+        let mut offset = 0;
+        while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
+            let pos = offset + rel;
+            if source::is_identifier_boundary(bytes, pos, key.len()) {
+                let end = if window_len == 0 {
+                    bytes.len()
+                } else {
+                    bytes.len().min(pos + window_len)
+                };
+                visit(pos, key, &bytes[pos..end]);
+            }
+            offset = pos + key.len();
+        }
+    }
+}
+
 pub fn classify_asset(raw: &str) -> Option<AssetKind> {
     let path = raw.split(['?', '#']).next().unwrap_or(raw);
     if MANIFEST_POLICIES.iter().any(|policy| policy(path)) {
@@ -311,58 +368,48 @@ fn record_payload_route(
 }
 
 fn scan_api_tokens(bytes: &[u8], extractor: Extractor, findings: &mut FindingsBuilder) {
-    for marker in [
-        b"/api/".as_slice(),
-        b"/graphql".as_slice(),
-        b"/trpc".as_slice(),
-    ] {
-        for pos in memchr::memmem::find_iter(bytes, marker) {
-            let start = source::walk_token_start(bytes, pos);
-            if !source::is_string_literal_start(bytes, start) {
-                continue;
+    scan_string_tokens(
+        bytes,
+        &[
+            b"/api/".as_slice(),
+            b"/graphql".as_slice(),
+            b"/trpc".as_slice(),
+        ],
+        source::TemplateMode::Preserve,
+        |raw| {
+            if crate::scan::classify::is_api_candidate(raw) {
+                findings.record_candidate(crate::scan::classify::normalize_api_url(raw), extractor);
             }
-            if let Some(raw) = source::token_string(bytes, start, source::TemplateMode::Preserve) {
-                if crate::scan::classify::is_api_candidate(&raw) {
-                    findings.record_candidate(
-                        crate::scan::classify::normalize_api_url(&raw),
-                        extractor,
-                    );
-                }
-            }
-        }
-    }
+        },
+    );
 }
 
 fn scan_astro_actions(bytes: &[u8], findings: &mut FindingsBuilder) {
-    for pos in memchr::memmem::find_iter(bytes, b"/_actions/") {
-        let start = source::walk_token_start(bytes, pos);
-        if !source::is_string_literal_start(bytes, start) {
-            continue;
-        }
-        let Some(raw) = source::token_string(bytes, start, source::TemplateMode::Preserve) else {
-            continue;
-        };
-        findings.record_api(
-            raw,
-            Shape::inferred(Some("POST"), true),
-            Extractor::AstroIsland,
-        );
-    }
+    scan_string_tokens(
+        bytes,
+        &[b"/_actions/".as_slice()],
+        source::TemplateMode::Preserve,
+        |raw| {
+            findings.record_api(
+                raw.to_owned(),
+                Shape::inferred(Some("POST"), true),
+                Extractor::AstroIsland,
+            );
+        },
+    );
 }
 
 fn scan_nuxt_islands(bytes: &[u8], findings: &mut FindingsBuilder) {
-    for pos in memchr::memmem::find_iter(bytes, b"/__nuxt_island/") {
-        let start = source::walk_token_start(bytes, pos);
-        if !source::is_string_literal_start(bytes, start) {
-            continue;
-        }
-        let Some(raw) = source::token_string(bytes, start, source::TemplateMode::Preserve) else {
-            continue;
-        };
-        findings.record_api(
-            raw,
-            Shape::inferred(Some("GET"), false),
-            Extractor::NuxtPayload,
-        );
-    }
+    scan_string_tokens(
+        bytes,
+        &[b"/__nuxt_island/".as_slice()],
+        source::TemplateMode::Preserve,
+        |raw| {
+            findings.record_api(
+                raw.to_owned(),
+                Shape::inferred(Some("GET"), false),
+                Extractor::NuxtPayload,
+            );
+        },
+    );
 }

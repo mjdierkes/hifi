@@ -164,25 +164,21 @@ fn manifest_roots(bytes: &[u8], base: &Url) -> Vec<Url> {
 }
 
 fn collect_literal_manifest_candidates(bytes: &[u8], out: &mut Vec<String>) {
-    for marker in [
-        b"/_nuxt/builds/".as_slice(),
-        b"_nuxt/builds/".as_slice(),
-        b"/_nuxt/prerendered.json".as_slice(),
-    ] {
-        for pos in memchr::memmem::find_iter(bytes, marker) {
-            let start = source::walk_token_start(bytes, pos);
-            if !source::is_string_literal_start(bytes, start) {
-                continue;
-            }
-            let Some(raw) = source::token_string(bytes, start, TemplateMode::Preserve) else {
-                continue;
-            };
-            let path = raw.split(['?', '#']).next().unwrap_or(&raw);
+    super::scan_string_tokens(
+        bytes,
+        &[
+            b"/_nuxt/builds/".as_slice(),
+            b"_nuxt/builds/".as_slice(),
+            b"/_nuxt/prerendered.json".as_slice(),
+        ],
+        TemplateMode::Preserve,
+        |raw| {
+            let path = raw.split(['?', '#']).next().unwrap_or(raw);
             if is_manifest(path) {
-                out.push(raw);
+                out.push(raw.to_owned());
             }
-        }
-    }
+        },
+    );
 }
 
 fn parse_routes(bytes: &[u8]) -> Vec<String> {
@@ -219,118 +215,82 @@ fn collect_endpoint_json(bytes: &[u8], out: &mut Vec<String>) {
 }
 
 fn collect_endpoint_literals(bytes: &[u8], out: &mut Vec<String>) {
-    for key in [
-        b"endpoint".as_slice(),
-        b"apiUrl".as_slice(),
-        b"baseURL".as_slice(),
-        b"url".as_slice(),
-    ] {
-        let mut offset = 0;
-        while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
-            let pos = offset + rel;
-            if !source::is_identifier_boundary(bytes, pos, key.len()) {
-                offset = pos + key.len();
-                continue;
-            }
+    super::scan_key_windows(
+        bytes,
+        &[
+            b"endpoint".as_slice(),
+            b"apiUrl".as_slice(),
+            b"baseURL".as_slice(),
+            b"url".as_slice(),
+        ],
+        0,
+        |pos, key, _| {
             if let Some(endpoint) = string_value_after_key(&bytes[pos..], key) {
                 push_endpoint(out, &endpoint);
             }
-            offset = pos + key.len();
-        }
-    }
-    for key in [b"endpoints".as_slice(), b"api".as_slice()] {
-        let mut offset = 0;
-        while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
-            let pos = offset + rel;
-            if source::is_identifier_boundary(bytes, pos, key.len()) {
-                collect_api_strings(&bytes[pos..bytes.len().min(pos + 4096)], out);
-            }
-            offset = pos + key.len();
-        }
-    }
+        },
+    );
+    super::scan_key_windows(
+        bytes,
+        &[b"endpoints".as_slice(), b"api".as_slice()],
+        4096,
+        |_, _, window| collect_api_strings(window, out),
+    );
 }
 
 fn collect_relative_endpoint_literals(bytes: &[u8], bases: &[String], out: &mut Vec<String>) {
     if bases.is_empty() {
         return;
     }
-    for key in [
-        b"endpoint".as_slice(),
-        b"endpoints".as_slice(),
-        b"path".as_slice(),
-        b"url".as_slice(),
-        b"api".as_slice(),
-    ] {
-        let mut offset = 0;
-        while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
-            let pos = offset + rel;
-            if source::is_identifier_boundary(bytes, pos, key.len()) {
-                collect_relative_api_strings(&bytes[pos..bytes.len().min(pos + 4096)], bases, out);
-            }
-            offset = pos + key.len();
-        }
-    }
+    super::scan_key_windows(
+        bytes,
+        &[
+            b"endpoint".as_slice(),
+            b"endpoints".as_slice(),
+            b"path".as_slice(),
+            b"url".as_slice(),
+            b"api".as_slice(),
+        ],
+        4096,
+        |_, _, window| collect_relative_api_strings(window, bases, out),
+    );
 }
 
 fn collect_relative_api_strings(bytes: &[u8], bases: &[String], out: &mut Vec<String>) {
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if matches!(b, b'"' | b'\'' | b'`') {
-            if let Some(s) =
-                source::quoted_string(bytes, i + 1, b, TemplateMode::ReplaceExpressions)
-            {
-                push_relative_endpoint(out, &s, bases);
-            }
-            i = source::quoted_end(bytes, i + 1, b).map_or(i + 1, |end| end + 1);
-            continue;
-        }
-        i += 1;
-    }
+    super::scan_quoted_strings(bytes, TemplateMode::ReplaceExpressions, |raw| {
+        push_relative_endpoint(out, raw, bases);
+    });
 }
 
 fn runtime_api_bases(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
-    for key in [
-        b"apiBase".as_slice(),
-        b"apiBaseURL".as_slice(),
-        b"apiBaseUrl".as_slice(),
-        b"apiUrl".as_slice(),
-        b"apiURL".as_slice(),
-        b"baseURL".as_slice(),
-        b"baseUrl".as_slice(),
-    ] {
-        let mut offset = 0;
-        while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
-            let pos = offset + rel;
-            if source::is_identifier_boundary(bytes, pos, key.len()) {
-                if let Some(value) = string_value_after_key(&bytes[pos..], key) {
-                    push_runtime_api_base(&mut out, &value);
-                }
+    super::scan_key_windows(
+        bytes,
+        &[
+            b"apiBase".as_slice(),
+            b"apiBaseURL".as_slice(),
+            b"apiBaseUrl".as_slice(),
+            b"apiUrl".as_slice(),
+            b"apiURL".as_slice(),
+            b"baseURL".as_slice(),
+            b"baseUrl".as_slice(),
+        ],
+        0,
+        |pos, key, _| {
+            if let Some(value) = string_value_after_key(&bytes[pos..], key) {
+                push_runtime_api_base(&mut out, &value);
             }
-            offset = pos + key.len();
-        }
-    }
+        },
+    );
     out.sort();
     out.dedup();
     out
 }
 
 fn collect_api_strings(bytes: &[u8], out: &mut Vec<String>) {
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if matches!(b, b'"' | b'\'' | b'`') {
-            if let Some(s) =
-                source::quoted_string(bytes, i + 1, b, TemplateMode::ReplaceExpressions)
-            {
-                push_endpoint(out, &s);
-            }
-            i = source::quoted_end(bytes, i + 1, b).map_or(i + 1, |end| end + 1);
-            continue;
-        }
-        i += 1;
-    }
+    super::scan_quoted_strings(bytes, TemplateMode::ReplaceExpressions, |raw| {
+        push_endpoint(out, raw);
+    });
 }
 
 fn endpoint_key_context(key: &str) -> bool {
@@ -419,20 +379,9 @@ fn collect_literal_routes(bytes: &[u8], out: &mut Vec<String>) {
 }
 
 fn collect_route_strings(bytes: &[u8], out: &mut Vec<String>) {
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if matches!(b, b'"' | b'\'' | b'`') {
-            if let Some(s) =
-                source::quoted_string(bytes, i + 1, b, TemplateMode::ReplaceExpressions)
-            {
-                push_route(out, &s);
-            }
-            i = source::quoted_end(bytes, i + 1, b).map_or(i + 1, |end| end + 1);
-            continue;
-        }
-        i += 1;
-    }
+    super::scan_quoted_strings(bytes, TemplateMode::ReplaceExpressions, |raw| {
+        push_route(out, raw);
+    });
 }
 
 fn route_key_context(key: &str) -> bool {

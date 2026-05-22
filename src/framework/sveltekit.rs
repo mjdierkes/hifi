@@ -246,26 +246,22 @@ fn app_root_from_immutable(root: &str) -> Option<String> {
 }
 
 fn collect_literal_immutable_roots(bytes: &[u8], out: &mut Vec<String>) {
-    for marker in [
-        b"/immutable/entry/".as_slice(),
-        b"/immutable/nodes/".as_slice(),
-        b"/immutable/chunks/".as_slice(),
-        b"/immutable/assets/".as_slice(),
-    ] {
-        for pos in memchr::memmem::find_iter(bytes, marker) {
-            let start = source::walk_token_start(bytes, pos);
-            if !source::is_string_literal_start(bytes, start) {
-                continue;
-            }
-            let Some(raw) = source::token_string(bytes, start, TemplateMode::Preserve) else {
-                continue;
-            };
-            let Some(root) = root_before_immutable_child(&raw) else {
-                continue;
+    super::scan_string_tokens(
+        bytes,
+        &[
+            b"/immutable/entry/".as_slice(),
+            b"/immutable/nodes/".as_slice(),
+            b"/immutable/chunks/".as_slice(),
+            b"/immutable/assets/".as_slice(),
+        ],
+        TemplateMode::Preserve,
+        |raw| {
+            let Some(root) = root_before_immutable_child(raw) else {
+                return;
             };
             out.push(root);
-        }
-    }
+        },
+    );
 }
 
 fn root_before_immutable_child(raw: &str) -> Option<String> {
@@ -335,18 +331,12 @@ fn collect_keyed_literal_routes(bytes: &[u8], out: &mut Vec<String>) {
 }
 
 fn collect_route_id_literals(bytes: &[u8], out: &mut Vec<String>) {
-    for marker in [b"/[".as_slice(), b"/(".as_slice()] {
-        for pos in memchr::memmem::find_iter(bytes, marker) {
-            let start = source::walk_token_start(bytes, pos);
-            if !source::is_string_literal_start(bytes, start) {
-                continue;
-            }
-            let Some(route) = source::token_string(bytes, start, TemplateMode::Preserve) else {
-                continue;
-            };
-            push_route(out, &route);
-        }
-    }
+    super::scan_string_tokens(
+        bytes,
+        &[b"/[".as_slice(), b"/(".as_slice()],
+        TemplateMode::Preserve,
+        |route| push_route(out, route),
+    );
 }
 
 fn collect_pattern_routes(bytes: &[u8], out: &mut Vec<String>) {
@@ -473,22 +463,16 @@ fn collect_literal_dependency_values(bytes: &[u8], findings: &mut crate::scan::F
 }
 
 fn scan_dependency_window(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
-    for marker in [
-        b"/api".as_slice(),
-        b"/graphql".as_slice(),
-        b"/trpc".as_slice(),
-    ] {
-        for pos in memchr::memmem::find_iter(bytes, marker) {
-            let start = source::walk_token_start(bytes, pos);
-            if !source::is_string_literal_start(bytes, start) {
-                continue;
-            }
-            let Some(raw) = source::token_string(bytes, start, TemplateMode::Preserve) else {
-                continue;
-            };
-            record_dependency_url(&raw, findings);
-        }
-    }
+    super::scan_string_tokens(
+        bytes,
+        &[
+            b"/api".as_slice(),
+            b"/graphql".as_slice(),
+            b"/trpc".as_slice(),
+        ],
+        TemplateMode::Preserve,
+        |raw| record_dependency_url(raw, findings),
+    );
 }
 
 fn scan_action_attrs(bytes: &[u8], base: &Url, findings: &mut crate::scan::FindingsBuilder) {
@@ -515,18 +499,12 @@ fn scan_action_attrs(bytes: &[u8], base: &Url, findings: &mut crate::scan::Findi
 }
 
 fn scan_action_literals(bytes: &[u8], base: &Url, findings: &mut crate::scan::FindingsBuilder) {
-    for marker in [b"?/".as_slice(), b"/__data.json?/".as_slice()] {
-        for pos in memchr::memmem::find_iter(bytes, marker) {
-            let start = source::walk_token_start(bytes, pos);
-            if !source::is_string_literal_start(bytes, start) {
-                continue;
-            }
-            let Some(raw) = source::token_string(bytes, start, TemplateMode::Preserve) else {
-                continue;
-            };
-            record_action(raw.as_str(), base, findings);
-        }
-    }
+    super::scan_string_tokens(
+        bytes,
+        &[b"?/".as_slice(), b"/__data.json?/".as_slice()],
+        TemplateMode::Preserve,
+        |raw| record_action(raw, base, findings),
+    );
 }
 
 fn record_action(raw: &str, base: &Url, findings: &mut crate::scan::FindingsBuilder) {
