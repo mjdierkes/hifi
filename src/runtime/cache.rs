@@ -49,11 +49,6 @@ impl ScanCache {
         }
     }
 
-    #[cfg(test)]
-    pub fn at_path(path: PathBuf) -> Self {
-        Self { path }
-    }
-
     pub fn read_fresh_binary(&self) -> Option<(Vec<u8>, u64)> {
         read_fresh(&binary_path_for(&self.path), CACHE_FRESH_SECS)
     }
@@ -211,7 +206,7 @@ const CONTENT_MEMORY_MAX_ENTRIES: usize = 512;
 
 /// Process-wide in-memory cache: chunk URL -> latest known index entry.
 ///
-/// LRU-bounded so a long-running daemon scanning many sites cannot grow it
+/// LRU-bounded so repeated scans in a long-running process cannot grow it
 /// without limit. Disk remains the source of truth past the cap.
 fn url_index_memory() -> &'static RwLock<LruCache<String, UrlIndexEntry>> {
     static MEMORY: OnceLock<RwLock<LruCache<String, UrlIndexEntry>>> = OnceLock::new();
@@ -289,10 +284,6 @@ fn hash_parts<'a>(parts: impl Iterator<Item = &'a str>) -> u64 {
 
 pub fn path_for(base: &Url) -> PathBuf {
     scanner_hashed_path("processed", base, None, "json")
-}
-
-pub fn completion_path_for(base: &Url) -> PathBuf {
-    hashed_path("completions", base, None, "bin")
 }
 
 pub type AssetData = DocumentScan;
@@ -683,11 +674,6 @@ fn scanner_hashed_path(kind: &str, url: &Url, cache_key: Option<&str>, ext: &str
     hashed_path_with_hash(kind, url, hash, ext)
 }
 
-fn hashed_path(kind: &str, url: &Url, cache_key: Option<&str>, ext: &str) -> PathBuf {
-    let hash = hash_parts(cache_key.into_iter().chain(std::iter::once(url.as_str())));
-    hashed_path_with_hash(kind, url, hash, ext)
-}
-
 fn hashed_path_with_hash(kind: &str, url: &Url, hash: u64, ext: &str) -> PathBuf {
     use std::fmt::Write;
     let base = dir();
@@ -720,66 +706,11 @@ fn read_fresh(path: &Path, max_age_secs: u64) -> Option<(Vec<u8>, u64)> {
     Some((fs::read(path).ok()?, age))
 }
 
-pub fn read_completion_candidates(base: &Url) -> Option<Vec<String>> {
-    let bytes = fs::read(completion_path_for(base)).ok()?;
-    decode_completion_candidates(&bytes)
-}
-
-pub fn write_completion_candidates(base: &Url, candidates: &[String]) {
-    write_bytes(
-        &completion_path_for(base),
-        &encode_completion_candidates(candidates),
-    );
-}
-
-const COMPLETION_MAGIC: &[u8; 8] = b"HIFICC1\0";
-
-fn encode_completion_candidates(candidates: &[String]) -> Vec<u8> {
-    let est: usize = 16 + candidates.iter().map(|c| c.len() + 4).sum::<usize>();
-    let mut out = Vec::with_capacity(est);
-    out.extend_from_slice(COMPLETION_MAGIC);
-    super::wire::put_string_vec(&mut out, candidates);
-    out
-}
-
-fn decode_completion_candidates(bytes: &[u8]) -> Option<Vec<String>> {
-    let mut r = super::wire::Reader::new(bytes);
-    let magic = r.take_exact(COMPLETION_MAGIC.len())?;
-    if magic != COMPLETION_MAGIC {
-        return None;
-    }
-    let candidates = r.string_vec()?;
-    r.finish()?;
-    Some(candidates)
-}
-
 fn write_bytes(path: &Path, bytes: &[u8]) {
     if let Some(dir) = path.parent() {
         let _ = create_private_dir_all(dir);
     }
     let _ = write_private_file(path, bytes);
-}
-
-/// Hostnames present in the on-disk cache, sorted and deduplicated across cache kinds.
-/// Used by shell completion to suggest previously scanned sites.
-pub fn cached_hosts() -> Vec<String> {
-    let mut hosts = std::collections::BTreeSet::new();
-    for kind in ["processed", "assets"] {
-        let Ok(entries) = fs::read_dir(dir().join(kind)) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                if !name.is_empty() && name != "unknown" {
-                    hosts.insert(name.to_string());
-                }
-            }
-        }
-    }
-    hosts.into_iter().collect()
 }
 
 fn dir() -> &'static Path {

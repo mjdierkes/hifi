@@ -10,18 +10,12 @@ use crate::framework::FrameworkConfig;
 use crate::scan::next::NextConfig;
 use crate::scan::{Confidence, Evidence, EvidenceKind, Extractor, Shape};
 
-use super::{cache, config::RuntimeConfig, fetch, http::Client, net};
+use super::{cache, fetch, http::Client, net};
 use crate::url::Url;
-use lru::LruCache;
-use parking_lot::RwLock;
-use std::{fmt::Write, num::NonZeroUsize, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 use thiserror::Error;
 
-const MEMORY_CACHE_MAX_ENTRIES: usize = 256;
-
 type Result<T, E = RuntimeError> = std::result::Result<T, E>;
-pub type MemoryBody = Arc<Output>;
-pub type MemoryCache = Arc<RwLock<LruCache<String, (MemoryBody, Instant)>>>;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -45,53 +39,6 @@ pub struct Output {
 }
 
 impl Output {
-    pub fn to_json_string(&self) -> String {
-        let mut out = String::new();
-        self.write_json(&mut out);
-        out
-    }
-
-    pub fn write_json(&self, out: &mut String) {
-        out.push('{');
-        let mut comma = false;
-        if !self.evidence.is_empty() {
-            push_field_name(out, &mut comma, "evidence");
-            out.push('[');
-            for (i, evidence) in self.evidence.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_evidence_json(out, evidence);
-            }
-            out.push(']');
-        }
-        if let Some(revision) = self.revision.as_deref() {
-            push_field_name(out, &mut comma, "revision");
-            push_json_string(out, revision);
-        }
-        if !self.framework.is_none() {
-            push_field_name(out, &mut comma, "framework");
-            write_framework_json(out, &self.framework);
-        }
-        if !self.cache.is_stored() {
-            push_field_name(out, &mut comma, "cache");
-            push_json_string(out, self.cache.as_str());
-        }
-        if let Some(age) = self.cache_age_secs {
-            push_field_name(out, &mut comma, "cache_age_secs");
-            let _ = write!(out, "{age}");
-        }
-        if let Some(elapsed) = self.elapsed_us {
-            push_field_name(out, &mut comma, "elapsed_us");
-            let _ = write!(out, "{elapsed}");
-        }
-        if !self.warnings.is_empty() {
-            push_field_name(out, &mut comma, "warnings");
-            write_string_array_json(out, &self.warnings);
-        }
-        out.push('}');
-    }
-
     pub(crate) fn mark(
         mut self,
         t0: Option<Instant>,
@@ -114,174 +61,10 @@ pub enum CacheStatus {
     Miss,
 }
 
-impl CacheStatus {
-    fn is_stored(&self) -> bool {
-        *self == Self::Stored
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Stored => "stored",
-            Self::Fresh => "fresh",
-            Self::RevisionHit => "hit",
-            Self::Miss => "miss",
-        }
-    }
-}
-
-fn push_field_name(out: &mut String, comma: &mut bool, name: &str) {
-    if *comma {
-        out.push(',');
-    }
-    *comma = true;
-    push_json_string(out, name);
-    out.push(':');
-}
-
-fn push_json_string(out: &mut String, value: &str) {
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            ch if ch <= '\u{1f}' => {
-                let _ = write!(out, "\\u{:04x}", ch as u32);
-            }
-            ch => out.push(ch),
-        }
-    }
-    out.push('"');
-}
-
-fn write_string_array_json(out: &mut String, values: &[String]) {
-    out.push('[');
-    for (i, value) in values.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        push_json_string(out, value);
-    }
-    out.push(']');
-}
-
-fn write_evidence_json(out: &mut String, evidence: &Evidence) {
-    out.push('{');
-    push_json_string(out, "url");
-    out.push(':');
-    push_json_string(out, &evidence.url);
-    out.push(',');
-    push_json_string(out, "kind");
-    out.push(':');
-    push_json_string(out, evidence_kind_name(evidence.kind));
-    out.push(',');
-    push_json_string(out, "extractor");
-    out.push(':');
-    push_json_string(out, extractor_name(evidence.extractor));
-    out.push(',');
-    push_json_string(out, "confidence");
-    out.push(':');
-    push_json_string(out, confidence_name(evidence.confidence));
-    if let Some(shape) = &evidence.shape {
-        out.push(',');
-        push_json_string(out, "shape");
-        out.push(':');
-        write_shape_json(out, shape);
-    }
-    out.push('}');
-}
-
-fn write_shape_json(out: &mut String, shape: &Shape) {
-    let (methods, has_body, has_headers, content_types, auth, next_server_action, query_params) =
-        shape.binary_parts();
-    out.push('{');
-    let _ = write!(
-        out,
-        "\"methods\":{methods},\"has_body\":{has_body},\"has_headers\":{has_headers},\"content_types\":{content_types},\"auth\":{auth}"
-    );
-    if next_server_action {
-        out.push_str(",\"next_server_action\":true");
-    }
-    if !query_params.is_empty() {
-        out.push_str(",\"query_params\":");
-        write_string_array_json(out, query_params);
-    }
-    out.push('}');
-}
-
-fn write_framework_json(out: &mut String, framework: &FrameworkConfig) {
-    match framework {
-        FrameworkConfig::None => out.push_str("null"),
-        FrameworkConfig::Nuxt => out.push_str("{\"kind\":\"nuxt\"}"),
-        FrameworkConfig::SvelteKit => out.push_str("{\"kind\":\"svelte_kit\"}"),
-        FrameworkConfig::Astro => out.push_str("{\"kind\":\"astro\"}"),
-        FrameworkConfig::Remix => out.push_str("{\"kind\":\"remix\"}"),
-        FrameworkConfig::Next(config) => {
-            out.push_str("{\"kind\":\"next\",\"config\":{");
-            let mut comma = false;
-            if let Some(value) = config.build_id.as_deref() {
-                push_field_name(out, &mut comma, "build_id");
-                push_json_string(out, value);
-            }
-            if let Some(value) = config.asset_prefix.as_deref() {
-                push_field_name(out, &mut comma, "asset_prefix");
-                push_json_string(out, value);
-            }
-            if let Some(value) = config.base_path.as_deref() {
-                push_field_name(out, &mut comma, "base_path");
-                push_json_string(out, value);
-            }
-            if !config.locales.is_empty() {
-                push_field_name(out, &mut comma, "locales");
-                write_string_array_json(out, &config.locales);
-            }
-            if let Some(value) = config.default_locale.as_deref() {
-                push_field_name(out, &mut comma, "default_locale");
-                push_json_string(out, value);
-            }
-            if let Some(value) = config.locale.as_deref() {
-                push_field_name(out, &mut comma, "locale");
-                push_json_string(out, value);
-            }
-            if let Some(value) = config.page.as_deref() {
-                push_field_name(out, &mut comma, "page");
-                push_json_string(out, value);
-            }
-            out.push_str("}}");
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct CacheContext {
-    pub memory: Option<MemoryCache>,
-    pub assets: Option<fetch::AssetMemoryCache>,
-    pub allow_private: bool,
-}
-
-impl CacheContext {
-    pub fn for_config(config: RuntimeConfig) -> Self {
-        Self {
-            allow_private: config.allow_private,
-            ..Self::default()
-        }
-    }
-}
-
-pub fn memory_cache() -> MemoryCache {
-    Arc::new(RwLock::new(LruCache::new(
-        NonZeroUsize::new(MEMORY_CACHE_MAX_ENTRIES).expect("nonzero cache size"),
-    )))
-}
-
 pub struct Processor<'a> {
     client: &'a Client,
     concurrency: usize,
-    cache: CacheContext,
+    allow_private: bool,
 }
 
 struct RequestPlan {
@@ -302,11 +85,11 @@ struct ScanOutcome {
 }
 
 impl<'a> Processor<'a> {
-    pub fn new(client: &'a Client, concurrency: usize, cache: CacheContext) -> Self {
+    pub fn new(client: &'a Client, concurrency: usize, allow_private: bool) -> Self {
         Self {
             client,
             concurrency,
-            cache,
+            allow_private,
         }
     }
 
@@ -316,31 +99,14 @@ impl<'a> Processor<'a> {
         no_cache: bool,
         t0: Instant,
     ) -> Result<Output> {
-        let active_cache = self.cache_for_request(no_cache);
-        let plan = RequestPlan::new(url, &active_cache)?;
+        let plan = RequestPlan::new(url)?;
         let outcome = self
-            .scan_request(&plan, !no_cache, Some(t0), &active_cache)
+            .scan_request(&plan, !no_cache, Some(t0), self.allow_private)
             .await?;
         if !no_cache && !outcome.used_revision_cache {
-            write_caches(
-                &plan.cache,
-                &outcome.output,
-                url,
-                active_cache.memory.clone(),
-            )?;
+            write_caches(&plan.cache, &outcome.output)?;
         }
         Ok(outcome.output)
-    }
-
-    fn cache_for_request(&self, no_cache: bool) -> CacheContext {
-        if no_cache {
-            CacheContext {
-                allow_private: self.cache.allow_private,
-                ..CacheContext::default()
-            }
-        } else {
-            self.cache.clone()
-        }
     }
 
     // This is the canonical scan pipeline. Keep cache lookup, page loading,
@@ -351,7 +117,7 @@ impl<'a> Processor<'a> {
         plan: &RequestPlan,
         use_cache: bool,
         t0: Option<Instant>,
-        cache_ctx: &CacheContext,
+        allow_private: bool,
     ) -> Result<ScanOutcome> {
         if use_cache {
             if let Some((body, age)) = plan.cache.read_fresh_binary() {
@@ -364,7 +130,7 @@ impl<'a> Processor<'a> {
             }
         }
 
-        let page = self.load_page(plan, use_cache, cache_ctx).await?;
+        let page = self.load_page(plan, use_cache, allow_private).await?;
         let root_scan = scan_root_document(page.html, page.final_base).await?;
         let mut found = root_scan.findings;
         let mut initial_assets = root_scan.assets;
@@ -393,8 +159,7 @@ impl<'a> Processor<'a> {
                 concurrency: self.concurrency,
                 use_processed_cache: use_cache,
                 cache_key: revision.clone(),
-                allow_private: cache_ctx.allow_private,
-                memory: cache_ctx.assets.clone(),
+                allow_private,
                 framework_config: root_scan.framework_config.clone(),
             },
             &mut found,
@@ -420,14 +185,10 @@ impl<'a> Processor<'a> {
         &self,
         plan: &RequestPlan,
         use_cache: bool,
-        cache_ctx: &CacheContext,
+        allow_private: bool,
     ) -> Result<LoadedPage> {
-        let response = net::get_limited(
-            self.client,
-            plan.original_base.clone(),
-            cache_ctx.allow_private,
-        )
-        .await?;
+        let response =
+            net::get_limited(self.client, plan.original_base.clone(), allow_private).await?;
         let final_base = response.url().clone();
         let html = net::read_limited(response).await?;
         let _ = use_cache;
@@ -436,10 +197,9 @@ impl<'a> Processor<'a> {
 }
 
 impl RequestPlan {
-    fn new(url: &str, cache: &CacheContext) -> Result<Self, crate::url::ParseError> {
+    fn new(url: &str) -> Result<Self, crate::url::ParseError> {
         let original_base = Url::parse(url)?;
         let scan_cache = cache::ScanCache::for_base(&original_base);
-        let _ = cache;
         Ok(Self {
             original_base,
             cache: scan_cache,
@@ -483,47 +243,9 @@ fn warnings_from_assets(asset_stats: &fetch::AssetScanStats) -> Vec<String> {
     warnings
 }
 
-pub fn read_memory(memory: &MemoryCache, url: &str) -> Option<(MemoryBody, u64)> {
-    memory
-        .write()
-        .get(url)
-        .cloned()
-        .map(|(body, t)| (body, t.elapsed().as_secs()))
-}
-
-pub fn write_memory(memory: &MemoryCache, url: String, body: MemoryBody) {
-    let mut entries = memory.write();
-    let now = Instant::now();
-    entries.put(url, (body, now));
-    prune_memory(&mut entries, now);
-}
-
-pub fn mark_cached_body(
-    body: &Output,
-    t0: Instant,
-    status: CacheStatus,
-    age_secs: u64,
-) -> MemoryBody {
-    Arc::new(body.clone().mark(Some(t0), status, Some(age_secs)))
-}
-
-fn write_caches(
-    cache_store: &cache::ScanCache,
-    out: &Output,
-    url: &str,
-    memory: Option<MemoryCache>,
-) -> Result<()> {
+fn write_caches(cache_store: &cache::ScanCache, out: &Output) -> Result<()> {
     let cached = out.clone().mark(None, CacheStatus::Stored, None);
     cache_store.write_binary_deferred(Arc::from(encode_output_binary(&cached)));
-    if let Ok(base) = crate::url::Url::parse(url) {
-        let candidates = completion_candidates(&cached.evidence);
-        if !candidates.is_empty() {
-            cache::write_completion_candidates(&base, &candidates);
-        }
-    }
-    if let Some(memory) = memory {
-        write_memory(&memory, url.to_string(), Arc::new(cached));
-    }
     Ok(())
 }
 
@@ -690,14 +412,6 @@ fn evidence_kind_to_u8(kind: EvidenceKind) -> u8 {
     }
 }
 
-fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
-    match kind {
-        EvidenceKind::Api => "api",
-        EvidenceKind::Route => "route",
-        EvidenceKind::Candidate => "candidate",
-    }
-}
-
 fn evidence_kind_from_u8(value: u8) -> Option<EvidenceKind> {
     match value {
         0 => Some(EvidenceKind::Api),
@@ -720,22 +434,6 @@ fn extractor_to_u8(extractor: Extractor) -> u8 {
         Extractor::RemixManifest => 8,
         Extractor::AstroIsland => 9,
         Extractor::ApiClient => 10,
-    }
-}
-
-fn extractor_name(extractor: Extractor) -> &'static str {
-    match extractor {
-        Extractor::Literal => "literal",
-        Extractor::Manifest => "manifest",
-        Extractor::Flight => "flight",
-        Extractor::ApiCall => "api_call",
-        Extractor::RouteCall => "route_call",
-        Extractor::ServerAction => "server_action",
-        Extractor::NuxtPayload => "nuxt_payload",
-        Extractor::SvelteKitData => "svelte_kit_data",
-        Extractor::RemixManifest => "remix_manifest",
-        Extractor::AstroIsland => "astro_island",
-        Extractor::ApiClient => "api_client",
     }
 }
 
@@ -765,15 +463,6 @@ fn confidence_to_u8(confidence: Confidence) -> u8 {
     }
 }
 
-fn confidence_name(confidence: Confidence) -> &'static str {
-    match confidence {
-        Confidence::Observed => "observed",
-        Confidence::Parsed => "parsed",
-        Confidence::Inferred => "inferred",
-        Confidence::Candidate => "candidate",
-    }
-}
-
 fn confidence_from_u8(value: u8) -> Option<Confidence> {
     match value {
         0 => Some(Confidence::Observed),
@@ -781,63 +470,6 @@ fn confidence_from_u8(value: u8) -> Option<Confidence> {
         2 => Some(Confidence::Inferred),
         3 => Some(Confidence::Candidate),
         _ => None,
-    }
-}
-
-fn completion_candidates(evidence: &[Evidence]) -> Vec<String> {
-    let mut set = std::collections::BTreeSet::<String>::new();
-    for item in evidence {
-        if !matches!(
-            item.kind,
-            crate::scan::EvidenceKind::Route | crate::scan::EvidenceKind::Api
-        ) {
-            continue;
-        }
-        let path = normalize_completion_path(&item.url);
-        if path.is_empty() {
-            continue;
-        }
-        set.insert(path.clone());
-        let mut current = path.as_str();
-        while let Some(idx) = current.rfind('/') {
-            let parent = &current[..idx];
-            if parent.is_empty() {
-                break;
-            }
-            set.insert(parent.to_string());
-            current = parent;
-        }
-    }
-    set.into_iter().collect()
-}
-
-fn normalize_completion_path(raw: &str) -> String {
-    let raw = raw.split(['?', '#']).next().unwrap_or(raw);
-    let path = crate::url::Url::parse(raw)
-        .map(|u| u.path().to_string())
-        .unwrap_or_else(|_| raw.to_string());
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let trimmed = if trimmed.starts_with('/') {
-        trimmed.to_string()
-    } else {
-        format!("/{trimmed}")
-    };
-    trimmed.replace("{dynamic}", ":id")
-}
-
-fn prune_memory(entries: &mut LruCache<String, (MemoryBody, Instant)>, now: Instant) {
-    let stale = entries
-        .iter()
-        .filter(|(_, (_, written))| {
-            now.saturating_duration_since(*written).as_secs() >= cache::CACHE_STALE_SECS
-        })
-        .map(|(url, _)| url.clone())
-        .collect::<Vec<_>>();
-    for url in stale {
-        entries.pop(&url);
     }
 }
 
@@ -875,17 +507,10 @@ mod tests {
         })
         .await;
         let client = Client::new();
-        let out = Processor::new(
-            &client,
-            2,
-            CacheContext {
-                allow_private: true,
-                ..CacheContext::default()
-            },
-        )
-        .process_for_display(&format!("http://{addr}/"), true, Instant::now())
-        .await
-        .unwrap();
+        let out = Processor::new(&client, 2, true)
+            .process_for_display(&format!("http://{addr}/"), true, Instant::now())
+            .await
+            .unwrap();
 
         assert!(has_evidence(
             &out,
@@ -916,17 +541,10 @@ mod tests {
         })
         .await;
         let client = Client::new();
-        let out = Processor::new(
-            &client,
-            2,
-            CacheContext {
-                allow_private: true,
-                ..CacheContext::default()
-            },
-        )
-        .process_for_display(&format!("http://{addr}/"), true, Instant::now())
-        .await
-        .unwrap();
+        let out = Processor::new(&client, 2, true)
+            .process_for_display(&format!("http://{addr}/"), true, Instant::now())
+            .await
+            .unwrap();
 
         assert!(has_evidence(
             &out,
@@ -938,34 +556,6 @@ mod tests {
             crate::scan::EvidenceKind::Candidate,
             "/api/from-html-asset"
         ));
-    }
-
-    #[test]
-    fn memory_cached_processed_output_is_remarked_on_read() {
-        let memory = memory_cache();
-        let url = "https://example.com/cache-regression";
-        let path =
-            std::env::temp_dir().join(format!("hifi-cache-regression-{}.json", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let out = Output {
-            evidence: Vec::new(),
-            revision: None,
-            framework: FrameworkConfig::default(),
-            cache: CacheStatus::Miss,
-            cache_age_secs: None,
-            elapsed_us: None,
-            warnings: Vec::new(),
-        };
-
-        let cache_store = cache::ScanCache::at_path(path.clone());
-        write_caches(&cache_store, &out, url, Some(memory.clone())).unwrap();
-        let (body, age) = read_memory(&memory, url).unwrap();
-        assert_eq!(body.cache, CacheStatus::Stored);
-
-        let marked = mark_cached_body(&body, Instant::now(), CacheStatus::Fresh, age);
-        assert_eq!(marked.cache, CacheStatus::Fresh);
-        assert_eq!(marked.cache_age_secs, Some(age));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
@@ -984,17 +574,10 @@ mod tests {
         })
         .await;
         let client = Client::new();
-        let out = Processor::new(
-            &client,
-            2,
-            CacheContext {
-                allow_private: true,
-                ..CacheContext::default()
-            },
-        )
-        .process_for_display(&format!("http://{addr}/"), true, Instant::now())
-        .await
-        .unwrap();
+        let out = Processor::new(&client, 2, true)
+            .process_for_display(&format!("http://{addr}/"), true, Instant::now())
+            .await
+            .unwrap();
 
         assert!(has_evidence(
             &out,
@@ -1016,14 +599,7 @@ mod tests {
         })
         .await;
         let client = Client::new();
-        let processor = Processor::new(
-            &client,
-            2,
-            CacheContext {
-                allow_private: true,
-                ..CacheContext::default()
-            },
-        );
+        let processor = Processor::new(&client, 2, true);
         let url = format!("http://{addr}/");
 
         let first = processor
@@ -1059,14 +635,7 @@ mod tests {
         })
         .await;
         let client = Client::new();
-        let processor = Processor::new(
-            &client,
-            2,
-            CacheContext {
-                allow_private: true,
-                ..CacheContext::default()
-            },
-        );
+        let processor = Processor::new(&client, 2, true);
         let url = format!("http://{addr}/");
 
         let first = processor

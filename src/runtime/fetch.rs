@@ -16,18 +16,13 @@ use super::http::Client;
 use super::net;
 use crate::url::Url;
 use futures_util::{stream::FuturesUnordered, StreamExt};
-use lru::LruCache;
-use parking_lot::RwLock;
 use std::{
     collections::VecDeque,
-    num::NonZeroUsize,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, OnceLock},
-    time::Instant,
 };
 use tokio::sync::Semaphore;
 
-const ASSET_MEMORY_CACHE_MAX_ENTRIES: usize = 1024;
 pub const MAX_TOTAL_ASSETS: usize = 2048;
 const MAX_LOW_SIGNAL_ASSETS: usize = 64;
 const MAX_PREWARM_HOSTS: usize = 16;
@@ -42,21 +37,12 @@ fn revalidation_semaphore() -> &'static Arc<Semaphore> {
     SEM.get_or_init(|| Arc::new(Semaphore::new(MAX_REVALIDATIONS_IN_FLIGHT)))
 }
 
-pub type AssetMemoryCache = Arc<RwLock<LruCache<String, (Arc<AssetData>, Instant)>>>;
-
-pub fn asset_memory_cache() -> AssetMemoryCache {
-    Arc::new(RwLock::new(LruCache::new(
-        NonZeroUsize::new(ASSET_MEMORY_CACHE_MAX_ENTRIES).expect("nonzero cache size"),
-    )))
-}
-
 #[derive(Default)]
 pub struct AssetScanOptions {
     pub concurrency: usize,
     pub use_processed_cache: bool,
     pub cache_key: Option<String>,
     pub allow_private: bool,
-    pub memory: Option<AssetMemoryCache>,
     /// Framework config extracted from the root HTML document. Sub-resources
     /// can't host their own page config, so this is how payloads reconstruct
     /// framework routes consistently.
@@ -66,7 +52,6 @@ pub struct AssetScanOptions {
 #[derive(Default)]
 pub struct AssetScanStats {
     pub discovered: usize,
-    pub memory_hits: usize,
     pub failed: usize,
     pub unauthorized: usize,
     pub skipped_low_signal: usize,
@@ -82,7 +67,6 @@ pub(crate) enum FetchFailure {
 
 struct ScannedAsset {
     asset: Arc<AssetData>,
-    memory_hit: bool,
 }
 
 enum FetchedBody {
@@ -123,7 +107,6 @@ pub async fn scan_assets(
                 opts.use_processed_cache,
                 opts.cache_key.as_deref(),
                 opts.allow_private,
-                opts.memory.clone(),
                 opts.framework_config.clone(),
             ));
         }
@@ -133,9 +116,6 @@ pub async fn scan_assets(
         };
         match res {
             Ok(result) => {
-                if result.memory_hit {
-                    stats.memory_hits += 1;
-                }
                 out.extend(result.asset.findings.clone());
                 enqueue_assets(
                     result.asset.assets.iter().cloned(),
@@ -264,33 +244,20 @@ async fn fetch_scan(
     use_cache: bool,
     cache_key: Option<&str>,
     allow_private: bool,
-    memory: Option<AssetMemoryCache>,
     framework_config: FrameworkConfig,
 ) -> Result<ScannedAsset, (AssetRef, FetchFailure)> {
     let mut cached = None;
     if use_cache {
         let chunk_cache = cache::ChunkCache::new();
-        if let Some(asset_data) = read_memory_asset(memory.as_ref(), &asset.url, cache_key) {
-            return Ok(ScannedAsset {
-                asset: asset_data,
-                memory_hit: true,
-            });
-        }
         if asset.kind == discover::AssetKind::Script {
             if let Some(chunk) = chunk_cache.read_fresh_url(&asset.url) {
-                write_memory_asset(memory.as_ref(), &asset.url, cache_key, chunk.data.clone());
-                return Ok(ScannedAsset {
-                    asset: chunk.data,
-                    memory_hit: false,
-                });
+                return Ok(ScannedAsset { asset: chunk.data });
             }
         }
         if asset.kind == discover::AssetKind::Script {
             if let Some(chunk) = chunk_cache.read_stale_url(&asset.url) {
                 // Stale-while-revalidate: hand the user cached findings now,
-                // refresh the bytes off the critical path. The user sees DRAM
-                // latency instead of an RTT.
-                write_memory_asset(memory.as_ref(), &asset.url, cache_key, chunk.data.clone());
+                // refresh the bytes off the critical path.
                 spawn_revalidate_chunk(
                     client.clone(),
                     asset.clone(),
@@ -299,12 +266,8 @@ async fn fetch_scan(
                     cache_key.map(str::to_owned),
                     framework_config.clone(),
                     allow_private,
-                    memory.clone(),
                 );
-                return Ok(ScannedAsset {
-                    asset: chunk.data,
-                    memory_hit: false,
-                });
+                return Ok(ScannedAsset { asset: chunk.data });
             }
         }
         if cached.is_none() {
@@ -313,11 +276,7 @@ async fn fetch_scan(
         if let Some(asset_data) = cached.take() {
             if asset_data.age_secs < cache::CACHE_FRESH_SECS {
                 let asset_data = Arc::new(asset_data.data);
-                write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
-                return Ok(ScannedAsset {
-                    asset: asset_data,
-                    memory_hit: false,
-                });
+                return Ok(ScannedAsset { asset: asset_data });
             }
             cached = Some(asset_data);
         }
@@ -344,11 +303,7 @@ async fn fetch_scan(
                 cache_key,
                 &cached.validators,
             );
-            write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
-            Ok(ScannedAsset {
-                asset: asset_data,
-                memory_hit: false,
-            })
+            Ok(ScannedAsset { asset: asset_data })
         }
         FetchedBody::Body(scan, validators, content_hash) => {
             let asset_data = Arc::new(*scan);
@@ -367,49 +322,10 @@ async fn fetch_scan(
                         &validators,
                     );
                 }
-                write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
             }
-            Ok(ScannedAsset {
-                asset: asset_data,
-                memory_hit: false,
-            })
+            Ok(ScannedAsset { asset: asset_data })
         }
     }
-}
-
-fn read_memory_asset(
-    memory: Option<&AssetMemoryCache>,
-    url: &Url,
-    cache_key: Option<&str>,
-) -> Option<Arc<AssetData>> {
-    // Once an entry is in the in-process memory cache it stays valid for the
-    // life of the process. Staleness is acceptable: disk-tier
-    // stale-while-revalidate refreshes the underlying bytes; the LRU cap bounds
-    // memory growth.
-    let memory = memory?;
-    let key = memory_key(url, cache_key);
-    let mut entries = memory.write();
-    let (asset, _) = entries.get(&key).cloned()?;
-    Some(asset)
-}
-
-fn write_memory_asset(
-    memory: Option<&AssetMemoryCache>,
-    url: &Url,
-    cache_key: Option<&str>,
-    asset: Arc<AssetData>,
-) {
-    if let Some(memory) = memory {
-        memory
-            .write()
-            .put(memory_key(url, cache_key), (asset, Instant::now()));
-    }
-}
-
-fn memory_key(url: &Url, cache_key: Option<&str>) -> String {
-    cache_key
-        .map(|key| format!("{key}\n{}", url.as_str()))
-        .unwrap_or_else(|| url.as_str().to_string())
 }
 
 async fn fetch_asset_body(
@@ -547,7 +463,6 @@ fn spawn_revalidate_chunk(
     cache_key: Option<String>,
     framework_config: FrameworkConfig,
     allow_private: bool,
-    memory: Option<AssetMemoryCache>,
 ) {
     let sem = revalidation_semaphore().clone();
     // try_acquire instead of acquire: a burst of stale hits should drop excess
@@ -600,15 +515,6 @@ fn spawn_revalidate_chunk(
                         &new_validators,
                     );
                 }
-                // Replace the stale entry the user already received with the
-                // fresh findings for any in-flight or upcoming work in this
-                // process that reads the memory cache.
-                write_memory_asset(
-                    memory.as_ref(),
-                    &asset.url,
-                    cache_key.as_deref(),
-                    asset_data,
-                );
             }
         }
     });
@@ -635,63 +541,6 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-
-    #[tokio::test]
-    async fn memory_cached_assets_keep_recursive_refs() {
-        let addr = serve(2, |req| {
-            if req.starts_with("GET /_next/static/chunks/b.js ") {
-                r#"fetch("/api/b")"#
-            } else {
-                r#"fetch("/api/a");"static/chunks/b.js""#
-            }
-        })
-        .await;
-
-        let client = Client::new();
-        let memory = asset_memory_cache();
-        let initial = script_asset(format!("http://{addr}/_next/static/chunks/a.js"));
-
-        let mut first = FindingsBuilder::default();
-        let first_stats = scan_assets(
-            client.clone(),
-            [initial.clone()],
-            AssetScanOptions {
-                concurrency: 1,
-                use_processed_cache: true,
-                cache_key: Some("b1".into()),
-                allow_private: true,
-                memory: Some(memory.clone()),
-                ..Default::default()
-            },
-            &mut first,
-        )
-        .await;
-        assert_eq!(first_stats.discovered, 2);
-        let first_apis = first.finish().api_map();
-        assert!(first_apis.contains_key("/api/a"));
-        assert!(first_apis.contains_key("/api/b"));
-
-        let mut second = FindingsBuilder::default();
-        let second_stats = scan_assets(
-            client,
-            [initial],
-            AssetScanOptions {
-                concurrency: 1,
-                use_processed_cache: true,
-                cache_key: Some("b1".into()),
-                allow_private: true,
-                memory: Some(memory),
-                ..Default::default()
-            },
-            &mut second,
-        )
-        .await;
-        assert_eq!(second_stats.discovered, 2);
-        assert_eq!(second_stats.memory_hits, 2);
-        let second_apis = second.finish().api_map();
-        assert!(second_apis.contains_key("/api/a"));
-        assert!(second_apis.contains_key("/api/b"));
-    }
 
     #[tokio::test]
     async fn recursive_discovery_is_not_limited_to_fixed_rounds() {
@@ -723,7 +572,6 @@ mod tests {
                 use_processed_cache: false,
                 cache_key: None,
                 allow_private: true,
-                memory: None,
                 ..Default::default()
             },
             &mut found,

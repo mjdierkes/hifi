@@ -1,13 +1,12 @@
 # hifi
 
-`hifi` maps an HTTP API surface by scanning a web app's HTML and JavaScript chunks.
+`hifi` extracts internal APIs by scanning a web app's raw HTML and JavaScript bytes.
 
 ## Usage
 
 ```sh
-hifi <url> [--no-cache] [--no-daemon] [--flat|--json]
+hifi <url> [--no-cache] [--json]
 hifi grep <url> <pattern> [-C N] [--max-hits N] [--max-bytes-per-hit N] [-a|--all]
-hifi serve
 ```
 
 Examples:

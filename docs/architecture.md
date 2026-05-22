@@ -1,7 +1,7 @@
 # hifi Architecture
 
-`hifi` maps a web application's visible HTTP surface by scanning the root HTML
-document and any static assets that the page references.
+`hifi` extracts internal APIs by scanning the root HTML document and any static
+assets that the page references.
 
 ## Execution Flow
 
@@ -9,8 +9,7 @@ document and any static assets that the page references.
 scans it, fetches discovered assets, and builds output. `discover` handles
 generic HTML/literal/dynamic references; `framework` owns framework-specific
 context, asset typing, resolution, payload findings, manifests, and headers.
-`fetch` recursively scans assets with bounded concurrency. `daemon` keeps warm
-memory caches and coalesces identical scans.
+`fetch` recursively scans assets with bounded concurrency.
 
 ## Scanner Shape
 
@@ -27,8 +26,8 @@ skip policy, payload/manifest findings, and request headers.
 ## Cache Layers
 
 Cache failures are best-effort and only make future scans colder. `ScanCache`
-owns processed-output paths, TTL policy, and revision lookup. Asset, findings,
-and completion caches stay in `runtime::cache`.
+owns processed-output paths, TTL policy, and revision lookup. Asset URL and
+content-hash caches stay in `runtime::cache`.
 
 ## Network Policy
 

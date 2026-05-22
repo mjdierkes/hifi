@@ -158,7 +158,6 @@ dependencies = [
  "blake3",
  "bytes",
  "futures-util",
- "libc",
  "lru",
  "memchr",
  "mimalloc",

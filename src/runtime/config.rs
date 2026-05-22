@@ -1,7 +1,7 @@
 //! Runtime settings derived from environment variables.
 //!
-//! Keep env reads here so request handling, daemon state, and network policy can
-//! receive explicit values instead of reaching back into process-global state.
+//! Keep env reads here so request handling and network policy receive explicit
+//! values instead of reaching back into process-global state.
 
 const DEFAULT_CHUNK_CONCURRENCY: usize = 32;
 const HARD_MAX_CHUNK_CONCURRENCY: usize = 128;
