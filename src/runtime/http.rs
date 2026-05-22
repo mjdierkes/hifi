@@ -1,8 +1,7 @@
 //! Small HTTP client tailored to hifi's scanner workload.
 //!
-//! The client owns just enough HTTP/2 to multiplex many GET requests over one
-//! TLS connection per origin. HTTP/1.1 remains as a compatibility path for
-//! plain HTTP test servers and TLS origins that do not negotiate `h2`.
+//! The client owns just enough HTTP/2 to multiplex many HTTPS GET requests over
+//! one TLS connection per origin. Plain HTTP uses HTTP/1.1.
 
 use crate::hash::FxHashMap;
 use crate::url::Url;
@@ -50,7 +49,6 @@ pub struct Client {
 
 struct ClientInner {
     tls_h2: TlsConnector,
-    tls_h1: TlsConnector,
     default_headers: Vec<(String, String)>,
     h2: Mutex<FxHashMap<Origin, Arc<H2Session>>>,
 }
@@ -153,17 +151,7 @@ impl Client {
                         sessions.insert(origin, session.clone());
                         session
                     }
-                    Err(err) => {
-                        trace_http_fallback(&url, &err);
-                        drop(sessions);
-                        return http1_tls_request(
-                            url,
-                            headers,
-                            &self.inner.default_headers,
-                            self.inner.tls_h1.clone(),
-                        )
-                        .await;
-                    }
+                    Err(err) => return Err(err),
                 }
             }
         };
@@ -174,17 +162,9 @@ impl Client {
         {
             Ok(response) => Ok(response),
             Err(err) => {
-                trace_http_fallback(&url, &err);
                 let mut sessions = self.inner.h2.lock().await;
                 sessions.remove(&Origin::for_url(&url)?);
-                drop(sessions);
-                http1_tls_request(
-                    url,
-                    headers,
-                    &self.inner.default_headers,
-                    self.inner.tls_h1.clone(),
-                )
-                .await
+                Err(err)
             }
         }
     }
@@ -213,23 +193,13 @@ impl ClientBuilder {
         let mut h2_config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        h2_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        h2_config.alpn_protocols = vec![b"h2".to_vec()];
         h2_config.resumption = Resumption::in_memory_sessions(1024);
         h2_config.enable_early_data = true;
-
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let mut h1_config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        h1_config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        h1_config.resumption = Resumption::in_memory_sessions(1024);
-        h1_config.enable_early_data = true;
 
         Client {
             inner: Arc::new(ClientInner {
                 tls_h2: TlsConnector::from(Arc::new(h2_config)),
-                tls_h1: TlsConnector::from(Arc::new(h1_config)),
                 default_headers: self.default_headers,
                 h2: Mutex::new(FxHashMap::default()),
             }),
@@ -816,20 +786,6 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn http1_tls_request(
-    url: Url,
-    headers: Vec<(String, String)>,
-    defaults: &[(String, String)],
-    tls: TlsConnector,
-) -> Result<Response, Error> {
-    let origin = Origin::for_url(&url)?;
-    let tcp = connect_tcp(&origin).await?;
-    let name = ServerName::try_from(origin.host.clone())
-        .map_err(|_| Error::BadDnsName(origin.host.clone()))?;
-    let stream = tls.connect(name, tcp).await?;
-    http1_exchange(stream, url, origin, headers, defaults, Version::Http11).await
-}
-
 async fn http1_request(
     url: Url,
     headers: Vec<(String, String)>,
@@ -948,12 +904,6 @@ fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
 impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client").finish_non_exhaustive()
-    }
-}
-
-fn trace_http_fallback(url: &Url, err: &Error) {
-    if std::env::var_os("HIFI_TRACE_HTTP").is_some() {
-        eprintln!("hifi: trace: h2 fallback {} {err}", url.as_str());
     }
 }
 

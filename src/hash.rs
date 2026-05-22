@@ -1,8 +1,7 @@
 //! Inline fast hash. Replaces the `rustc-hash` dep.
 //!
 //! This is a fast non-cryptographic hash for `HashMap` keys we control
-//! (URLs, route strings, headers). It is intentionally small and local rather
-//! than API-compatible with any external crate.
+//! (URLs, route strings, headers). It is intentionally small and local.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};

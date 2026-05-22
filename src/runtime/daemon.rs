@@ -12,8 +12,8 @@ use super::fetch;
 use super::http::Client;
 #[cfg(unix)]
 use super::processor::{
-    mark_cached_body, memory_cache, read_memory, Body, CacheContext, CacheStatus, MemoryCache,
-    Processor,
+    decode_output_binary, encode_output_binary, mark_cached_body, memory_cache, read_memory,
+    CacheContext, CacheStatus, MemoryBody, MemoryCache, Output, Processor,
 };
 #[cfg(unix)]
 use crate::hash::FxHashMap;
@@ -35,7 +35,7 @@ use tokio::sync::{oneshot, Mutex};
 
 type Result<T = ()> = std::result::Result<T, DaemonError>;
 #[cfg(unix)]
-type SharedScan = Arc<std::result::Result<Body, DaemonReply>>;
+type SharedScan = Arc<std::result::Result<MemoryBody, DaemonReply>>;
 #[cfg(unix)]
 type Inflight = Arc<Mutex<FxHashMap<String, Vec<oneshot::Sender<SharedScan>>>>>;
 #[cfg(unix)]
@@ -52,8 +52,6 @@ pub enum DaemonError {
     Runtime(#[from] super::processor::RuntimeError),
     #[error(transparent)]
     Utf8(#[from] std::str::Utf8Error),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
     #[cfg(not(unix))]
     #[error("daemon is unsupported on this platform; run scans without the daemon")]
     UnsupportedPlatform,
@@ -64,11 +62,12 @@ pub struct DaemonReply {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    pub output: Option<Output>,
 }
 
 #[derive(Debug)]
 pub enum DaemonRequest {
-    Reply(DaemonReply),
+    Reply(Box<DaemonReply>),
     StaleDaemon,
     Unavailable,
 }
@@ -131,13 +130,13 @@ enum WireStatus {
     VersionMismatch,
 }
 
-// Binary wire format. The magic bytes identify the protocol and gate version
-// compatibility: a daemon and CLI built from different versions will fail to
-// decode each other's messages and the stale daemon will retire.
+// Binary wire format. The magic bytes identify the protocol; a daemon and CLI
+// built from different versions will fail to decode each other's messages and
+// the stale daemon will retire.
 #[cfg(unix)]
-const WIRE_REQUEST_MAGIC: &[u8; 8] = b"HIFIRQ2\0";
+const WIRE_REQUEST_MAGIC: &[u8; 8] = b"HIFIRQ4\0";
 #[cfg(unix)]
-const WIRE_REPLY_MAGIC: &[u8; 8] = b"HIFIRP2\0";
+const WIRE_REPLY_MAGIC: &[u8; 8] = b"HIFIRP4\0";
 
 #[cfg(unix)]
 fn put_u32(out: &mut Vec<u8>, value: u32) {
@@ -148,6 +147,12 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
 fn put_string(out: &mut Vec<u8>, value: &str) {
     put_u32(out, value.len() as u32);
     out.extend_from_slice(value.as_bytes());
+}
+
+#[cfg(unix)]
+fn put_bytes(out: &mut Vec<u8>, value: &[u8]) {
+    put_u32(out, value.len() as u32);
+    out.extend_from_slice(value);
 }
 
 #[cfg(unix)]
@@ -195,6 +200,12 @@ impl<'a> WireReader<'a> {
         let slice = self.bytes.get(self.pos..self.pos + len)?;
         self.pos += len;
         std::str::from_utf8(slice).ok().map(str::to_owned)
+    }
+    fn bytes(&mut self) -> Option<&'a [u8]> {
+        let len = self.u32()? as usize;
+        let slice = self.bytes.get(self.pos..self.pos + len)?;
+        self.pos += len;
+        Some(slice)
     }
     fn identity(&mut self) -> Option<DaemonIdentity> {
         Some(DaemonIdentity {
@@ -260,6 +271,13 @@ impl WireReply {
                 out.extend_from_slice(&reply.exit_code.to_le_bytes());
                 put_string(&mut out, &reply.stdout);
                 put_string(&mut out, &reply.stderr);
+                match &reply.output {
+                    Some(output) => {
+                        out.push(1);
+                        put_bytes(&mut out, &encode_output_binary(output));
+                    }
+                    None => out.push(0),
+                }
             }
             None => out.push(0),
         }
@@ -281,6 +299,11 @@ impl WireReply {
                 exit_code: r.i32()?,
                 stdout: r.string()?,
                 stderr: r.string()?,
+                output: match r.u8()? {
+                    0 => None,
+                    1 => Some(decode_output_binary(r.bytes()?)?),
+                    _ => return None,
+                },
             }),
             _ => return None,
         };
@@ -399,7 +422,7 @@ pub async fn request(url: &str, no_cache: bool) -> DaemonRequest {
         return DaemonRequest::StaleDaemon;
     }
     match reply.reply {
-        Some(reply) => DaemonRequest::Reply(reply),
+        Some(reply) => DaemonRequest::Reply(Box::new(reply)),
         None => DaemonRequest::Unavailable,
     }
 }
@@ -545,6 +568,7 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
                 exit_code: 2,
                 stdout: String::new(),
                 stderr: "hifi: request too large\n".into(),
+                output: None,
             },
         )
         .await;
@@ -570,6 +594,7 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
                     exit_code: 2,
                     stdout: String::new(),
                     stderr: format!("hifi: {e}\n"),
+                    output: None,
                 },
             )
             .await;
@@ -580,13 +605,14 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
     if !no_cache {
         if let Some((body, age)) = read_memory(&state.memory, url) {
             if age < CACHE_FRESH_SECS {
-                let body = mark_cached_body(&body, t0, CacheStatus::Fresh, age)?;
+                let body = mark_cached_body(&body, t0, CacheStatus::Fresh, age);
                 return reply(
                     &mut stream,
                     DaemonReply {
                         exit_code: 0,
-                        stdout: body.to_string(),
+                        stdout: String::new(),
                         stderr: String::new(),
+                        output: Some((*body).clone()),
                     },
                 )
                 .await;
@@ -602,8 +628,9 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
                             &mut stream,
                             DaemonReply {
                                 exit_code: 0,
-                                stdout: body.to_string(),
+                                stdout: String::new(),
                                 stderr: String::new(),
+                                output: Some((**body).clone()),
                             },
                         )
                         .await
@@ -627,6 +654,7 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
                 exit_code: 2,
                 stdout: String::new(),
                 stderr: format!("hifi: {e}\n"),
+                output: None,
             };
             if !no_cache {
                 finish_inflight(&state.inflight, url, Arc::new(Err(error.clone()))).await;
@@ -635,17 +663,17 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
             return reply(&mut stream, error).await;
         }
     };
-    let body = out.to_json_string()?;
     if !no_cache {
-        let body: Body = Arc::from(body);
+        let body = Arc::new(out);
         finish_inflight(&state.inflight, url, Arc::new(Ok(body.clone()))).await;
         drop(inflight_guard);
         return reply(
             &mut stream,
             DaemonReply {
                 exit_code: 0,
-                stdout: body.to_string(),
+                stdout: String::new(),
                 stderr: String::new(),
+                output: Some((*body).clone()),
             },
         )
         .await;
@@ -654,8 +682,9 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
         &mut stream,
         DaemonReply {
             exit_code: 0,
-            stdout: body,
+            stdout: String::new(),
             stderr: String::new(),
+            output: Some(out),
         },
     )
     .await
@@ -767,6 +796,7 @@ mod tests {
             exit_code: 42,
             stdout: "hello".into(),
             stderr: "warn\n".into(),
+            output: None,
         });
         let bytes = original.encode();
         let decoded = WireReply::decode(&bytes).expect("decode");

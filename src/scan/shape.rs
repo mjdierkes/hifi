@@ -1,6 +1,5 @@
 use super::extract;
 use crate::source;
-use serde::{Deserialize, Serialize};
 
 const METHOD_GET: u8 = 1 << 0;
 const METHOD_POST: u8 = 1 << 1;
@@ -43,16 +42,14 @@ const CONTENT_HINTS: &[(&[&[u8]], u8)] = &[
     (TEXT_HINTS, CONTENT_TEXT),
 ];
 
-#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+#[derive(Default, Clone, Debug)]
 pub struct Shape {
     methods: u8,
     has_body: bool,
     has_headers: bool,
     content_types: u8,
     auth: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
     next_server_action: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     query_params: Vec<String>,
 }
 
@@ -174,10 +171,6 @@ impl Shape {
             query_params,
         }
     }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 // Shape extraction is deliberately heuristic. It should capture useful request

@@ -72,8 +72,6 @@ pub enum AppError {
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
-    Json(#[from] serde_json::Error),
-    #[error(transparent)]
     Net(#[from] net::NetError),
     #[error(transparent)]
     Http(#[from] crate::runtime::http::Error),
@@ -316,7 +314,7 @@ async fn daemon_output(
     match daemon::request(url, no_cache).await {
         daemon::DaemonRequest::Reply(mut out) => {
             render_daemon_reply(&mut out, mode, render);
-            return Some(out);
+            return Some(*out);
         }
         daemon::DaemonRequest::StaleDaemon | daemon::DaemonRequest::Unavailable => {}
     }
@@ -326,7 +324,7 @@ async fn daemon_output(
             match daemon::request(url, no_cache).await {
                 daemon::DaemonRequest::Reply(mut out) => {
                     render_daemon_reply(&mut out, mode, render);
-                    return Some(out);
+                    return Some(*out);
                 }
                 daemon::DaemonRequest::StaleDaemon | daemon::DaemonRequest::Unavailable => {}
             }

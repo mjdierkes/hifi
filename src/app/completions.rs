@@ -88,28 +88,23 @@ fn cached_completion_candidates(url: &str) -> Option<(crate::url::Url, Vec<Strin
 // build hash, so a rebuild orphans the previous file — for completion we just
 // want any recent surface, so union them all).
 fn cached_paths(parsed: &crate::url::Url) -> Option<Vec<String>> {
-    #[derive(serde::Deserialize)]
-    struct Envelope {
-        value: crate::runtime::processor::Output,
-    }
-
-    let primary = cache::path_for(parsed);
+    let primary = cache::path_for(parsed).with_extension("bin");
     let host_dir = primary.parent()?;
 
     let mut paths = Vec::new();
     let entries = fs::read_dir(host_dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+        if path.extension().and_then(|s| s.to_str()) != Some("bin") {
             continue;
         }
         let Ok(bytes) = fs::read(&path) else {
             continue;
         };
-        let Ok(envelope) = serde_json::from_slice::<Envelope>(&bytes) else {
+        let Some(output) = crate::runtime::processor::decode_output_binary(&bytes) else {
             continue;
         };
-        for evidence in envelope.value.evidence {
+        for evidence in output.evidence {
             if matches!(
                 evidence.kind,
                 crate::scan::EvidenceKind::Route | crate::scan::EvidenceKind::Api

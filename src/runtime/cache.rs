@@ -7,11 +7,18 @@
 //! The cache stores processed scan output, per-site asset scan data plus HTTP
 //! validators, and content-addressed chunk scan data.
 
-use super::cache_writer;
-use crate::{discover::DocumentScan, scan::FindingsBuilder, url::Url};
+use super::{
+    cache_writer,
+    processor::{decode_output_binary, encode_output_binary, Output},
+};
+use crate::{
+    discover::{AssetKind, AssetRef, AssetSource, DocumentScan},
+    framework::FrameworkConfig,
+    scan::FindingsBuilder,
+    url::Url,
+};
 use lru::LruCache;
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use std::{
     fs,
     num::NonZeroUsize,
@@ -285,16 +292,14 @@ pub fn path_for(base: &Url) -> PathBuf {
 }
 
 pub fn completion_path_for(base: &Url) -> PathBuf {
-    hashed_path("completions", base, None, "json")
+    hashed_path("completions", base, None, "bin")
 }
 
 pub type AssetData = DocumentScan;
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default)]
 pub struct AssetValidators {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_modified: Option<String>,
 }
 
@@ -310,14 +315,11 @@ pub struct CachedAsset {
     pub validators: AssetValidators,
 }
 
-#[derive(Serialize, Deserialize)]
 struct AssetEnvelope {
     data: AssetData,
-    #[serde(default, skip_serializing_if = "AssetValidators::is_empty")]
     validators: AssetValidators,
 }
 
-#[derive(Serialize, Deserialize)]
 struct ChunkIndex {
     validators: AssetValidators,
     content_hash: String,
@@ -332,10 +334,189 @@ pub struct CachedChunk {
     pub content_hash: String,
 }
 
+const ASSET_MAGIC: &[u8; 8] = b"HIFICA1\0";
+const CHUNK_INDEX_MAGIC: &[u8; 8] = b"HIFICI1\0";
+const FINDINGS_MAGIC: &[u8; 8] = b"HIFICF1\0";
+
+fn encode_asset_envelope(envelope: &AssetEnvelope) -> Vec<u8> {
+    let mut out = Vec::with_capacity(envelope.data.findings.evidence.len() * 48 + 128);
+    out.extend_from_slice(ASSET_MAGIC);
+    put_validators(&mut out, &envelope.validators);
+    put_document_scan(&mut out, &envelope.data);
+    out
+}
+
+fn decode_asset_envelope(bytes: &[u8]) -> Option<AssetEnvelope> {
+    let mut r = super::wire::Reader::new(bytes);
+    (r.take_exact(ASSET_MAGIC.len())? == ASSET_MAGIC).then_some(())?;
+    let validators = read_validators(&mut r)?;
+    let data = read_document_scan(&mut r)?;
+    r.finish()?;
+    Some(AssetEnvelope { data, validators })
+}
+
+fn encode_chunk_index(index: &ChunkIndex) -> Vec<u8> {
+    let mut out = Vec::with_capacity(index.data.findings.evidence.len() * 48 + 160);
+    out.extend_from_slice(CHUNK_INDEX_MAGIC);
+    put_validators(&mut out, &index.validators);
+    super::wire::put_string(&mut out, &index.content_hash);
+    put_document_scan(&mut out, &index.data);
+    out
+}
+
+fn decode_chunk_index(bytes: &[u8]) -> Option<ChunkIndex> {
+    let mut r = super::wire::Reader::new(bytes);
+    (r.take_exact(CHUNK_INDEX_MAGIC.len())? == CHUNK_INDEX_MAGIC).then_some(())?;
+    let validators = read_validators(&mut r)?;
+    let content_hash = r.string()?;
+    let data = read_document_scan(&mut r)?;
+    r.finish()?;
+    Some(ChunkIndex {
+        validators,
+        content_hash,
+        data,
+    })
+}
+
+fn encode_findings(findings: &FindingsBuilder) -> Vec<u8> {
+    let mut out = Vec::with_capacity(findings.evidence.len() * 48 + 16);
+    out.extend_from_slice(FINDINGS_MAGIC);
+    put_findings(&mut out, findings);
+    out
+}
+
+fn decode_findings(bytes: &[u8]) -> Option<FindingsBuilder> {
+    let mut r = super::wire::Reader::new(bytes);
+    (r.take_exact(FINDINGS_MAGIC.len())? == FINDINGS_MAGIC).then_some(())?;
+    let findings = read_findings(&mut r)?;
+    r.finish()?;
+    Some(findings)
+}
+
+fn put_validators(out: &mut Vec<u8>, validators: &AssetValidators) {
+    super::wire::put_opt_string(out, validators.etag.as_deref());
+    super::wire::put_opt_string(out, validators.last_modified.as_deref());
+}
+
+fn read_validators(r: &mut super::wire::Reader<'_>) -> Option<AssetValidators> {
+    Some(AssetValidators {
+        etag: r.opt_string()?,
+        last_modified: r.opt_string()?,
+    })
+}
+
+fn put_findings(out: &mut Vec<u8>, findings: &FindingsBuilder) {
+    let wrapped = Output {
+        evidence: findings.evidence.clone(),
+        revision: None,
+        framework: FrameworkConfig::None,
+        cache: Default::default(),
+        cache_age_secs: None,
+        elapsed_us: None,
+        warnings: Vec::new(),
+    };
+    let bytes = encode_output_binary(&wrapped);
+    super::wire::put_u32(out, bytes.len());
+    out.extend_from_slice(&bytes);
+}
+
+fn read_findings(r: &mut super::wire::Reader<'_>) -> Option<FindingsBuilder> {
+    let len = r.u32()? as usize;
+    let bytes = r.take_exact(len)?;
+    Some(FindingsBuilder {
+        evidence: decode_output_binary(bytes)?.evidence,
+    })
+}
+
+fn put_document_scan(out: &mut Vec<u8>, data: &DocumentScan) {
+    let wrapped = Output {
+        evidence: data.findings.evidence.clone(),
+        revision: data.revision.clone(),
+        framework: data.framework_config.clone(),
+        cache: Default::default(),
+        cache_age_secs: None,
+        elapsed_us: None,
+        warnings: Vec::new(),
+    };
+    let bytes = encode_output_binary(&wrapped);
+    super::wire::put_u32(out, bytes.len());
+    out.extend_from_slice(&bytes);
+    super::wire::put_u32(out, data.assets.len());
+    for asset in &data.assets {
+        super::wire::put_string(out, asset.url.as_str());
+        out.push(asset_kind_to_u8(asset.kind));
+        out.push(asset_source_to_u8(asset.source));
+    }
+}
+
+fn read_document_scan(r: &mut super::wire::Reader<'_>) -> Option<DocumentScan> {
+    let len = r.u32()? as usize;
+    let wrapped = decode_output_binary(r.take_exact(len)?)?;
+    let asset_len = r.u32()? as usize;
+    let mut assets = Vec::with_capacity(asset_len);
+    for _ in 0..asset_len {
+        assets.push(AssetRef {
+            url: Url::parse(&r.string()?).ok()?,
+            kind: asset_kind_from_u8(r.u8()?)?,
+            source: asset_source_from_u8(r.u8()?)?,
+        });
+    }
+    Some(DocumentScan {
+        findings: FindingsBuilder {
+            evidence: wrapped.evidence,
+        },
+        assets,
+        revision: wrapped.revision,
+        framework_config: wrapped.framework,
+    })
+}
+
+fn asset_kind_to_u8(kind: AssetKind) -> u8 {
+    match kind {
+        AssetKind::Script => 0,
+        AssetKind::Manifest => 1,
+        AssetKind::Payload => 2,
+    }
+}
+
+fn asset_kind_from_u8(value: u8) -> Option<AssetKind> {
+    match value {
+        0 => Some(AssetKind::Script),
+        1 => Some(AssetKind::Manifest),
+        2 => Some(AssetKind::Payload),
+        _ => None,
+    }
+}
+
+fn asset_source_to_u8(source: AssetSource) -> u8 {
+    match source {
+        AssetSource::HtmlScript => 0,
+        AssetSource::HtmlPreload => 1,
+        AssetSource::Literal => 2,
+        AssetSource::DynamicImport => 3,
+        AssetSource::NewUrl => 4,
+        AssetSource::NextManifest => 5,
+        AssetSource::FrameworkManifest => 6,
+    }
+}
+
+fn asset_source_from_u8(value: u8) -> Option<AssetSource> {
+    match value {
+        0 => Some(AssetSource::HtmlScript),
+        1 => Some(AssetSource::HtmlPreload),
+        2 => Some(AssetSource::Literal),
+        3 => Some(AssetSource::DynamicImport),
+        4 => Some(AssetSource::NewUrl),
+        5 => Some(AssetSource::NextManifest),
+        6 => Some(AssetSource::FrameworkManifest),
+        _ => None,
+    }
+}
+
 pub fn read_asset_cached(url: &Url, cache_key: Option<&str>) -> Option<CachedAsset> {
     let path = asset_path_for(url, cache_key);
     let (bytes, age_secs) = read_fresh(&path, CACHE_STALE_SECS)?;
-    let envelope: AssetEnvelope = serde_json::from_slice(&bytes).ok()?;
+    let envelope = decode_asset_envelope(&bytes)?;
     Some(CachedAsset {
         data: envelope.data,
         age_secs,
@@ -351,12 +532,12 @@ pub fn write_asset_with_validators(
     validators: &AssetValidators,
 ) {
     let path = asset_path_for(url, cache_key);
-    write_json(
+    write_bytes(
         &path,
-        &AssetEnvelope {
+        &encode_asset_envelope(&AssetEnvelope {
             data: asset.clone(),
             validators: validators.clone(),
-        },
+        }),
     );
 }
 
@@ -369,41 +550,44 @@ pub fn write_asset_with_validators_deferred(
     let path = asset_path_for(url, cache_key);
     let validators = validators.clone();
     spawn_cache_write(move || {
-        write_json(
+        write_bytes(
             &path,
-            &AssetEnvelope {
+            &encode_asset_envelope(&AssetEnvelope {
                 data: (*asset).clone(),
                 validators,
-            },
+            }),
         );
     });
 }
 
 fn read_chunk_findings(content_hash: &str) -> Option<FindingsBuilder> {
     let bytes = fs::read(chunk_content_path_for(content_hash)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    decode_findings(&bytes)
 }
 
 fn write_chunk(url: &Url, content_hash: &str, asset: &AssetData, validators: &AssetValidators) {
-    write_json(&chunk_content_path_for(content_hash), &asset.findings);
-    write_json(
+    write_bytes(
+        &chunk_content_path_for(content_hash),
+        &encode_findings(&asset.findings),
+    );
+    write_bytes(
         &chunk_index_path_for(url),
-        &ChunkIndex {
+        &encode_chunk_index(&ChunkIndex {
             validators: validators.clone(),
             content_hash: content_hash.to_owned(),
             data: asset.clone(),
-        },
+        }),
     );
     prune_chunk_cache(CHUNK_CACHE_MAX_BYTES);
 }
 
 fn asset_path_for(url: &Url, cache_key: Option<&str>) -> PathBuf {
-    scanner_hashed_path("assets", url, cache_key, "json")
+    scanner_hashed_path("assets", url, cache_key, "bin")
 }
 
 fn read_chunk_url(url: &Url, max_age_secs: u64) -> Option<CachedChunk> {
     let (bytes, age_secs) = read_fresh(&chunk_index_path_for(url), max_age_secs)?;
-    let index: ChunkIndex = serde_json::from_slice(&bytes).ok()?;
+    let index = decode_chunk_index(&bytes)?;
     Some(CachedChunk {
         data: Arc::new(index.data),
         age_secs,
@@ -419,7 +603,7 @@ fn spawn_cache_write(write: impl FnOnce() + Send + 'static) {
 fn chunk_index_path_for(url: &Url) -> PathBuf {
     let hash = hash_parts([SCANNER_CACHE_VERSION, url.as_str()].into_iter());
     let hex = format!("{hash:016x}");
-    prefixed_path("chunks/url-index", &hex, "json")
+    prefixed_path("chunks/url-index", &hex, "bin")
 }
 
 fn chunk_content_path_for(content_hash: &str) -> PathBuf {
@@ -567,12 +751,6 @@ fn decode_completion_candidates(bytes: &[u8]) -> Option<Vec<String>> {
     let candidates = r.string_vec()?;
     r.finish()?;
     Some(candidates)
-}
-
-fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) {
-    if let Ok(bytes) = serde_json::to_vec(value) {
-        write_bytes(path, &bytes);
-    }
 }
 
 fn write_bytes(path: &Path, bytes: &[u8]) {

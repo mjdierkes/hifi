@@ -13,7 +13,6 @@ use crate::scan::{Extractor, FindingsBuilder};
 use crate::source::{self, TemplateMode};
 use crate::url::Url;
 use aho_corasick::{AhoCorasick, MatchKind};
-use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 const ASSET_LITERALS: &[&str] = &[
@@ -70,7 +69,7 @@ static ASSET_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
         .expect("valid asset literals")
 });
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DocumentKind {
     Html,
     Script,
@@ -78,7 +77,7 @@ pub enum DocumentKind {
     Payload,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetKind {
     Script,
     Manifest,
@@ -95,7 +94,7 @@ impl AssetKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetSource {
     HtmlScript,
     HtmlPreload,
@@ -106,7 +105,7 @@ pub enum AssetSource {
     FrameworkManifest,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct AssetRef {
     pub url: Url,
     pub kind: AssetKind,
@@ -119,13 +118,11 @@ impl AssetRef {
     }
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default)]
 pub struct DocumentScan {
     pub findings: FindingsBuilder,
     pub assets: Vec<AssetRef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
-    #[serde(default, skip_serializing_if = "FrameworkConfig::is_none")]
     pub framework_config: FrameworkConfig,
 }
 

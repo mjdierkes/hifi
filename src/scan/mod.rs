@@ -12,7 +12,6 @@
 use crate::hash::FxHashMap;
 use crate::source;
 use patterns::{PatternKind, DOCUMENT_AC, DOCUMENT_PATTERNS};
-use serde::{Deserialize, Serialize};
 
 pub mod classify;
 mod extract;
@@ -27,16 +26,14 @@ pub type ApiMap = FxHashMap<String, Shape>;
 pub type CandidateMap = FxHashMap<String, ()>;
 pub type RouteMap = FxHashMap<String, ()>;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum EvidenceKind {
     Api,
     Route,
     Candidate,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Extractor {
     Literal,
     Manifest,
@@ -51,8 +48,7 @@ pub enum Extractor {
     ApiClient,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Confidence {
     Observed,
     Parsed,
@@ -76,19 +72,17 @@ impl Extractor {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Evidence {
     pub url: String,
     pub kind: EvidenceKind,
     pub extractor: Extractor,
     pub confidence: Confidence,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shape: Option<Shape>,
 }
 
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone)]
 pub struct FindingsBuilder {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
 }
 
@@ -177,9 +171,8 @@ impl FindingsBuilder {
     }
 }
 
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone)]
 pub struct ScanResult {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
 }
 

@@ -1,9 +1,9 @@
 //! Minimal streaming JSON scanner.
 //!
-//! Produced for vertical integration: replaces `serde_json::Value` walking in
-//! framework manifest parsing. The caller pulls events; we never materialise
-//! a tree. Strings are returned as `&str` borrowed straight from the input
-//! when they contain no escapes (the common case for routes and URLs).
+//! Produced for vertical integration: framework manifest parsing pulls events
+//! without materialising a tree. Strings are returned as `&str` borrowed
+//! straight from the input when they contain no escapes (the common case for
+//! routes and URLs).
 //! Escaped strings are decoded only when encountered, keeping the common
 //! unescaped route/URL path allocation-free at the call site.
 //!

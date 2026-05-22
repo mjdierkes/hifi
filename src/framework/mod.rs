@@ -3,7 +3,6 @@ use crate::scan::next::NextConfig;
 use crate::scan::{Extractor, FindingsBuilder, Shape};
 use crate::source;
 use crate::url::Url;
-use serde::{Deserialize, Serialize};
 
 pub mod astro;
 pub mod next;
@@ -42,8 +41,7 @@ pub struct AssetContext {
     pub remix: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "config")]
+#[derive(Clone, Debug, Default)]
 pub enum FrameworkConfig {
     #[default]
     None,

@@ -7,13 +7,12 @@
 //! literal that can be sliced out by bracket-walking and coerced to JSON.
 
 use crate::source;
-use serde::{Deserialize, Serialize};
 
 /// Runtime configuration leaked into the page by Next.js. Each field maps to a
 /// `__NEXT_DATA__` property and is `None` / empty when the page didn't expose
 /// it. Discovery uses these to resolve asset URLs against the right origin and
 /// to normalize routes back to their user-facing form.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 pub struct NextConfig {
     pub build_id: Option<String>,
     pub asset_prefix: Option<String>,
@@ -202,11 +201,7 @@ fn strip_intercepting_marker(segment: &str) -> &str {
 /// returned object literal and coercing it to JSON. The file is shaped like
 /// `self.__BUILD_MANIFEST = function(...){return {"/page": [...], ...}}(...);`.
 pub fn parse_build_manifest_js(bytes: &[u8]) -> Vec<String> {
-    // Modern Next wraps the object in `function(...){return {...}}(...)`;
-    // older or hand-rolled forms write `self.__BUILD_MANIFEST = {...}` inline.
-    // Try the `return` anchor first, then fall back to the first `{` after the
-    // build-manifest identifier.
-    let i = locate_build_manifest_object(bytes).or_else(|| locate_build_manifest_inline(bytes));
+    let i = locate_build_manifest_object(bytes);
     let Some(i) = i else {
         return Vec::new();
     };
@@ -296,17 +291,6 @@ fn extract_top_level_route_keys(literal: &[u8]) -> Vec<String> {
 fn locate_build_manifest_object(bytes: &[u8]) -> Option<usize> {
     let return_pos = memchr::memmem::find(bytes, b"return")?;
     let i = source::skip_ws(bytes, return_pos + b"return".len());
-    (bytes.get(i) == Some(&b'{')).then_some(i)
-}
-
-fn locate_build_manifest_inline(bytes: &[u8]) -> Option<usize> {
-    let ident_pos = memchr::memmem::find(bytes, b"__BUILD_MANIFEST")?;
-    let mut i = ident_pos + b"__BUILD_MANIFEST".len();
-    i = source::skip_ws(bytes, i);
-    while i < bytes.len() && bytes[i] == b'=' {
-        i += 1;
-        i = source::skip_ws(bytes, i);
-    }
     (bytes.get(i) == Some(&b'{')).then_some(i)
 }
 

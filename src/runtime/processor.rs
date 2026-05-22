@@ -14,49 +14,82 @@ use super::{cache, config::RuntimeConfig, fetch, http::Client, net};
 use crate::url::Url;
 use lru::LruCache;
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
-use std::{num::NonZeroUsize, sync::Arc, time::Instant};
+use std::{fmt::Write, num::NonZeroUsize, sync::Arc, time::Instant};
 use thiserror::Error;
 
 const MEMORY_CACHE_MAX_ENTRIES: usize = 256;
 
 type Result<T, E = RuntimeError> = std::result::Result<T, E>;
-pub type Body = Arc<str>;
-pub type MemoryCache = Arc<RwLock<LruCache<String, (Body, Instant)>>>;
+pub type MemoryBody = Arc<Output>;
+pub type MemoryCache = Arc<RwLock<LruCache<String, (MemoryBody, Instant)>>>;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error(transparent)]
     Net(#[from] net::NetError),
     #[error(transparent)]
-    Json(#[from] serde_json::Error),
-    #[error(transparent)]
     Url(#[from] crate::url::ParseError),
     #[error(transparent)]
     Join(#[from] tokio::task::JoinError),
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Output {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
-    #[serde(default, skip_serializing_if = "FrameworkConfig::is_none")]
     pub framework: FrameworkConfig,
-    #[serde(default, skip_serializing_if = "CacheStatus::is_stored")]
     pub cache: CacheStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_age_secs: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_us: Option<u128>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
 
 impl Output {
-    pub fn to_json_string(&self) -> Result<String> {
-        Ok(serde_json::to_string(self)?)
+    pub fn to_json_string(&self) -> String {
+        let mut out = String::new();
+        self.write_json(&mut out);
+        out
+    }
+
+    pub fn write_json(&self, out: &mut String) {
+        out.push('{');
+        let mut comma = false;
+        if !self.evidence.is_empty() {
+            push_field_name(out, &mut comma, "evidence");
+            out.push('[');
+            for (i, evidence) in self.evidence.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_evidence_json(out, evidence);
+            }
+            out.push(']');
+        }
+        if let Some(revision) = self.revision.as_deref() {
+            push_field_name(out, &mut comma, "revision");
+            push_json_string(out, revision);
+        }
+        if !self.framework.is_none() {
+            push_field_name(out, &mut comma, "framework");
+            write_framework_json(out, &self.framework);
+        }
+        if !self.cache.is_stored() {
+            push_field_name(out, &mut comma, "cache");
+            push_json_string(out, self.cache.as_str());
+        }
+        if let Some(age) = self.cache_age_secs {
+            push_field_name(out, &mut comma, "cache_age_secs");
+            let _ = write!(out, "{age}");
+        }
+        if let Some(elapsed) = self.elapsed_us {
+            push_field_name(out, &mut comma, "elapsed_us");
+            let _ = write!(out, "{elapsed}");
+        }
+        if !self.warnings.is_empty() {
+            push_field_name(out, &mut comma, "warnings");
+            write_string_array_json(out, &self.warnings);
+        }
+        out.push('}');
     }
 
     pub(crate) fn mark(
@@ -72,24 +105,154 @@ impl Output {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CacheStatus {
     #[default]
-    #[serde(rename = "stored")]
     Stored,
-    #[serde(rename = "fresh")]
     Fresh,
-    #[serde(rename = "stale")]
-    Stale,
-    #[serde(rename = "hit")]
     RevisionHit,
-    #[serde(rename = "miss")]
     Miss,
 }
 
 impl CacheStatus {
     fn is_stored(&self) -> bool {
         *self == Self::Stored
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stored => "stored",
+            Self::Fresh => "fresh",
+            Self::RevisionHit => "hit",
+            Self::Miss => "miss",
+        }
+    }
+}
+
+fn push_field_name(out: &mut String, comma: &mut bool, name: &str) {
+    if *comma {
+        out.push(',');
+    }
+    *comma = true;
+    push_json_string(out, name);
+    out.push(':');
+}
+
+fn push_json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            ch if ch <= '\u{1f}' => {
+                let _ = write!(out, "\\u{:04x}", ch as u32);
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+}
+
+fn write_string_array_json(out: &mut String, values: &[String]) {
+    out.push('[');
+    for (i, value) in values.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_json_string(out, value);
+    }
+    out.push(']');
+}
+
+fn write_evidence_json(out: &mut String, evidence: &Evidence) {
+    out.push('{');
+    push_json_string(out, "url");
+    out.push(':');
+    push_json_string(out, &evidence.url);
+    out.push(',');
+    push_json_string(out, "kind");
+    out.push(':');
+    push_json_string(out, evidence_kind_name(evidence.kind));
+    out.push(',');
+    push_json_string(out, "extractor");
+    out.push(':');
+    push_json_string(out, extractor_name(evidence.extractor));
+    out.push(',');
+    push_json_string(out, "confidence");
+    out.push(':');
+    push_json_string(out, confidence_name(evidence.confidence));
+    if let Some(shape) = &evidence.shape {
+        out.push(',');
+        push_json_string(out, "shape");
+        out.push(':');
+        write_shape_json(out, shape);
+    }
+    out.push('}');
+}
+
+fn write_shape_json(out: &mut String, shape: &Shape) {
+    let (methods, has_body, has_headers, content_types, auth, next_server_action, query_params) =
+        shape.binary_parts();
+    out.push('{');
+    let _ = write!(
+        out,
+        "\"methods\":{methods},\"has_body\":{has_body},\"has_headers\":{has_headers},\"content_types\":{content_types},\"auth\":{auth}"
+    );
+    if next_server_action {
+        out.push_str(",\"next_server_action\":true");
+    }
+    if !query_params.is_empty() {
+        out.push_str(",\"query_params\":");
+        write_string_array_json(out, query_params);
+    }
+    out.push('}');
+}
+
+fn write_framework_json(out: &mut String, framework: &FrameworkConfig) {
+    match framework {
+        FrameworkConfig::None => out.push_str("null"),
+        FrameworkConfig::Nuxt => out.push_str("{\"kind\":\"nuxt\"}"),
+        FrameworkConfig::SvelteKit => out.push_str("{\"kind\":\"svelte_kit\"}"),
+        FrameworkConfig::Astro => out.push_str("{\"kind\":\"astro\"}"),
+        FrameworkConfig::Remix => out.push_str("{\"kind\":\"remix\"}"),
+        FrameworkConfig::Next(config) => {
+            out.push_str("{\"kind\":\"next\",\"config\":{");
+            let mut comma = false;
+            if let Some(value) = config.build_id.as_deref() {
+                push_field_name(out, &mut comma, "build_id");
+                push_json_string(out, value);
+            }
+            if let Some(value) = config.asset_prefix.as_deref() {
+                push_field_name(out, &mut comma, "asset_prefix");
+                push_json_string(out, value);
+            }
+            if let Some(value) = config.base_path.as_deref() {
+                push_field_name(out, &mut comma, "base_path");
+                push_json_string(out, value);
+            }
+            if !config.locales.is_empty() {
+                push_field_name(out, &mut comma, "locales");
+                write_string_array_json(out, &config.locales);
+            }
+            if let Some(value) = config.default_locale.as_deref() {
+                push_field_name(out, &mut comma, "default_locale");
+                push_json_string(out, value);
+            }
+            if let Some(value) = config.locale.as_deref() {
+                push_field_name(out, &mut comma, "locale");
+                push_json_string(out, value);
+            }
+            if let Some(value) = config.page.as_deref() {
+                push_field_name(out, &mut comma, "page");
+                push_json_string(out, value);
+            }
+            out.push_str("}}");
+        }
     }
 }
 
@@ -320,7 +483,7 @@ fn warnings_from_assets(asset_stats: &fetch::AssetScanStats) -> Vec<String> {
     warnings
 }
 
-pub fn read_memory(memory: &MemoryCache, url: &str) -> Option<(Body, u64)> {
+pub fn read_memory(memory: &MemoryCache, url: &str) -> Option<(MemoryBody, u64)> {
     memory
         .write()
         .get(url)
@@ -328,7 +491,7 @@ pub fn read_memory(memory: &MemoryCache, url: &str) -> Option<(Body, u64)> {
         .map(|(body, t)| (body, t.elapsed().as_secs()))
 }
 
-pub fn write_memory(memory: &MemoryCache, url: String, body: Body) {
+pub fn write_memory(memory: &MemoryCache, url: String, body: MemoryBody) {
     let mut entries = memory.write();
     let now = Instant::now();
     entries.put(url, (body, now));
@@ -336,13 +499,12 @@ pub fn write_memory(memory: &MemoryCache, url: String, body: Body) {
 }
 
 pub fn mark_cached_body(
-    body: &str,
+    body: &Output,
     t0: Instant,
     status: CacheStatus,
     age_secs: u64,
-) -> Result<Body> {
-    let output = serde_json::from_str::<Output>(body)?.mark(Some(t0), status, Some(age_secs));
-    Ok(Arc::from(output.to_json_string()?))
+) -> MemoryBody {
+    Arc::new(body.clone().mark(Some(t0), status, Some(age_secs)))
 }
 
 fn write_caches(
@@ -360,15 +522,14 @@ fn write_caches(
         }
     }
     if let Some(memory) = memory {
-        let body = Arc::from(cached.to_json_string()?);
-        write_memory(&memory, url.to_string(), body);
+        write_memory(&memory, url.to_string(), Arc::new(cached));
     }
     Ok(())
 }
 
 const OUTPUT_BINARY_MAGIC: &[u8; 8] = b"HIFIOU1\0";
 
-fn encode_output_binary(out: &Output) -> Vec<u8> {
+pub(crate) fn encode_output_binary(out: &Output) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(out.evidence.len().saturating_mul(48) + 128);
     bytes.extend_from_slice(OUTPUT_BINARY_MAGIC);
     put_opt_string(&mut bytes, out.revision.as_deref());
@@ -394,7 +555,7 @@ fn encode_output_binary(out: &Output) -> Vec<u8> {
     bytes
 }
 
-fn decode_output_binary(bytes: &[u8]) -> Option<Output> {
+pub(crate) fn decode_output_binary(bytes: &[u8]) -> Option<Output> {
     let mut reader = BinaryReader::new(bytes);
     reader
         .take_exact(OUTPUT_BINARY_MAGIC.len())
@@ -529,6 +690,14 @@ fn evidence_kind_to_u8(kind: EvidenceKind) -> u8 {
     }
 }
 
+fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
+    match kind {
+        EvidenceKind::Api => "api",
+        EvidenceKind::Route => "route",
+        EvidenceKind::Candidate => "candidate",
+    }
+}
+
 fn evidence_kind_from_u8(value: u8) -> Option<EvidenceKind> {
     match value {
         0 => Some(EvidenceKind::Api),
@@ -551,6 +720,22 @@ fn extractor_to_u8(extractor: Extractor) -> u8 {
         Extractor::RemixManifest => 8,
         Extractor::AstroIsland => 9,
         Extractor::ApiClient => 10,
+    }
+}
+
+fn extractor_name(extractor: Extractor) -> &'static str {
+    match extractor {
+        Extractor::Literal => "literal",
+        Extractor::Manifest => "manifest",
+        Extractor::Flight => "flight",
+        Extractor::ApiCall => "api_call",
+        Extractor::RouteCall => "route_call",
+        Extractor::ServerAction => "server_action",
+        Extractor::NuxtPayload => "nuxt_payload",
+        Extractor::SvelteKitData => "svelte_kit_data",
+        Extractor::RemixManifest => "remix_manifest",
+        Extractor::AstroIsland => "astro_island",
+        Extractor::ApiClient => "api_client",
     }
 }
 
@@ -577,6 +762,15 @@ fn confidence_to_u8(confidence: Confidence) -> u8 {
         Confidence::Parsed => 1,
         Confidence::Inferred => 2,
         Confidence::Candidate => 3,
+    }
+}
+
+fn confidence_name(confidence: Confidence) -> &'static str {
+    match confidence {
+        Confidence::Observed => "observed",
+        Confidence::Parsed => "parsed",
+        Confidence::Inferred => "inferred",
+        Confidence::Candidate => "candidate",
     }
 }
 
@@ -634,7 +828,7 @@ fn normalize_completion_path(raw: &str) -> String {
     trimmed.replace("{dynamic}", ":id")
 }
 
-fn prune_memory(entries: &mut LruCache<String, (Body, Instant)>, now: Instant) {
+fn prune_memory(entries: &mut LruCache<String, (MemoryBody, Instant)>, now: Instant) {
     let stale = entries
         .iter()
         .filter(|(_, (_, written))| {
@@ -663,7 +857,7 @@ mod tests {
             if req.starts_with("GET /_next/static/b1/_buildManifest.js ") {
                 (
                     "200 OK",
-                    r#"self.__BUILD_MANIFEST={"/extra":["static/chunks/app-extra.js"]};const u="/api/from-manifest";"#,
+                    r#"self.__BUILD_MANIFEST=function(){return{"/extra":["static/chunks/app-extra.js"]}}();const u="/api/from-manifest";"#,
                 )
             } else if req.starts_with("GET /_next/static/chunks/app-extra.js ") {
                 ("200 OK", r#"fetch("/api/from-chunk",{method:"POST"})"#)
@@ -766,11 +960,9 @@ mod tests {
         let cache_store = cache::ScanCache::at_path(path.clone());
         write_caches(&cache_store, &out, url, Some(memory.clone())).unwrap();
         let (body, age) = read_memory(&memory, url).unwrap();
-        let stored = serde_json::from_str::<Output>(&body).unwrap();
-        assert_eq!(stored.cache, CacheStatus::Stored);
+        assert_eq!(body.cache, CacheStatus::Stored);
 
-        let marked = mark_cached_body(&body, Instant::now(), CacheStatus::Fresh, age).unwrap();
-        let marked = serde_json::from_str::<Output>(&marked).unwrap();
+        let marked = mark_cached_body(&body, Instant::now(), CacheStatus::Fresh, age);
         assert_eq!(marked.cache, CacheStatus::Fresh);
         assert_eq!(marked.cache_age_secs, Some(age));
         let _ = std::fs::remove_file(&path);

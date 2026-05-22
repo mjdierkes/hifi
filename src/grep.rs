@@ -374,8 +374,8 @@ mod tests {
 
     #[test]
     fn grep_bytes_centers_snippet_on_match_in_long_line() {
-        // Minified-style: one long line, match in the middle. Old behavior
-        // returned the file prefix; new behavior centers the window on the match.
+        // Minified-style: one long line, match in the middle. The snippet
+        // should center the window on the match.
         let body = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAtargetBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let options = GrepOptions {
             context: 2,

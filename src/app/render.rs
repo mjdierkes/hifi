@@ -12,21 +12,6 @@ pub struct RenderOptions {
     pub filter: Option<String>,
 }
 
-pub fn render_json_mode(json: &str, mode: OutputMode, opts: &RenderOptions) -> String {
-    match mode {
-        OutputMode::Json => {
-            let mut out = String::with_capacity(json.len() + 1);
-            out.push_str(json);
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out
-        }
-        OutputMode::Flat => render_flat(json),
-        OutputMode::Auto => render_grouped(json, opts),
-    }
-}
-
 pub fn render_processed(
     out: &Output,
     mode: OutputMode,
@@ -36,7 +21,7 @@ pub fn render_processed(
     let mut stdout = io::BufWriter::new(stdout.lock());
     match mode {
         OutputMode::Json => {
-            serde_json::to_writer(&mut stdout, &out)?;
+            stdout.write_all(out.to_json_string().as_bytes())?;
             stdout.write_all(b"\n")?;
         }
         OutputMode::Flat => render_flat_output(out, &mut stdout)?,
@@ -50,11 +35,37 @@ pub fn render_daemon_reply(
     mode: OutputMode,
     opts: &RenderOptions,
 ) {
-    if reply.exit_code == 0 {
-        reply
-            .stderr
-            .push_str(&warning_text_from_json(&reply.stdout));
-        reply.stdout = render_json_mode(&reply.stdout, mode, opts);
+    if reply.exit_code != 0 {
+        return;
+    }
+    let Some(mut output) = reply.output.take() else {
+        if !reply.stdout.ends_with('\n') {
+            reply.stdout.push('\n');
+        }
+        return;
+    };
+    if output.cache == CacheStatus::Stored {
+        output.cache = CacheStatus::Fresh;
+    }
+    reply.stderr.push_str(&warning_text(&output));
+    let mut rendered = Vec::new();
+    let ok = match mode {
+        OutputMode::Json => {
+            reply.stdout = output.to_json_string();
+            if !reply.stdout.ends_with('\n') {
+                reply.stdout.push('\n');
+            }
+            true
+        }
+        OutputMode::Flat => render_flat_output(&output, &mut rendered).is_ok(),
+        OutputMode::Auto => render_grouped_output(&output, &mut rendered, opts).is_ok(),
+    };
+    if ok && mode != OutputMode::Json {
+        reply.stdout = String::from_utf8(rendered).unwrap_or_else(|_| {
+            let mut json = output.to_json_string();
+            json.push('\n');
+            json
+        });
     }
 }
 
@@ -67,12 +78,6 @@ pub fn warning_text(out: &Output) -> String {
 
 pub fn render_warnings(out: &Output) {
     eprint!("{}", warning_text(out));
-}
-
-fn warning_text_from_json(json: &str) -> String {
-    serde_json::from_str::<Output>(json)
-        .map(|out| warning_text(&out))
-        .unwrap_or_default()
 }
 
 fn render_flat_output<W: Write>(v: &Output, out: &mut W) -> io::Result<()> {
@@ -246,7 +251,6 @@ fn path_matches(path: &str, filter: &str) -> bool {
 fn cache_label(status: CacheStatus) -> &'static str {
     match status {
         CacheStatus::Fresh => "cache fresh",
-        CacheStatus::Stale => "cache stale",
         CacheStatus::RevisionHit => "cache hit",
         CacheStatus::Miss => "fresh scan",
         CacheStatus::Stored => "stored",
@@ -375,8 +379,7 @@ fn render_resource_summary<W: Write>(out: &mut W, paths: &[String]) -> io::Resul
             let group = groups.entry(segs[0].clone()).or_default();
             group.count += 1;
             // Use the first non-param segment after the resource as the action
-            // name. Fall back to ":id" so the row isn't empty when the only
-            // children are detail endpoints (e.g. /images/:id).
+            // name. Detail-only children use ":id" (e.g. /images/:id).
             let action = segs[1..]
                 .iter()
                 .find(|s| !is_param(s))
@@ -479,28 +482,6 @@ fn truncate_csv(items: &[&str], budget: usize) -> String {
         out.push_str(item);
     }
     out
-}
-
-fn render_flat(json: &str) -> String {
-    let Ok(v) = serde_json::from_str::<Output>(json) else {
-        return format!("{json}\n");
-    };
-    let mut out = Vec::new();
-    if render_flat_output(&v, &mut out).is_err() {
-        return format!("{json}\n");
-    }
-    String::from_utf8(out).unwrap_or_else(|_| format!("{json}\n"))
-}
-
-fn render_grouped(json: &str, opts: &RenderOptions) -> String {
-    let Ok(v) = serde_json::from_str::<Output>(json) else {
-        return format!("{json}\n");
-    };
-    let mut out = Vec::new();
-    if render_grouped_output(&v, &mut out, opts).is_err() {
-        return format!("{json}\n");
-    }
-    String::from_utf8(out).unwrap_or_else(|_| format!("{json}\n"))
 }
 
 pub fn escape_terminal(s: &str) -> String {
@@ -622,12 +603,15 @@ Routes
             kind: EvidenceKind::Api,
             extractor: Extractor::ApiCall,
             confidence: Confidence::Observed,
-            shape: Some(
-                serde_json::from_str(&format!(
-                    r#"{{"methods":{methods},"has_body":{has_body},"has_headers":false,"content_types":0,"auth":false,"query_params":[],"next_server_action":{next_action}}}"#
-                ))
-                .unwrap(),
-            ),
+            shape: Some(Shape::from_binary_parts(
+                methods,
+                has_body,
+                false,
+                0,
+                false,
+                next_action,
+                Vec::new(),
+            )),
         }
     }
 }
