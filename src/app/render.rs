@@ -1,5 +1,5 @@
 use super::{AppError, OutputMode};
-use crate::runtime::processor::Output;
+use crate::runtime::engine::Output;
 use std::fmt::Write as _;
 use std::io::{self, Write};
 
@@ -122,7 +122,7 @@ fn is_visual_spoofing_char(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::processor::{Api, CacheStatus, Output};
+    use crate::runtime::engine::{Api, CacheStatus, Output};
     use crate::scan::Shape;
 
     #[test]

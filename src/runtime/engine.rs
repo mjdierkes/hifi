@@ -1,9 +1,4 @@
-//! Scan lifecycle orchestration.
-//!
-//! `Processor` is the runtime boundary between network/cache concerns and pure
-//! scanning. The public flow is intentionally staged: plan the request, check
-//! processed cache, load the root page, scan the root document, recursively scan
-//! assets, then build display output.
+//! Vertical scan engine: URL bytes in, internal API surface out.
 
 use crate::discover::{self, DocumentKind};
 use crate::scan::{Evidence, EvidenceKind, Shape};
@@ -15,6 +10,7 @@ use std::{sync::Arc, time::Instant};
 use thiserror::Error;
 
 type Result<T, E = RuntimeError> = std::result::Result<T, E>;
+pub use fetch::MAX_TOTAL_ASSETS;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -65,149 +61,70 @@ pub enum CacheStatus {
     Miss,
 }
 
-pub struct Processor<'a> {
-    client: &'a Client,
+pub async fn scan_site(
+    client: &Client,
+    url: &str,
     concurrency: usize,
     allow_private: bool,
-}
+    no_cache: bool,
+    t0: Instant,
+) -> Result<Output> {
+    let base = Url::parse(url)?;
+    let cache_store = cache::ScanCache::for_base(&base);
+    let use_cache = !no_cache;
 
-struct RequestPlan {
-    original_base: Url,
-    cache: cache::ScanCache,
-}
+    if use_cache {
+        if let Some((body, age)) = cache_store.read_fresh_binary() {
+            if let Some(output) = decode_output_binary(&body) {
+                return Ok(output.mark(Some(t0), CacheStatus::Fresh, Some(age)));
+            }
+        }
+    }
 
-struct LoadedPage {
-    html: bytes::Bytes,
-    final_base: Url,
-}
+    let response = net::get_limited(client, base, allow_private).await?;
+    let final_base = response.url().clone();
+    let html = net::read_limited(response).await?;
+    let root_scan = scan_root_document(html, final_base).await?;
+    let mut found = root_scan.findings;
+    let mut initial_assets = root_scan.assets;
+    let revision = root_scan.revision.clone();
 
-// A scan may reuse a processed result either before network I/O (`fresh`/`stale`)
-// or after reading the root page when the page revision matches (`hit`).
-struct ScanOutcome {
-    output: Output,
-    used_revision_cache: bool,
-}
+    if let (true, Some(revision)) = (use_cache, revision.as_deref()) {
+        if let Some(bytes) = cache_store.read_stale_binary() {
+            if let Some(output) = decode_output_binary(&bytes) {
+                if output.revision.as_deref() == Some(revision) {
+                    return Ok(output.mark(Some(t0), CacheStatus::RevisionHit, None));
+                }
+            }
+        }
+    }
 
-impl<'a> Processor<'a> {
-    pub fn new(client: &'a Client, concurrency: usize, allow_private: bool) -> Self {
-        Self {
-            client,
+    let asset_stats = fetch::scan_assets(
+        fetch::ScanEnv {
+            client: client.clone(),
             concurrency,
+            use_cache,
+            cache_key: revision.clone(),
             allow_private,
-        }
+            framework_config: root_scan.framework_config,
+        },
+        initial_assets.drain(..),
+        &mut found,
+    )
+    .await;
+    let found = found.finish();
+    let output = Output {
+        apis: collect_apis(&found.evidence),
+        revision,
+        cache: CacheStatus::Miss,
+        cache_age_secs: None,
+        elapsed_us: Some(t0.elapsed().as_micros()),
+        warnings: warnings_from_assets(&asset_stats),
+    };
+    if use_cache {
+        write_caches(&cache_store, &output);
     }
-
-    pub async fn process_for_display(
-        &self,
-        url: &str,
-        no_cache: bool,
-        t0: Instant,
-    ) -> Result<Output> {
-        let plan = RequestPlan::new(url)?;
-        let outcome = self
-            .scan_request(&plan, !no_cache, Some(t0), self.allow_private)
-            .await?;
-        if !no_cache && !outcome.used_revision_cache {
-            write_caches(&plan.cache, &outcome.output)?;
-        }
-        Ok(outcome.output)
-    }
-
-    // This is the canonical scan pipeline. Keep cache lookup, page loading,
-    // asset recursion, and output construction as separate steps so each policy
-    // can be reasoned about independently.
-    async fn scan_request(
-        &self,
-        plan: &RequestPlan,
-        use_cache: bool,
-        t0: Option<Instant>,
-        allow_private: bool,
-    ) -> Result<ScanOutcome> {
-        if use_cache {
-            if let Some((body, age)) = plan.cache.read_fresh_binary() {
-                if let Some(output) = decode_output_binary(&body) {
-                    return Ok(ScanOutcome {
-                        output: output.mark(t0, CacheStatus::Fresh, Some(age)),
-                        used_revision_cache: true,
-                    });
-                }
-            }
-        }
-
-        let page = self.load_page(plan, use_cache, allow_private).await?;
-        let root_scan = scan_root_document(page.html, page.final_base).await?;
-        let mut found = root_scan.findings;
-        let mut initial_assets = root_scan.assets;
-        let revision = root_scan.revision.clone();
-
-        // Revision hits happen after the page is read. The root HTML may be
-        // new enough to validate the asset graph, so we can reuse processed
-        // output without rescanning every static asset.
-        if let (true, Some(revision), Some(t0)) = (use_cache, revision.as_deref(), t0) {
-            if let Some(bytes) = plan.cache.read_stale_binary() {
-                if let Some(output) = decode_output_binary(&bytes) {
-                    if output.revision.as_deref() == Some(revision) {
-                        return Ok(ScanOutcome {
-                            output: output.mark(Some(t0), CacheStatus::RevisionHit, None),
-                            used_revision_cache: true,
-                        });
-                    }
-                }
-            }
-        }
-
-        let asset_stats = fetch::scan_assets(
-            self.client.clone(),
-            initial_assets.drain(..),
-            fetch::AssetScanOptions {
-                concurrency: self.concurrency,
-                use_processed_cache: use_cache,
-                cache_key: revision.clone(),
-                allow_private,
-                framework_config: root_scan.framework_config.clone(),
-            },
-            &mut found,
-        )
-        .await;
-        let found = found.finish();
-
-        Ok(ScanOutcome {
-            output: Output {
-                apis: collect_apis(&found.evidence),
-                revision,
-                cache: CacheStatus::Miss,
-                cache_age_secs: None,
-                elapsed_us: t0.map(|t| t.elapsed().as_micros()),
-                warnings: warnings_from_assets(&asset_stats),
-            },
-            used_revision_cache: false,
-        })
-    }
-
-    async fn load_page(
-        &self,
-        plan: &RequestPlan,
-        use_cache: bool,
-        allow_private: bool,
-    ) -> Result<LoadedPage> {
-        let response =
-            net::get_limited(self.client, plan.original_base.clone(), allow_private).await?;
-        let final_base = response.url().clone();
-        let html = net::read_limited(response).await?;
-        let _ = use_cache;
-        Ok(LoadedPage { html, final_base })
-    }
-}
-
-impl RequestPlan {
-    fn new(url: &str) -> Result<Self, crate::url::ParseError> {
-        let original_base = Url::parse(url)?;
-        let scan_cache = cache::ScanCache::for_base(&original_base);
-        Ok(Self {
-            original_base,
-            cache: scan_cache,
-        })
-    }
+    Ok(output)
 }
 
 async fn scan_root_document(html: bytes::Bytes, final_base: Url) -> Result<discover::DocumentScan> {
@@ -284,10 +201,9 @@ fn prettify_path(path: &str) -> String {
     path.replace("{dynamic}", ":id")
 }
 
-fn write_caches(cache_store: &cache::ScanCache, out: &Output) -> Result<()> {
+fn write_caches(cache_store: &cache::ScanCache, out: &Output) {
     let cached = out.clone().mark(None, CacheStatus::Stored, None);
     cache_store.write_binary_deferred(Arc::from(encode_output_binary(&cached)));
-    Ok(())
 }
 
 const OUTPUT_BINARY_MAGIC: &[u8; 8] = b"HIFIOU2\0";
@@ -414,10 +330,16 @@ mod tests {
         })
         .await;
         let client = Client::new();
-        let out = Processor::new(&client, 2, true)
-            .process_for_display(&format!("http://{addr}/"), true, Instant::now())
-            .await
-            .unwrap();
+        let out = scan_site(
+            &client,
+            &format!("http://{addr}/"),
+            2,
+            true,
+            true,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
 
         assert!(has_api(&out, "/api/from-chunk"));
     }
@@ -439,10 +361,16 @@ mod tests {
         })
         .await;
         let client = Client::new();
-        let out = Processor::new(&client, 2, true)
-            .process_for_display(&format!("http://{addr}/"), true, Instant::now())
-            .await
-            .unwrap();
+        let out = scan_site(
+            &client,
+            &format!("http://{addr}/"),
+            2,
+            true,
+            true,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
 
         assert!(has_api(&out, "/api/from-generic-script"));
     }
@@ -463,10 +391,16 @@ mod tests {
         })
         .await;
         let client = Client::new();
-        let out = Processor::new(&client, 2, true)
-            .process_for_display(&format!("http://{addr}/"), true, Instant::now())
-            .await
-            .unwrap();
+        let out = scan_site(
+            &client,
+            &format!("http://{addr}/"),
+            2,
+            true,
+            true,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
 
         assert!(has_api(&out, "/api/ok"));
         assert_eq!(
@@ -484,15 +418,12 @@ mod tests {
         })
         .await;
         let client = Client::new();
-        let processor = Processor::new(&client, 2, true);
         let url = format!("http://{addr}/");
 
-        let first = processor
-            .process_for_display(&url, true, Instant::now())
+        let first = scan_site(&client, &url, 2, true, true, Instant::now())
             .await
             .unwrap();
-        let second = processor
-            .process_for_display(&url, true, Instant::now())
+        let second = scan_site(&client, &url, 2, true, true, Instant::now())
             .await
             .unwrap();
 
@@ -508,15 +439,12 @@ mod tests {
         })
         .await;
         let client = Client::new();
-        let processor = Processor::new(&client, 2, true);
         let url = format!("http://{addr}/");
 
-        let first = processor
-            .process_for_display(&url, false, Instant::now())
+        let first = scan_site(&client, &url, 2, true, false, Instant::now())
             .await
             .unwrap();
-        let second = processor
-            .process_for_display(&url, false, Instant::now())
+        let second = scan_site(&client, &url, 2, true, false, Instant::now())
             .await
             .unwrap();
 

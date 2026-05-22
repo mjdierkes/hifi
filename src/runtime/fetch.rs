@@ -1,6 +1,6 @@
 //! Recursive asset fetcher.
 //!
-//! The processor gives this module initial `AssetRef`s. Fetch keeps a bounded
+//! The engine gives this module initial `AssetRef`s. Fetch keeps a bounded
 //! breadth-first queue, reads each static asset, scans it for more references,
 //! and merges findings back into the caller's `FindingsBuilder`.
 //!
@@ -38,35 +38,17 @@ fn revalidation_semaphore() -> &'static Arc<Semaphore> {
 }
 
 #[derive(Default)]
-pub struct AssetScanOptions {
-    pub concurrency: usize,
-    pub use_processed_cache: bool,
-    pub cache_key: Option<String>,
-    pub allow_private: bool,
-    /// Framework config extracted from the root HTML document. Sub-resources
-    /// can't host their own page config, so this is how payloads reconstruct
-    /// framework routes consistently.
-    pub framework_config: FrameworkConfig,
-}
-
-#[derive(Default)]
 pub struct AssetScanStats {
     pub discovered: usize,
     pub failed: usize,
     pub unauthorized: usize,
-    pub skipped_low_signal: usize,
     pub capped: bool,
-    pub failed_urls: Vec<Url>,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum FetchFailure {
+enum FetchFailure {
     Unauthorized,
     Other,
-}
-
-struct ScannedAsset {
-    asset: Arc<AssetData>,
 }
 
 enum FetchedBody {
@@ -74,10 +56,18 @@ enum FetchedBody {
     NotModified,
 }
 
+pub(super) struct ScanEnv {
+    pub client: Client,
+    pub concurrency: usize,
+    pub use_cache: bool,
+    pub cache_key: Option<String>,
+    pub allow_private: bool,
+    pub framework_config: FrameworkConfig,
+}
+
 pub async fn scan_assets(
-    client: Client,
+    env: ScanEnv,
     initial: impl IntoIterator<Item = AssetRef>,
-    opts: AssetScanOptions,
     out: &mut FindingsBuilder,
 ) -> AssetScanStats {
     let mut stats = AssetScanStats::default();
@@ -91,10 +81,10 @@ pub async fn scan_assets(
         &mut stats,
         &mut low_signal_enqueued,
     );
-    prewarm_asset_hosts(&client, &queue, opts.allow_private);
+    prewarm_asset_hosts(&env.client, &queue, env.allow_private);
 
     let mut fetched = FuturesUnordered::new();
-    let concurrency = opts.concurrency.max(1);
+    let concurrency = env.concurrency.max(1);
 
     loop {
         while fetched.len() < concurrency {
@@ -102,12 +92,12 @@ pub async fn scan_assets(
                 break;
             };
             fetched.push(fetch_scan(
-                client.clone(),
+                env.client.clone(),
                 asset,
-                opts.use_processed_cache,
-                opts.cache_key.as_deref(),
-                opts.allow_private,
-                opts.framework_config.clone(),
+                env.use_cache,
+                env.cache_key.as_deref(),
+                env.allow_private,
+                env.framework_config.clone(),
             ));
         }
 
@@ -115,22 +105,21 @@ pub async fn scan_assets(
             break;
         };
         match res {
-            Ok(result) => {
-                out.extend(result.asset.findings.clone());
+            Ok(asset) => {
+                out.extend(asset.findings.clone());
                 enqueue_assets(
-                    result.asset.assets.iter().cloned(),
+                    asset.assets.iter().cloned(),
                     &mut visited,
                     &mut queue,
                     &mut stats,
                     &mut low_signal_enqueued,
                 );
             }
-            Err((asset, reason)) => {
+            Err(reason) => {
                 stats.failed += 1;
                 if matches!(reason, FetchFailure::Unauthorized) {
                     stats.unauthorized += 1;
                 }
-                stats.failed_urls.push(asset.url);
             }
         }
     }
@@ -158,7 +147,6 @@ fn enqueue_assets(
             continue;
         } else if is_low_signal_asset(&asset) && *low_signal_enqueued >= MAX_LOW_SIGNAL_ASSETS {
             visited.insert(asset.url.clone());
-            stats.skipped_low_signal += 1;
         } else if visited.insert(asset.url.clone()) {
             if is_low_signal_asset(&asset) {
                 *low_signal_enqueued += 1;
@@ -245,13 +233,13 @@ async fn fetch_scan(
     cache_key: Option<&str>,
     allow_private: bool,
     framework_config: FrameworkConfig,
-) -> Result<ScannedAsset, (AssetRef, FetchFailure)> {
+) -> Result<Arc<AssetData>, FetchFailure> {
     let mut cached = None;
     if use_cache {
         let chunk_cache = cache::ChunkCache::new();
         if asset.kind == discover::AssetKind::Script {
             if let Some(chunk) = chunk_cache.read_fresh_url(&asset.url) {
-                return Ok(ScannedAsset { asset: chunk.data });
+                return Ok(chunk.data);
             }
         }
         if asset.kind == discover::AssetKind::Script {
@@ -267,7 +255,7 @@ async fn fetch_scan(
                     framework_config.clone(),
                     allow_private,
                 );
-                return Ok(ScannedAsset { asset: chunk.data });
+                return Ok(chunk.data);
             }
         }
         if cached.is_none() {
@@ -276,7 +264,7 @@ async fn fetch_scan(
         if let Some(asset_data) = cached.take() {
             if asset_data.age_secs < cache::CACHE_FRESH_SECS {
                 let asset_data = Arc::new(asset_data.data);
-                return Ok(ScannedAsset { asset: asset_data });
+                return Ok(asset_data);
             }
             cached = Some(asset_data);
         }
@@ -291,11 +279,10 @@ async fn fetch_scan(
         framework_config,
         use_cache,
     )
-    .await
-    .map_err(|reason| (asset.clone(), reason))?
+    .await?
     {
         FetchedBody::NotModified => {
-            let cached = cached.ok_or_else(|| (asset.clone(), FetchFailure::Other))?;
+            let cached = cached.ok_or(FetchFailure::Other)?;
             let asset_data = Arc::new(cached.data);
             cache::write_asset_with_validators_deferred(
                 &asset.url,
@@ -303,7 +290,7 @@ async fn fetch_scan(
                 cache_key,
                 &cached.validators,
             );
-            Ok(ScannedAsset { asset: asset_data })
+            Ok(asset_data)
         }
         FetchedBody::Body(scan, validators, content_hash) => {
             let asset_data = Arc::new(*scan);
@@ -323,7 +310,7 @@ async fn fetch_scan(
                     );
                 }
             }
-            Ok(ScannedAsset { asset: asset_data })
+            Ok(asset_data)
         }
     }
 }
@@ -565,15 +552,15 @@ mod tests {
         let initial = script_asset(format!("http://{addr}/_next/static/chunks/a.js"));
         let mut found = FindingsBuilder::default();
         let stats = scan_assets(
-            client,
-            [initial],
-            AssetScanOptions {
+            ScanEnv {
+                client,
                 concurrency: 2,
-                use_processed_cache: false,
+                use_cache: false,
                 cache_key: None,
                 allow_private: true,
-                ..Default::default()
+                framework_config: FrameworkConfig::default(),
             },
+            [initial],
             &mut found,
         )
         .await;

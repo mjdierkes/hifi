@@ -11,9 +11,9 @@ pub use self::render::escape_terminal;
 use self::render::{render_processed, render_warnings};
 use crate::grep;
 use crate::runtime::config::RuntimeConfig;
+use crate::runtime::engine;
 use crate::runtime::http::Client;
 use crate::runtime::net;
-use crate::runtime::processor::Processor;
 use std::io;
 use thiserror::Error;
 
@@ -52,7 +52,7 @@ pub enum AppError {
     #[error(transparent)]
     Http(#[from] crate::runtime::http::Error),
     #[error(transparent)]
-    Runtime(#[from] crate::runtime::processor::RuntimeError),
+    Runtime(#[from] crate::runtime::engine::RuntimeError),
     #[error(transparent)]
     Url(#[from] crate::url::ParseError),
 }
@@ -139,9 +139,15 @@ fn parse_scan_args(raw: &[String]) -> Result<ScanArgs, AppError> {
 }
 
 async fn run_scan(args: ScanArgs, client: Client, config: RuntimeConfig) -> Result<i32, AppError> {
-    let out = Processor::new(&client, config.chunk_concurrency, config.allow_private)
-        .process_for_display(&args.url, args.no_cache, std::time::Instant::now())
-        .await?;
+    let out = engine::scan_site(
+        &client,
+        &args.url,
+        config.chunk_concurrency,
+        config.allow_private,
+        args.no_cache,
+        std::time::Instant::now(),
+    )
+    .await?;
     render_processed(&out, args.mode)?;
     render_warnings(&out);
     Ok(0)

@@ -7,7 +7,7 @@
 use crate::app::{escape_terminal, normalize_url, AppError};
 use crate::discover::{self, AssetRef, DocumentKind};
 use crate::runtime::config::RuntimeConfig;
-use crate::runtime::fetch::MAX_TOTAL_ASSETS;
+use crate::runtime::engine::MAX_TOTAL_ASSETS;
 use crate::runtime::http::Client;
 use crate::runtime::net;
 use crate::url::Url;
