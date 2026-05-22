@@ -9,9 +9,10 @@ aho-corasick = "1"
 blake3 = "1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-idna = "1"
 memchr = "2"
 lru = "0.16"
+mimalloc = { version = "0.1", default-features = false }
+parking_lot = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1"
 rustc-hash = "2"
@@ -26,11 +27,10 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros"] }
-url_crate = { package = "url", version = "2", features = ["serde"] }
 
 [profile.release]
 lto = "thin"
-codegen-units = 16
+codegen-units = 1
 opt-level = 3
 panic = "abort"
 strip = true

@@ -11,12 +11,13 @@ use crate::discover::DocumentScan;
 use crate::scan::FindingsBuilder;
 use crate::url::Url;
 use lru::LruCache;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, OnceLock},
     time::SystemTime,
 };
 
@@ -216,26 +217,25 @@ fn url_index_memory() -> &'static RwLock<LruCache<String, UrlIndexEntry>> {
 }
 
 fn url_index_memory_get(url: &Url) -> Option<UrlIndexHit> {
-    let mut map = url_index_memory().write().ok()?;
+    let mut map = url_index_memory().write();
     let entry = map.get(url.as_str())?.clone();
     let age_secs = entry.age_secs();
     Some(UrlIndexHit { entry, age_secs })
 }
 
 fn url_index_memory_put(url: &Url, cached: &CachedChunk) {
-    if let Ok(mut map) = url_index_memory().write() {
-        map.put(
-            url.as_str().to_owned(),
-            UrlIndexEntry {
-                data: cached.data.clone(),
-                validators: cached.validators.clone(),
-                content_hash: cached.content_hash.clone(),
-                inserted_at: SystemTime::now()
-                    .checked_sub(std::time::Duration::from_secs(cached.age_secs))
-                    .unwrap_or_else(SystemTime::now),
-            },
-        );
-    }
+    let mut map = url_index_memory().write();
+    map.put(
+        url.as_str().to_owned(),
+        UrlIndexEntry {
+            data: cached.data.clone(),
+            validators: cached.validators.clone(),
+            content_hash: cached.content_hash.clone(),
+            inserted_at: SystemTime::now()
+                .checked_sub(std::time::Duration::from_secs(cached.age_secs))
+                .unwrap_or_else(SystemTime::now),
+        },
+    );
 }
 
 /// Process-wide in-memory cache: content_hash -> findings.
@@ -253,16 +253,15 @@ fn content_memory() -> &'static RwLock<LruCache<String, Arc<FindingsBuilder>>> {
 }
 
 fn content_memory_get(content_hash: &str) -> Option<Arc<FindingsBuilder>> {
-    content_memory().write().ok()?.get(content_hash).cloned()
+    content_memory().write().get(content_hash).cloned()
 }
 
 fn content_memory_put(content_hash: &str, findings: &FindingsBuilder) {
-    if let Ok(mut map) = content_memory().write() {
-        if map.contains(content_hash) {
-            return;
-        }
-        map.put(content_hash.to_owned(), Arc::new(findings.clone()));
+    let mut map = content_memory().write();
+    if map.contains(content_hash) {
+        return;
     }
+    map.put(content_hash.to_owned(), Arc::new(findings.clone()));
 }
 
 fn binary_path_for(json_path: &Path) -> PathBuf {
@@ -415,6 +414,11 @@ fn read_chunk_url(url: &Url, max_age_secs: u64) -> Option<CachedChunk> {
 }
 
 fn spawn_cache_write(write: impl FnOnce() + Send + 'static) {
+    #[cfg(test)]
+    {
+        write();
+    }
+    #[cfg(not(test))]
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn_blocking(write);
     } else {

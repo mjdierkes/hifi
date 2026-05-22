@@ -6,16 +6,19 @@
 
 use crate::url::Url;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use rustls::RootCertStore;
+use rustc_hash::FxHashMap;
+use rustls::{client::Resumption, RootCertStore};
 use rustls_pki_types::ServerName;
+use std::borrow::Cow;
 use std::{
-    collections::HashMap,
     fmt, io,
     io::IoSlice,
+    net::SocketAddr,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
@@ -34,6 +37,7 @@ const END_STREAM: u8 = 0x01;
 const END_HEADERS: u8 = 0x04;
 const PADDED: u8 = 0x08;
 const PRIORITY: u8 = 0x20;
+const DNS_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct Client {
@@ -44,7 +48,7 @@ struct ClientInner {
     tls_h2: TlsConnector,
     tls_h1: TlsConnector,
     default_headers: Vec<(String, String)>,
-    h2: Mutex<HashMap<Origin, Arc<H2Session>>>,
+    h2: Mutex<FxHashMap<Origin, Arc<H2Session>>>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -213,6 +217,8 @@ impl ClientBuilder {
             .with_root_certificates(roots)
             .with_no_client_auth();
         h2_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        h2_config.resumption = Resumption::in_memory_sessions(1024);
+        h2_config.enable_early_data = true;
 
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -220,13 +226,15 @@ impl ClientBuilder {
             .with_root_certificates(roots)
             .with_no_client_auth();
         h1_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        h1_config.resumption = Resumption::in_memory_sessions(1024);
+        h1_config.enable_early_data = true;
 
         Client {
             inner: Arc::new(ClientInner {
                 tls_h2: TlsConnector::from(Arc::new(h2_config)),
                 tls_h1: TlsConnector::from(Arc::new(h1_config)),
                 default_headers: self.default_headers,
-                h2: Mutex::new(HashMap::new()),
+                h2: Mutex::new(FxHashMap::default()),
             }),
         }
     }
@@ -309,10 +317,70 @@ impl Origin {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DnsEntry {
+    addr: SocketAddr,
+    expires_at: Instant,
+}
+
+fn dns_cache() -> &'static Mutex<FxHashMap<(String, u16), DnsEntry>> {
+    static CACHE: OnceLock<Mutex<FxHashMap<(String, u16), DnsEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+async fn connect_tcp(origin: &Origin) -> Result<TcpStream, Error> {
+    let key = (origin.host.clone(), origin.port);
+    if let Some(addr) = cached_addr(&key).await {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                stream.set_nodelay(true)?;
+                return Ok(stream);
+            }
+            Err(_) => {
+                dns_cache().lock().await.remove(&key);
+            }
+        }
+    }
+
+    let mut last_err = None;
+    let addrs = tokio::net::lookup_host((origin.host.as_str(), origin.port)).await?;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                stream.set_nodelay(true)?;
+                dns_cache().lock().await.insert(
+                    key,
+                    DnsEntry {
+                        addr,
+                        expires_at: Instant::now() + DNS_TTL,
+                    },
+                );
+                return Ok(stream);
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "DNS returned no addresses"))
+        .into())
+}
+
+async fn cached_addr(key: &(String, u16)) -> Option<SocketAddr> {
+    let now = Instant::now();
+    let mut cache = dns_cache().lock().await;
+    let entry = cache.get(key).copied()?;
+    if entry.expires_at > now {
+        Some(entry.addr)
+    } else {
+        cache.remove(key);
+        None
+    }
+}
+
 struct H2Session {
     origin: Origin,
     writer: mpsc::UnboundedSender<H2Write>,
-    streams: Mutex<HashMap<u32, mpsc::UnboundedSender<StreamMessage>>>,
+    streams: Mutex<FxHashMap<u32, mpsc::UnboundedSender<StreamMessage>>>,
     decoder: Mutex<HpackDecoder>,
     next_stream_id: AtomicU32,
 }
@@ -322,7 +390,7 @@ enum H2Write {
 }
 
 async fn connect_h2(origin: Origin, tls: TlsConnector) -> Result<Arc<H2Session>, Error> {
-    let tcp = TcpStream::connect((origin.host.as_str(), origin.port)).await?;
+    let tcp = connect_tcp(&origin).await?;
     let name = ServerName::try_from(origin.host.clone())
         .map_err(|_| Error::BadDnsName(origin.host.clone()))?;
     let mut stream = tls.connect(name, tcp).await?;
@@ -364,7 +432,7 @@ async fn connect_h2(origin: Origin, tls: TlsConnector) -> Result<Arc<H2Session>,
     let session = Arc::new(H2Session {
         origin,
         writer: writer_tx,
-        streams: Mutex::new(HashMap::new()),
+        streams: Mutex::new(FxHashMap::default()),
         decoder: Mutex::new(HpackDecoder::default()),
         next_stream_id: AtomicU32::new(1),
     });
@@ -950,14 +1018,15 @@ impl HpackDecoder {
             if b & 0x80 != 0 {
                 can_resize = false;
                 let idx = read_int(bytes, &mut pos, 7)?;
-                out.push(self.lookup(idx)?);
+                let (name, value) = self.lookup(idx)?;
+                out.push((name.into_owned(), value.into_owned()));
             } else if b & 0x40 != 0 {
                 can_resize = false;
                 let idx = read_int(bytes, &mut pos, 6)?;
                 let name = if idx == 0 {
                     read_string(bytes, &mut pos)?
                 } else {
-                    self.lookup(idx)?.0
+                    self.lookup_name(idx)?.into_owned()
                 };
                 let value = read_string(bytes, &mut pos)?;
                 self.insert_dynamic(name.clone(), value.clone());
@@ -974,7 +1043,7 @@ impl HpackDecoder {
                 let name = if idx == 0 {
                     read_string(bytes, &mut pos)?
                 } else {
-                    self.lookup(idx)?.0
+                    self.lookup_name(idx)?.into_owned()
                 };
                 let value = read_string(bytes, &mut pos)?;
                 out.push((name, value));
@@ -1007,16 +1076,30 @@ impl HpackDecoder {
         }
     }
 
-    fn lookup(&self, idx: usize) -> Result<(String, String), Error> {
+    fn lookup(&self, idx: usize) -> Result<(Cow<'static, str>, Cow<'static, str>), Error> {
         if idx == 0 {
             return Err(Error::H2("bad HPACK index"));
         }
         if let Some((name, value)) = STATIC_TABLE.get(idx - 1) {
-            return Ok((name.to_string(), value.to_string()));
+            return Ok((Cow::Borrowed(*name), Cow::Borrowed(*value)));
+        }
+        let (name, value) = self
+            .dynamic
+            .get(idx - STATIC_TABLE.len() - 1)
+            .ok_or(Error::H2("bad HPACK dynamic index"))?;
+        Ok((Cow::Owned(name.clone()), Cow::Owned(value.clone())))
+    }
+
+    fn lookup_name(&self, idx: usize) -> Result<Cow<'static, str>, Error> {
+        if idx == 0 {
+            return Err(Error::H2("bad HPACK index"));
+        }
+        if let Some((name, _)) = STATIC_TABLE.get(idx - 1) {
+            return Ok(Cow::Borrowed(*name));
         }
         self.dynamic
             .get(idx - STATIC_TABLE.len() - 1)
-            .cloned()
+            .map(|(name, _)| Cow::Owned(name.clone()))
             .ok_or(Error::H2("bad HPACK dynamic index"))
     }
 }
@@ -1100,10 +1183,21 @@ fn hpack_huffman_decode(raw: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 fn huffman_symbol(code: u32, len: usize) -> Option<u16> {
-    HUFFMAN_CODES
-        .iter()
-        .position(|&(bits, value)| bits == len && value == code)
-        .map(|idx| idx as u16)
+    static LOOKUP: OnceLock<FxHashMap<u64, u16>> = OnceLock::new();
+    LOOKUP
+        .get_or_init(|| {
+            HUFFMAN_CODES
+                .iter()
+                .enumerate()
+                .map(|(idx, &(bits, value))| (huffman_key(value, bits), idx as u16))
+                .collect()
+        })
+        .get(&huffman_key(code, len))
+        .copied()
+}
+
+fn huffman_key(code: u32, len: usize) -> u64 {
+    ((len as u64) << 32) | code as u64
 }
 
 const HUFFMAN_CODES: &[(usize, u32)] = &[
@@ -1437,7 +1531,7 @@ async fn http1_tls_request(
     tls: TlsConnector,
 ) -> Result<Response, Error> {
     let origin = Origin::for_url(&url)?;
-    let tcp = TcpStream::connect((origin.host.as_str(), origin.port)).await?;
+    let tcp = connect_tcp(&origin).await?;
     let name = ServerName::try_from(origin.host.clone())
         .map_err(|_| Error::BadDnsName(origin.host.clone()))?;
     let stream = tls.connect(name, tcp).await?;
@@ -1450,7 +1544,7 @@ async fn http1_request(
     defaults: &[(String, String)],
 ) -> Result<Response, Error> {
     let origin = Origin::for_url(&url)?;
-    let stream = TcpStream::connect((origin.host.as_str(), origin.port)).await?;
+    let stream = connect_tcp(&origin).await?;
     http1_exchange(stream, url, origin, headers, defaults, Version::Http11).await
 }
 

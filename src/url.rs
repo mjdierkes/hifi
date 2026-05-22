@@ -605,7 +605,7 @@ fn encode_non_ascii(input: &str) -> String {
                 let ascii_host = if host.is_ascii() {
                     host.to_string()
                 } else {
-                    idna::domain_to_ascii(host).unwrap_or_else(|_| encode_non_ascii_component(host))
+                    encode_non_ascii_component(host)
                 };
                 out.push_str(&ascii_host);
                 if let Some(port) = port {

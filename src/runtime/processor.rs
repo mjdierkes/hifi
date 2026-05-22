@@ -13,12 +13,9 @@ use crate::scan::{Confidence, Evidence, EvidenceKind, Extractor, Shape};
 use super::{cache, config::RuntimeConfig, fetch, http::Client, net};
 use crate::url::Url;
 use lru::LruCache;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::{
-    num::NonZeroUsize,
-    sync::{Arc, RwLock},
-    time::Instant,
-};
+use std::{num::NonZeroUsize, sync::Arc, time::Instant};
 use thiserror::Error;
 
 const MEMORY_CACHE_MAX_ENTRIES: usize = 256;
@@ -326,18 +323,16 @@ fn warnings_from_assets(asset_stats: &fetch::AssetScanStats) -> Vec<String> {
 pub fn read_memory(memory: &MemoryCache, url: &str) -> Option<(Body, u64)> {
     memory
         .write()
-        .ok()?
         .get(url)
         .cloned()
         .map(|(body, t)| (body, t.elapsed().as_secs()))
 }
 
 pub fn write_memory(memory: &MemoryCache, url: String, body: Body) {
-    if let Ok(mut entries) = memory.write() {
-        let now = Instant::now();
-        entries.put(url, (body, now));
-        prune_memory(&mut entries, now);
-    }
+    let mut entries = memory.write();
+    let now = Instant::now();
+    entries.put(url, (body, now));
+    prune_memory(&mut entries, now);
 }
 
 pub fn mark_cached_body(

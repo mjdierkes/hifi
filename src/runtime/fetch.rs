@@ -17,11 +17,12 @@ use super::net;
 use crate::url::Url;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use lru::LruCache;
+use parking_lot::RwLock;
 use std::{
     collections::VecDeque,
     num::NonZeroUsize,
     sync::atomic::{AtomicBool, Ordering},
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 use tokio::sync::Semaphore;
@@ -387,7 +388,7 @@ fn read_memory_asset(
     // memory growth.
     let memory = memory?;
     let key = memory_key(url, cache_key);
-    let mut entries = memory.write().ok()?;
+    let mut entries = memory.write();
     let (asset, _) = entries.get(&key).cloned()?;
     Some(asset)
 }
@@ -399,9 +400,9 @@ fn write_memory_asset(
     asset: Arc<AssetData>,
 ) {
     if let Some(memory) = memory {
-        if let Ok(mut entries) = memory.write() {
-            entries.put(memory_key(url, cache_key), (asset, Instant::now()));
-        }
+        memory
+            .write()
+            .put(memory_key(url, cache_key), (asset, Instant::now()));
     }
 }
 
