@@ -44,6 +44,11 @@ pub enum Extractor {
     ApiCall,
     RouteCall,
     ServerAction,
+    NuxtPayload,
+    SvelteKitData,
+    RemixManifest,
+    AstroIsland,
+    ApiClient,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -58,8 +63,13 @@ pub enum Confidence {
 impl Extractor {
     fn confidence(self) -> Confidence {
         match self {
-            Self::ApiCall | Self::RouteCall => Confidence::Observed,
-            Self::Manifest | Self::Flight => Confidence::Parsed,
+            Self::ApiCall | Self::RouteCall | Self::ApiClient => Confidence::Observed,
+            Self::Manifest
+            | Self::Flight
+            | Self::NuxtPayload
+            | Self::SvelteKitData
+            | Self::RemixManifest
+            | Self::AstroIsland => Confidence::Parsed,
             Self::ServerAction => Confidence::Inferred,
             Self::Literal => Confidence::Candidate,
         }
@@ -221,6 +231,7 @@ pub fn scan_endpoints(bytes: &[u8]) -> ScanResult {
             PatternKind::RouteStart => record_route_start(bytes, m.end(), &mut out),
         }
     }
+    scan_api_clients(bytes, &mut out);
     out.compact();
     out
 }
@@ -282,4 +293,136 @@ fn push_candidate(bytes: &[u8], pos: usize, out: &mut ScanResult) -> bool {
     let url = classify::normalize_api_url(&url);
     out.record_candidate(url, Extractor::Literal);
     true
+}
+
+fn scan_api_clients(bytes: &[u8], out: &mut ScanResult) {
+    for anchor in [
+        b"$fetch(".as_slice(),
+        b"useFetch(".as_slice(),
+        b"useLazyFetch(".as_slice(),
+        b"ofetch(".as_slice(),
+        b"ky(".as_slice(),
+    ] {
+        for pos in memchr::memmem::find_iter(bytes, anchor) {
+            record_first_arg_client(bytes, pos + anchor.len(), out);
+        }
+    }
+    for anchor in [b"axios(".as_slice(), b"axios.request(".as_slice()] {
+        for pos in memchr::memmem::find_iter(bytes, anchor) {
+            record_object_client(bytes, pos + anchor.len(), out);
+        }
+    }
+}
+
+fn record_first_arg_client(bytes: &[u8], after: usize, out: &mut ScanResult) {
+    let Some(url) = extract::url_arg(bytes, after) else {
+        return;
+    };
+    if !classify::is_url_like(&url) {
+        return;
+    }
+    let mut shape = shape::Shape::inferred(method_near(bytes, after), false);
+    shape.apply_query_params(&url);
+    out.record_api(
+        classify::normalize_api_url(&url),
+        shape,
+        Extractor::ApiClient,
+    );
+}
+
+fn record_object_client(bytes: &[u8], after: usize, out: &mut ScanResult) {
+    let i = source::skip_ws(bytes, after);
+    if bytes.get(i) != Some(&b'{') {
+        return;
+    }
+    let end = object_end(bytes, i).unwrap_or_else(|| bytes.len().min(i + 1024));
+    let obj = &bytes[i..end];
+    let Some(url) = object_string_value(obj, &[b"url", b"URL", b"endpoint", b"path"]) else {
+        return;
+    };
+    if !classify::is_url_like(&url) {
+        return;
+    }
+    let method = object_string_value(obj, &[b"method"])
+        .or_else(|| method_near(bytes, i).map(str::to_string));
+    let mut shape = shape::Shape::inferred(
+        method.as_deref(),
+        contains_key(obj, b"data") || contains_key(obj, b"body"),
+    );
+    shape.apply_query_params(&url);
+    out.record_api(
+        classify::normalize_api_url(&url),
+        shape,
+        Extractor::ApiClient,
+    );
+}
+
+fn object_string_value(bytes: &[u8], keys: &[&[u8]]) -> Option<String> {
+    for key in keys {
+        let mut offset = 0;
+        while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
+            let pos = offset + rel;
+            if !source::is_identifier_boundary_before(bytes, pos) {
+                offset = pos + 1;
+                continue;
+            }
+            let mut i = source::skip_ws(bytes, pos + key.len());
+            if bytes.get(i) != Some(&b':') {
+                offset = pos + 1;
+                continue;
+            }
+            i = source::skip_ws(bytes, i + 1);
+            if matches!(bytes.get(i), Some(b'"' | b'\'' | b'`')) {
+                return extract::url_arg(bytes, i);
+            }
+            offset = pos + 1;
+        }
+    }
+    None
+}
+
+fn method_near(bytes: &[u8], start: usize) -> Option<&'static str> {
+    let end = memchr::memchr(b';', &bytes[start..])
+        .map(|rel| start + rel)
+        .unwrap_or_else(|| bytes.len().min(start + 256));
+    ["DELETE", "PATCH", "POST", "PUT", "GET", "HEAD", "OPTIONS"]
+        .into_iter()
+        .find(|method| {
+            source::find_ascii_ignore_case(&bytes[start..end], method.as_bytes()).is_some()
+        })
+}
+
+fn contains_key(bytes: &[u8], key: &[u8]) -> bool {
+    let mut offset = 0;
+    while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
+        let pos = offset + rel;
+        if source::is_identifier_boundary_before(bytes, pos) {
+            return true;
+        }
+        offset = pos + 1;
+    }
+    false
+}
+
+fn object_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => {
+                i = source::quoted_end(bytes, i + 1, bytes[i])? + 1;
+                continue;
+            }
+            b'{' | b'[' | b'(' => depth += 1,
+            b'}' | b']' | b')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }

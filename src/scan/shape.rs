@@ -130,6 +130,18 @@ impl Shape {
             ..Self::default()
         }
     }
+
+    pub(crate) fn inferred(method: Option<&str>, has_body: bool) -> Self {
+        let mut shape = Self {
+            has_body,
+            ..Self::default()
+        };
+        if let Some(method) = method {
+            shape.methods |= method_bit(method);
+        }
+        shape.ensure_default_method();
+        shape
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -230,6 +242,13 @@ fn parse_method(mut bytes: &[u8]) -> u8 {
     METHODS
         .iter()
         .find_map(|(bit, name)| method.eq_ignore_ascii_case(name.as_bytes()).then_some(*bit))
+        .unwrap_or(0)
+}
+
+fn method_bit(method: &str) -> u8 {
+    METHODS
+        .iter()
+        .find_map(|(bit, name)| method.eq_ignore_ascii_case(name).then_some(*bit))
         .unwrap_or(0)
 }
 

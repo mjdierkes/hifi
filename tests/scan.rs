@@ -20,6 +20,29 @@ fn api_shapes() {
 }
 
 #[test]
+fn api_client_recognizers_cover_common_wrappers() {
+    let result = scan(
+        r#"
+        $fetch("/api/nuxt", { method: "POST", body: payload });
+        useFetch("/api/composable?limit=10");
+        ky("/api/ky", { method: "PATCH" });
+        axios({ url: "/api/object", method: "delete" });
+        axios.request({ endpoint: "/graphql", method: "POST", data: body });
+    "#,
+    );
+    for (url, method) in [
+        ("/api/nuxt", "POST"),
+        ("/api/composable", "GET"),
+        ("/api/ky", "PATCH"),
+        ("/api/object", "DELETE"),
+        ("/graphql", "POST"),
+    ] {
+        let shape = &result.api_map()[url];
+        assert_eq!(shape.methods_csv(), method, "{url}");
+    }
+}
+
+#[test]
 fn candidates_cover_strings_templates_and_raw_literals() {
     let result = scan(
         r#"
@@ -98,6 +121,53 @@ fn rejects_non_endpoint_noise() {
     ] {
         assert_no_route(&result, route);
     }
+}
+
+#[test]
+fn rejects_real_world_route_noise_without_dropping_routes() {
+    let result = scan(
+        r#"
+        const routes=["/docs/kit/load","/blog/runes","/themes/details/starlight","/products/bolts"];
+        const source="/assets/app/assets/entry.ts";
+        const files=["/src/app.html","/src/lib","/node_modules","/.env","/.git","/vercel/path0"];
+        const runtime=["/dev/null","/proc/self/fd","/home/web_user","/opfs","/tmp"];
+        const random=["/ZQ!fOG27VO4UQ!fOG27VO","/UO!_$cX$Z$cX$","/0LN\\\\\\\\_abefnprtv"];
+        const generated=["/*@__PURE__*","/:ids+.","/rmx:h","/dev/null/inferredProject/foo"];
+        const api="/api/users";
+    "#,
+    );
+    for route in [
+        "/docs/kit/load",
+        "/blog/runes",
+        "/themes/details/starlight",
+        "/products/bolts",
+    ] {
+        assert_route(&result, route);
+    }
+    for route in [
+        "/assets/app/assets/entry.ts",
+        "/src/app.html",
+        "/src/lib",
+        "/node_modules",
+        "/.env",
+        "/.git",
+        "/vercel/path0",
+        "/dev/null",
+        "/proc/self/fd",
+        "/home/web_user",
+        "/opfs",
+        "/tmp",
+        "/ZQ!fOG27VO4UQ!fOG27VO",
+        "/UO!_$cX$Z$cX$",
+        "/0LN\\\\\\\\_abefnprtv",
+        "/*@__PURE__*",
+        "/:ids+.",
+        "/rmx:h",
+        "/dev/null/inferredProject/foo",
+    ] {
+        assert_no_route(&result, route);
+    }
+    assert_candidate(&result, "/api/users");
 }
 
 fn scan(src: &str) -> ScanResult {

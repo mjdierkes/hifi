@@ -119,6 +119,136 @@ fn next_manifest_roots_follow_asset_prefix_or_observed_mount() {
 }
 
 #[test]
+fn lightweight_framework_support_detects_assets_payloads_and_labels() {
+    let nuxt = scan_html(
+        r#"
+        <script type="application/json" id="__NUXT_DATA__">[{}]</script>
+        <script src="/_nuxt/app.123.js"></script>
+        <script>const payload="/products/_payload.json"; import("_nuxt/chunk.456.js")</script>
+    "#,
+    );
+    assert_eq!(nuxt.framework_config.label().as_deref(), Some("Nuxt"));
+    assert_assets(
+        &nuxt,
+        &[
+            "https://example.com/_nuxt/app.123.js",
+            "https://example.com/products/_payload.json",
+            "https://example.com/_nuxt/chunk.456.js",
+        ],
+    );
+    assert_candidate(&nuxt, "/products/_payload.json");
+
+    let svelte = scan_html(
+        r#"
+        <div data-sveltekit-preload-data="hover"></div>
+        <script src="/_app/immutable/entry/start.abc.js"></script>
+        <script>const data="/shop/__data.json?x-sveltekit-invalidated=1"; import("_app/immutable/chunks/page.def.js")</script>
+    "#,
+    );
+    assert_eq!(
+        svelte.framework_config.label().as_deref(),
+        Some("SvelteKit")
+    );
+    assert_assets(
+        &svelte,
+        &[
+            "https://example.com/_app/immutable/entry/start.abc.js",
+            "https://example.com/shop/__data.json?x-sveltekit-invalidated=1",
+            "https://example.com/_app/immutable/chunks/page.def.js",
+        ],
+    );
+
+    let astro = scan_html(
+        r#"
+        <astro-island component-url="/_astro/Product.abc.js"></astro-island>
+        <script>const action="/_actions/add-to-cart"; import("_astro/client.def.js")</script>
+    "#,
+    );
+    assert_eq!(astro.framework_config.label().as_deref(), Some("Astro"));
+    assert_asset(&astro, "https://example.com/_actions/add-to-cart");
+    assert_no_asset_containing(&astro, "/_astro/client.def.js");
+
+    let remix = scan_html(
+        r#"
+        <script>window.__remixContext={}; const data="/products?_data=routes/products"; import("build/routes/products-abc.js")</script>
+    "#,
+    );
+    assert_eq!(remix.framework_config.label().as_deref(), Some("Remix"));
+    assert_assets(
+        &remix,
+        &[
+            "https://example.com/products?_data=routes/products",
+            "https://example.com/build/routes/products-abc.js",
+        ],
+    );
+}
+
+#[test]
+fn framework_80_20_expansion_follows_manifests_payloads_and_islands() {
+    let nuxt = scan_html(
+        r#"
+        <script id="__NUXT_DATA__">[{}]</script>
+        <script>const meta="/_nuxt/builds/meta/abc.json"; const api="/api/catalog";</script>
+    "#,
+    );
+    assert_asset(&nuxt, "https://example.com/_nuxt/builds/meta/abc.json");
+    assert_evidence(
+        &nuxt,
+        "/api/catalog",
+        EvidenceKind::Candidate,
+        Extractor::NuxtPayload,
+    );
+
+    let nuxt_payload = scan(
+        br#"{"state":{"endpoint":"/api/products"}}"#,
+        &url("https://example.com/products/_payload.json"),
+        DocumentKind::Payload,
+    );
+    assert_route(&nuxt_payload, "/products");
+    assert_evidence(
+        &nuxt_payload,
+        "/api/products",
+        EvidenceKind::Candidate,
+        Extractor::NuxtPayload,
+    );
+
+    let svelte = scan_html(
+        r#"
+        <script>window.__sveltekit_x={}; const node="nodes/2.abc.js"; const chunk="chunks/api.def.js";</script>
+    "#,
+    );
+    assert_assets(
+        &svelte,
+        &[
+            "https://example.com/_app/immutable/nodes/2.abc.js",
+            "https://example.com/_app/immutable/chunks/api.def.js",
+        ],
+    );
+
+    let remix = scan_html(
+        r#"
+        <script>window.__remixContext={manifest:{routes:{x:{module:"routes/products.abc.js"}}}};</script>
+    "#,
+    );
+    assert_asset(&remix, "https://example.com/build/routes/products.abc.js");
+
+    let astro = scan_html(
+        r#"
+        <astro-island component-url="/_astro/Product.abc.js" renderer-url="/_astro/client.def.js"></astro-island>
+        <script>const endpoint="/_actions/cart.add";</script>
+    "#,
+    );
+    assert_asset(&astro, "https://example.com/_astro/Product.abc.js");
+    assert_api(&astro, "/_actions/cart.add");
+    assert_evidence(
+        &astro,
+        "/_actions/cart.add",
+        EvidenceKind::Api,
+        Extractor::AstroIsland,
+    );
+}
+
+#[test]
 fn rejects_asset_false_positives() {
     let result = scan_html(
         r#"

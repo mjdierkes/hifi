@@ -28,7 +28,11 @@ pub fn is_client_route(s: &str) -> bool {
         && !s.starts_with("/trpc")
         && !s.starts_with("/_next")
         && !s.starts_with("/_nuxt")
+        && !s.starts_with("/_app")
+        && !s.starts_with("/_astro")
         && !looks_like_internal_path(s)
+        && !looks_like_dev_or_source_path(s)
+        && !looks_like_generated_noise(s)
         && has_substantive_segments(s)
 }
 
@@ -40,6 +44,63 @@ fn looks_like_internal_path(s: &str) -> bool {
         || path.contains("/node_modules/")
         || path.contains("/.next/")
         || path.contains("/.bun/")
+        || path.contains("/.git")
+        || path.contains("/.env")
+        || path.contains("/.staging")
+        || path.contains("/vercel/path")
+        || path.contains("/proc/")
+        || path.contains("/dev/")
+        || path == "/dev"
+        || path == "/proc"
+        || path == "/opfs"
+        || path == "/vfs"
+        || path == "/tmp"
+        || path == "/home"
+        || path.starts_with("/home/")
+        || path.starts_with("/assets/app/")
+        || path.starts_with("/src/")
+        || path == "/src"
+}
+
+fn looks_like_dev_or_source_path(s: &str) -> bool {
+    let path = s.split(['?', '#']).next().unwrap_or(s);
+    let file = path.rsplit('/').next().unwrap_or(path);
+    if file.contains('.') && bad_ext(path.as_bytes(), SOURCE_EXTS, true) {
+        return true;
+    }
+    path.ends_with(".d.ts")
+        || path.ends_with(".config")
+        || path.contains("/inferredProject")
+        || path.contains("/autoImportProviderProject")
+        || path.contains("/auxiliaryProject")
+        || path.contains("/*@__PURE__")
+        || path.contains("/*{dynamic}*")
+        || path.contains("/__delete")
+        || path.contains("/:ids+.")
+        || path.contains("/rmx:")
+}
+
+fn looks_like_generated_noise(s: &str) -> bool {
+    let path = s.split(['?', '#']).next().unwrap_or(s);
+    let mut segments = path.split('/').filter(|seg| !seg.is_empty());
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    if segments.next().is_some() {
+        return false;
+    }
+    if first.contains("{dynamic}") || first.contains(':') {
+        return false;
+    }
+    let len = first.len();
+    len >= 12
+        && first.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'_' | b'-' | b'!' | b'$' | b'*' | b'+' | b'\\')
+        })
+        && first
+            .bytes()
+            .any(|b| matches!(b, b'_' | b'!' | b'$' | b'*' | b'+' | b'\\'))
 }
 
 // Minified JS is full of two- and three-character quoted strings (`"/g"`,
@@ -96,6 +157,11 @@ pub fn normalize_api_url(s: &str) -> String {
         without_fragment.to_owned()
     }
 }
+
+#[rustfmt::skip]
+const SOURCE_EXTS: &[&str] = &[
+    ".ts", ".tsx", ".jsx", ".vue", ".svelte", ".md", ".mdx", ".cjs", ".d.ts",
+];
 
 fn is_route_like(s: &str) -> bool {
     let bytes = s.as_bytes();

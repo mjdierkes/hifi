@@ -161,7 +161,7 @@ fn enqueue_assets(
 
 fn asset_priority(asset: &AssetRef) -> u8 {
     match (asset.source, asset.kind) {
-        (AssetSource::NextManifest, _) => 0,
+        (AssetSource::NextManifest | AssetSource::FrameworkManifest, _) => 0,
         (_, discover::AssetKind::Manifest) => 1,
         (AssetSource::HtmlScript | AssetSource::HtmlPreload, discover::AssetKind::Script) => 2,
         (_, discover::AssetKind::Payload) => 3,
@@ -355,8 +355,11 @@ async fn fetch_asset_body(
         return Ok(FetchedBody::NotModified);
     }
     if !status.is_success() {
-        if asset.source == AssetSource::NextManifest {
-            // Next.js deployments commonly omit one of the optional manifests.
+        if matches!(
+            asset.source,
+            AssetSource::NextManifest | AssetSource::FrameworkManifest
+        ) {
+            // Framework deployments commonly omit optional manifests.
             // Treat that as an empty document so a missing manifest does not
             // make the whole scan look incomplete.
             return Ok(FetchedBody::Body(
