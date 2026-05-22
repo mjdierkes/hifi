@@ -4,9 +4,8 @@
 //! private-address policy, status handling, and response size limits remain
 //! consistent across page, asset, and grep fetches.
 
+use crate::runtime::http::{Client, Response};
 use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
-use reqwest::{header::LOCATION, Client, Response};
 use std::{io, net::IpAddr};
 use thiserror::Error;
 use url::{Host, Url};
@@ -29,7 +28,7 @@ pub enum NetError {
     #[error("too many redirects for '{0}'")]
     TooManyRedirects(String),
     #[error(transparent)]
-    Http(#[from] reqwest::Error),
+    Http(#[from] crate::runtime::http::Error),
 }
 
 pub fn validate_url(url: &Url, allow_private: bool) -> Result<(), NetError> {
@@ -88,13 +87,18 @@ pub async fn get_limited(
     for _ in 0..MAX_REDIRECTS {
         validate_request_url(&current, allow_private).await?;
         let response = client.get(current.clone()).send().await?;
-        if response.status().is_redirection() {
+        if response.is_redirection() {
             if let Some(next) = redirect_target(&response) {
                 current = next;
                 continue;
             }
         }
-        return Ok(response.error_for_status()?);
+        if response.is_success() {
+            return Ok(response);
+        }
+        return Err(NetError::Http(crate::runtime::http::Error::H2(
+            "HTTP status was not successful",
+        )));
     }
     Err(NetError::TooManyRedirects(current.to_string()))
 }
@@ -125,9 +129,8 @@ async fn read_limited_inner(
 
     let mut body =
         BytesMut::with_capacity(content_length.unwrap_or(0).min(MAX_RESPONSE_BYTES) as usize);
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+    let bytes = response.body();
+    for chunk in bytes.chunks(16 * 1024) {
         let next_len = body.len() as u64 + chunk.len() as u64;
         if next_len > MAX_RESPONSE_BYTES {
             return Err(NetError::ResponseTooLarge {
@@ -136,12 +139,12 @@ async fn read_limited_inner(
             });
         }
         if let Some(h) = hash.as_mut() {
-            for b in &chunk {
+            for b in chunk {
                 *h ^= *b as u64;
                 *h = h.wrapping_mul(0x100000001b3);
             }
         }
-        body.extend_from_slice(&chunk);
+        body.extend_from_slice(chunk);
     }
     Ok((body.freeze(), hash.unwrap_or(0)))
 }
@@ -155,7 +158,7 @@ pub async fn get_bytes_limited(
 }
 
 pub fn redirect_target(response: &Response) -> Option<Url> {
-    let location = response.headers().get(LOCATION)?.to_str().ok()?;
+    let location = response.header("location")?;
     response.url().join(location).ok()
 }
 

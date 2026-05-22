@@ -1,10 +1,6 @@
 use super::AppError;
-use crate::runtime::cache::CACHE_FRESH_SECS;
 use crate::runtime::config::RuntimeConfig;
-use crate::runtime::net;
-use reqwest::header::{HeaderMap, HeaderValue};
-use reqwest::Client;
-use std::time::Duration;
+use crate::runtime::http::Client;
 
 // Many CDNs (notably Cloudflare) block obvious bot UAs with 403 before we ever
 // see the page. hifi crawls publicly-served content the way a browser does, so
@@ -18,46 +14,30 @@ pub fn runtime_client() -> Result<(RuntimeConfig, Client), AppError> {
     Ok((config, client))
 }
 
-fn make_client(config: RuntimeConfig) -> reqwest::Result<Client> {
-    Client::builder()
-        .pool_max_idle_per_host(config.chunk_concurrency)
-        .pool_idle_timeout(Duration::from_secs(CACHE_FRESH_SECS))
-        .tcp_keepalive(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(12))
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if net::validate_url(attempt.url(), config.allow_private).is_ok() {
-                attempt.follow()
-            } else {
-                attempt.error("blocked redirect to private or unsupported URL")
-            }
-        }))
-        .user_agent(DEFAULT_USER_AGENT)
+fn make_client(_config: RuntimeConfig) -> Result<Client, crate::runtime::http::Error> {
+    Ok(Client::builder()
         .default_headers(browser_default_headers())
-        .build()
+        .build())
 }
 
 // Cloudflare bot-management 403s any request that looks programmatic; UA alone
 // isn't enough. Real browsers always send Accept, Accept-Language, and the
 // Sec-Fetch-* hints; sending the same set lets us through without TLS
 // fingerprinting tricks.
-fn browser_default_headers() -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        reqwest::header::ACCEPT,
-        HeaderValue::from_static(
+fn browser_default_headers() -> Vec<(String, String)> {
+    vec![
+        ("user-agent".into(), DEFAULT_USER_AGENT.into()),
+        (
+            "accept".into(),
             "text/html,application/xhtml+xml,application/xml;q=0.9,\
-             image/avif,image/webp,*/*;q=0.8",
+             image/avif,image/webp,*/*;q=0.8"
+                .into(),
         ),
-    );
-    headers.insert(
-        reqwest::header::ACCEPT_LANGUAGE,
-        HeaderValue::from_static("en-US,en;q=0.9"),
-    );
-    headers.insert("Sec-Fetch-Site", HeaderValue::from_static("none"));
-    headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("navigate"));
-    headers.insert("Sec-Fetch-User", HeaderValue::from_static("?1"));
-    headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("document"));
-    headers.insert("Upgrade-Insecure-Requests", HeaderValue::from_static("1"));
-    headers
+        ("accept-language".into(), "en-US,en;q=0.9".into()),
+        ("sec-fetch-site".into(), "none".into()),
+        ("sec-fetch-mode".into(), "navigate".into()),
+        ("sec-fetch-user".into(), "?1".into()),
+        ("sec-fetch-dest".into(), "document".into()),
+        ("upgrade-insecure-requests".into(), "1".into()),
+    ]
 }

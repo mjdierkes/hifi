@@ -12,11 +12,10 @@ use crate::framework::{self, FrameworkConfig};
 use crate::scan::FindingsBuilder;
 
 use super::cache::{self, AssetData};
+use super::http::Client;
 use super::net;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use lru::LruCache;
-use reqwest::header::{HeaderMap, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
-use reqwest::{Client, StatusCode};
 use std::{
     collections::VecDeque,
     num::NonZeroUsize,
@@ -344,15 +343,18 @@ async fn fetch_asset_body(
         }
         if let Some(validators) = validators {
             if let Some(etag) = &validators.etag {
-                request = request.header(IF_NONE_MATCH, etag);
+                request = request.header("if-none-match", etag);
             }
             if let Some(last_modified) = &validators.last_modified {
-                request = request.header(IF_MODIFIED_SINCE, last_modified);
+                request = request.header("if-modified-since", last_modified);
             }
         }
 
-        let response = request.send().await.map_err(|_| FetchFailure::Other)?;
-        if response.status().is_redirection() {
+        let response = request.send().await.map_err(|err| {
+            trace_asset_error(&current_url, &err);
+            FetchFailure::Other
+        })?;
+        if response.is_redirection() {
             if redirects >= net::MAX_REDIRECTS {
                 return Err(FetchFailure::Other);
             }
@@ -372,12 +374,12 @@ async fn fetch_asset_body(
         net::trace_response_version("asset", &current_url, &response);
     }
     let status = response.status();
-    if status == StatusCode::NOT_MODIFIED {
+    if status == 304 {
         // The cached scan result is still valid; callers refresh the validator
         // sidecar timestamp without reparsing the asset body.
         return Ok(FetchedBody::NotModified);
     }
-    if !status.is_success() {
+    if !(200..300).contains(&status) {
         if matches!(
             asset.source,
             AssetSource::NextManifest | AssetSource::FrameworkManifest
@@ -390,8 +392,9 @@ async fn fetch_asset_body(
                 cache::AssetValidators::default(),
             ));
         }
+        trace_asset_status(&current_url, status);
         return Err(match status {
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => FetchFailure::Unauthorized,
+            401 | 403 => FetchFailure::Unauthorized,
             _ => FetchFailure::Other,
         });
     }
@@ -399,14 +402,16 @@ async fn fetch_asset_body(
     let validators = asset_validators(response.headers());
     let kind = asset.document_kind();
     let (body, streamed_hash) = if use_hash_cache && kind == discover::DocumentKind::Script {
-        net::read_limited_hashed(response)
-            .await
-            .map_err(|_| FetchFailure::Other)?
+        net::read_limited_hashed(response).await.map_err(|err| {
+            trace_net_error(&current_url, &err);
+            FetchFailure::Other
+        })?
     } else {
         (
-            net::read_limited(response)
-                .await
-                .map_err(|_| FetchFailure::Other)?,
+            net::read_limited(response).await.map_err(|err| {
+                trace_net_error(&current_url, &err);
+                FetchFailure::Other
+            })?,
             0,
         )
     };
@@ -425,7 +430,12 @@ async fn fetch_asset_body(
         )
     })
     .await
-    .map_err(|_| FetchFailure::Other)?;
+    .map_err(|err| {
+        if std::env::var_os("HIFI_TRACE_HTTP").is_some() {
+            eprintln!("hifi: trace: asset scan join error {err}");
+        }
+        FetchFailure::Other
+    })?;
     if let Some(hash) = findings_hash {
         if !had_cached_findings {
             cache::write_findings_by_hash(hash, kind, &scan.findings);
@@ -434,18 +444,36 @@ async fn fetch_asset_body(
     Ok(FetchedBody::Body(Box::new(scan), validators))
 }
 
-fn asset_validators(headers: &HeaderMap) -> cache::AssetValidators {
-    cache::AssetValidators {
-        etag: header_value(headers, ETAG),
-        last_modified: header_value(headers, LAST_MODIFIED),
+fn trace_asset_error(url: &Url, err: &super::http::Error) {
+    if std::env::var_os("HIFI_TRACE_HTTP").is_some() {
+        eprintln!("hifi: trace: asset error {} {err}", url.as_str());
     }
 }
 
-fn header_value(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Option<String> {
+fn trace_net_error(url: &Url, err: &net::NetError) {
+    if std::env::var_os("HIFI_TRACE_HTTP").is_some() {
+        eprintln!("hifi: trace: asset read error {} {err}", url.as_str());
+    }
+}
+
+fn trace_asset_status(url: &Url, status: u16) {
+    if std::env::var_os("HIFI_TRACE_HTTP").is_some() {
+        eprintln!("hifi: trace: asset status {} {status}", url.as_str());
+    }
+}
+
+fn asset_validators(headers: &[(String, String)]) -> cache::AssetValidators {
+    cache::AssetValidators {
+        etag: header_value(headers, "etag"),
+        last_modified: header_value(headers, "last-modified"),
+    }
+}
+
+fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
     headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
 }
 
 #[cfg(test)]

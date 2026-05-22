@@ -10,9 +10,8 @@ use crate::framework::FrameworkConfig;
 use crate::scan::next::NextConfig;
 use crate::scan::{Confidence, Evidence, EvidenceKind, Extractor, Shape};
 
-use super::{cache, config::RuntimeConfig, fetch, net};
+use super::{cache, config::RuntimeConfig, fetch, http::Client, net};
 use lru::LruCache;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
     num::NonZeroUsize,

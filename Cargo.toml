@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-reqwest = { version = "0.12", features = ["brotli", "deflate", "gzip", "http2", "rustls-tls-webpki-roots", "stream", "zstd"], default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "sync"] }
 aho-corasick = "1"
 bytes = "1"
@@ -12,11 +11,15 @@ directories = "6"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 memchr = "2"
 lru = "0.16"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
 rustc-hash = "2"
 serde_json = "1"
 thiserror = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 url = { version = "2", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
+webpki-roots = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

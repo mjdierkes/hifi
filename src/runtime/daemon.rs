@@ -9,12 +9,12 @@ use super::cache::CACHE_FRESH_SECS;
 use super::config::RuntimeConfig;
 #[cfg(unix)]
 use super::fetch;
+use super::http::Client;
 #[cfg(unix)]
 use super::processor::{
     mark_cached_body, memory_cache, read_memory, Body, CacheContext, CacheStatus, MemoryCache,
     Processor,
 };
-use reqwest::Client;
 #[cfg(unix)]
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};

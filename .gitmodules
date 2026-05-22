@@ -1,0 +1,45 @@
+[submodule ".context/reqwest"]
+	path = .context/reqwest
+	url = https://github.com/seanmonstar/reqwest
+[submodule ".context/tokio"]
+	path = .context/tokio
+	url = https://github.com/tokio-rs/tokio
+[submodule ".context/aho-corasick"]
+	path = .context/aho-corasick
+	url = https://github.com/BurntSushi/aho-corasick
+[submodule ".context/bytes"]
+	path = .context/bytes
+	url = https://github.com/tokio-rs/bytes
+[submodule ".context/directories"]
+	path = .context/directories
+	url = https://github.com/soc/directories-rs
+[submodule ".context/futures-rs"]
+	path = .context/futures-rs
+	url = https://github.com/rust-lang/futures-rs
+[submodule ".context/memchr"]
+	path = .context/memchr
+	url = https://github.com/BurntSushi/memchr
+[submodule ".context/lru-rs"]
+	path = .context/lru-rs
+	url = https://github.com/jeromefroe/lru-rs.git
+[submodule ".context/rustc-hash"]
+	path = .context/rustc-hash
+	url = https://github.com/rust-lang/rustc-hash
+[submodule ".context/serde_json"]
+	path = .context/serde_json
+	url = https://github.com/serde-rs/json
+[submodule ".context/thiserror"]
+	path = .context/thiserror
+	url = https://github.com/dtolnay/thiserror
+[submodule ".context/rust-url"]
+	path = .context/rust-url
+	url = https://github.com/servo/rust-url
+[submodule ".context/serde"]
+	path = .context/serde
+	url = https://github.com/serde-rs/serde
+[submodule ".context/libc"]
+	path = .context/libc
+	url = https://github.com/rust-lang/libc
+[submodule ".context/h2"]
+	path = .context/h2
+	url = https://github.com/hyperium/h2

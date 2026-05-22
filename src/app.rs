@@ -18,9 +18,9 @@ use self::render::{render_daemon_reply, render_processed, render_warnings, Rende
 use crate::grep;
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::daemon;
+use crate::runtime::http::Client;
 use crate::runtime::net;
 use crate::runtime::processor::{CacheContext, Processor};
-use reqwest::Client;
 use std::io;
 use std::time::Duration;
 use thiserror::Error;
@@ -76,7 +76,7 @@ pub enum AppError {
     #[error(transparent)]
     Net(#[from] net::NetError),
     #[error(transparent)]
-    Reqwest(#[from] reqwest::Error),
+    Http(#[from] crate::runtime::http::Error),
     #[error(transparent)]
     Runtime(#[from] crate::runtime::processor::RuntimeError),
     #[error(transparent)]
