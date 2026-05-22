@@ -80,7 +80,7 @@ pub enum AppError {
     #[error(transparent)]
     Runtime(#[from] crate::runtime::processor::RuntimeError),
     #[error(transparent)]
-    Url(#[from] url::ParseError),
+    Url(#[from] crate::url::ParseError),
 }
 
 impl From<String> for AppError {
@@ -297,13 +297,13 @@ fn set_mode(current: OutputMode, next: OutputMode) -> Result<OutputMode, AppErro
 
 pub fn normalize_url(url: &str) -> Result<String, AppError> {
     if url.contains("://") {
-        let parsed = url::Url::parse(url)?;
+        let parsed = crate::url::Url::parse(url)?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(format!("unsupported URL scheme '{}'", parsed.scheme()).into());
         }
         Ok(parsed.to_string())
     } else {
-        Ok(url::Url::parse(&format!("https://{url}"))?.to_string())
+        Ok(crate::url::Url::parse(&format!("https://{url}"))?.to_string())
     }
 }
 

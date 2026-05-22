@@ -11,6 +11,7 @@ use crate::scan::next::NextConfig;
 use crate::scan::{Confidence, Evidence, EvidenceKind, Extractor, Shape};
 
 use super::{cache, config::RuntimeConfig, fetch, http::Client, net};
+use crate::url::Url;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -19,7 +20,6 @@ use std::{
     time::Instant,
 };
 use thiserror::Error;
-use url::Url;
 
 const MEMORY_CACHE_MAX_ENTRIES: usize = 256;
 
@@ -34,7 +34,7 @@ pub enum RuntimeError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
-    Url(#[from] url::ParseError),
+    Url(#[from] crate::url::ParseError),
     #[error(transparent)]
     Join(#[from] tokio::task::JoinError),
 }
@@ -276,7 +276,7 @@ impl<'a> Processor<'a> {
 }
 
 impl RequestPlan {
-    fn new(url: &str, cache: &CacheContext) -> Result<Self, url::ParseError> {
+    fn new(url: &str, cache: &CacheContext) -> Result<Self, crate::url::ParseError> {
         let original_base = Url::parse(url)?;
         let scan_cache = cache::ScanCache::for_base(&original_base);
         let _ = cache;
@@ -357,8 +357,8 @@ fn write_caches(
     memory: Option<MemoryCache>,
 ) -> Result<()> {
     let cached = out.clone().mark(None, CacheStatus::Stored, None);
-    cache_store.write_binary(&encode_output_binary(&cached));
-    if let Ok(base) = url::Url::parse(url) {
+    cache_store.write_binary_deferred(Arc::from(encode_output_binary(&cached)));
+    if let Ok(base) = crate::url::Url::parse(url) {
         let candidates = completion_candidates(&cached.evidence);
         if !candidates.is_empty() {
             cache::write_completion_candidates(&base, &candidates);
@@ -700,7 +700,7 @@ fn completion_candidates(evidence: &[Evidence]) -> Vec<String> {
 
 fn normalize_completion_path(raw: &str) -> String {
     let raw = raw.split(['?', '#']).next().unwrap_or(raw);
-    let path = url::Url::parse(raw)
+    let path = crate::url::Url::parse(raw)
         .map(|u| u.path().to_string())
         .unwrap_or_else(|_| raw.to_string());
     let trimmed = path.trim_end_matches('/');

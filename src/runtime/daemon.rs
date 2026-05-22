@@ -417,7 +417,7 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
     }
     let no_cache = wire.no_cache;
     let url = wire.url.as_str();
-    if let Ok(parsed) = url::Url::parse(url) {
+    if let Ok(parsed) = crate::url::Url::parse(url) {
         if let Err(e) = super::net::validate_url(&parsed, state.config.allow_private) {
             return reply(
                 &mut stream,

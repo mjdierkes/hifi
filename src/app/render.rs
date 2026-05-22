@@ -309,7 +309,7 @@ fn collect_paths(v: &Output, kind: EvidenceKind) -> Vec<String> {
 }
 
 fn normalize_path(url: &str) -> String {
-    let raw = url::Url::parse(url)
+    let raw = crate::url::Url::parse(url)
         .map(|u| u.path().to_string())
         .unwrap_or_else(|_| url.split(['?', '#']).next().unwrap_or(url).to_string());
     let trimmed = raw.trim_end_matches('/');

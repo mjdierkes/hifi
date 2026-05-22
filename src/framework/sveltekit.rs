@@ -4,8 +4,8 @@ use crate::discover::{AssetKind, AssetRef, AssetSource};
 use crate::scan::{Extractor, Shape};
 use crate::source;
 use crate::source::TemplateMode;
+use crate::url::Url;
 use rustc_hash::FxHashSet;
-use url::Url;
 
 const SKIP_FRAGMENTS: &[&str] = &[
     "/_app/immutable/chunks/scheduler.",

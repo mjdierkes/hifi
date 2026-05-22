@@ -5,6 +5,7 @@ mod grep;
 mod runtime;
 mod scan;
 mod source;
+pub mod url;
 
 pub use discover::{
     scan_document, scan_document_with_config, AssetKind, AssetRef, AssetSource, DocumentKind,

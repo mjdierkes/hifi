@@ -1,7 +1,7 @@
 //! Lightweight Astro discovery policy.
 
 use crate::source;
-use url::Url;
+use crate::url::Url;
 
 const SKIP_FRAGMENTS: &[&str] = &["/_astro/hoisted.", "/_astro/polyfills", "/_astro/client."];
 

@@ -1,7 +1,7 @@
 //! Lightweight Remix / React Router framework discovery policy.
 
 use crate::source;
-use url::Url;
+use crate::url::Url;
 
 const SKIP_FRAGMENTS: &[&str] = &[
     "/build/_shared/",

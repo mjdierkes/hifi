@@ -75,7 +75,7 @@ pub fn print_path_completions(url: &str, prefix: &str) {
     }
 }
 
-fn cached_completion_candidates(url: &str) -> Option<(url::Url, Vec<String>, bool)> {
+fn cached_completion_candidates(url: &str) -> Option<(crate::url::Url, Vec<String>, bool)> {
     let parsed = normalized_url(url)?;
     if let Some(candidates) = cache::read_completion_candidates(&parsed) {
         return Some((parsed, candidates, false));
@@ -87,7 +87,7 @@ fn cached_completion_candidates(url: &str) -> Option<(url::Url, Vec<String>, boo
 // Read every cached scan we have for the host (the cache path is keyed by
 // build hash, so a rebuild orphans the previous file — for completion we just
 // want any recent surface, so union them all).
-fn cached_paths(parsed: &url::Url) -> Option<Vec<String>> {
+fn cached_paths(parsed: &crate::url::Url) -> Option<Vec<String>> {
     #[derive(serde::Deserialize)]
     struct Envelope {
         value: crate::runtime::processor::Output,
@@ -124,9 +124,9 @@ fn cached_paths(parsed: &url::Url) -> Option<Vec<String>> {
     Some(paths)
 }
 
-fn normalized_url(url: &str) -> Option<url::Url> {
+fn normalized_url(url: &str) -> Option<crate::url::Url> {
     let normalized = super::normalize_url(url).ok()?;
-    url::Url::parse(&normalized).ok()
+    crate::url::Url::parse(&normalized).ok()
 }
 
 fn path_completion_candidates(paths: &[String]) -> Vec<String> {
@@ -154,7 +154,7 @@ fn path_completion_candidates(paths: &[String]) -> Vec<String> {
 
 fn normalize_completion_path(raw: &str) -> String {
     let raw = raw.split(['?', '#']).next().unwrap_or(raw);
-    let path = url::Url::parse(raw)
+    let path = crate::url::Url::parse(raw)
         .map(|u| u.path().to_string())
         .unwrap_or_else(|_| raw.to_string());
     let trimmed = path.trim_end_matches('/');
@@ -291,9 +291,39 @@ fn append_block_if_missing(rc: &Path, marker: &str, block: &str) -> io::Result<b
     Ok(true)
 }
 
-const BASH_COMPLETION: &str = r#"_hifi() {
-    local cur prev words cword
-    _init_completion || return
+const BASH_COMPLETION: &str = r#"__hifi_cache_dir() {
+    if [[ -n "${HIFI_CACHE_DIR-}" ]]; then
+        printf '%s' "${HIFI_CACHE_DIR}"
+    elif [[ "$(uname -s)" == "Darwin" ]]; then
+        printf '%s' "${HOME}/Library/Caches/hifi"
+    else
+        printf '%s' "${XDG_CACHE_HOME:-${HOME}/.cache}/hifi"
+    fi
+}
+
+__hifi_hosts() {
+    local dir host seen
+    declare -A seen
+    local cache_dir
+    cache_dir=$(__hifi_cache_dir)
+    for kind in processed assets; do
+        [[ -d "${cache_dir}/${kind}" ]] || continue
+        for dir in "${cache_dir}/${kind}"/*/; do
+            [[ -d "${dir}" ]] || continue
+            host="${dir%/}"
+            host="${host##*/}"
+            [[ -z "${host}" || "${host}" == "unknown" ]] && continue
+            if [[ -z "${seen[$host]-}" ]]; then
+                seen[$host]=1
+                printf '%s\n' "${host}"
+            fi
+        done
+    done
+}
+
+_hifi() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local cword=${COMP_CWORD}
     local subcommands="grep serve completions install help"
     local flags="--routes -r --all -a --no-cache --no-daemon --flat --json -h --help"
 
@@ -303,41 +333,30 @@ const BASH_COMPLETION: &str = r#"_hifi() {
     fi
 
     if [[ ${cword} -eq 1 ]]; then
-        local command_matches
-        command_matches=$(compgen -W "${subcommands}" -- "${cur}")
-        if [[ -n "${command_matches}" ]]; then
-            COMPREPLY=( ${command_matches} )
-            return
-        fi
         local hosts
-        hosts=$(hifi __complete "${cur}" 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${hosts}" -- "${cur}") )
+        hosts=$(__hifi_hosts)
+        COMPREPLY=( $(compgen -W "${subcommands} ${hosts}" -- "${cur}") )
         return
     fi
 
-    case "${words[1]}" in
-        completions)
-            COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") )
-            return
-            ;;
-        install)
+    case "${COMP_WORDS[1]}" in
+        completions|install)
             COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") )
             return
             ;;
         grep)
             if [[ ${cword} -eq 2 ]]; then
                 local hosts
-                hosts=$(hifi __complete "${cur}" 2>/dev/null)
+                hosts=$(__hifi_hosts)
                 COMPREPLY=( $(compgen -W "${hosts}" -- "${cur}") )
                 return
             fi
             ;;
     esac
 
-    # Second positional after a URL: suggest cached routes for that URL.
     if [[ ${cword} -eq 2 && "${cur}" != -* ]]; then
         local paths
-        paths=$(hifi __complete-paths "${words[1]}" "${cur}" 2>/dev/null)
+        paths=$(hifi __complete-paths "${COMP_WORDS[1]}" "${cur}" 2>/dev/null)
         if [[ -n "${paths}" ]]; then
             COMPREPLY=( $(compgen -W "${paths}" -- "${cur}") )
             return
@@ -350,6 +369,24 @@ complete -F _hifi hifi
 "#;
 
 const ZSH_COMPLETION: &str = r#"#compdef hifi
+__hifi_cache_dir() {
+    if [[ -n "${HIFI_CACHE_DIR-}" ]]; then
+        print -r -- "${HIFI_CACHE_DIR}"
+    elif [[ "$OSTYPE" == darwin* ]]; then
+        print -r -- "${HOME}/Library/Caches/hifi"
+    else
+        print -r -- "${XDG_CACHE_HOME:-${HOME}/.cache}/hifi"
+    fi
+}
+
+__hifi_hosts() {
+    local cache_dir
+    cache_dir=$(__hifi_cache_dir)
+    local -a entries
+    entries=(${cache_dir}/processed/*(/N:t) ${cache_dir}/assets/*(/N:t))
+    print -rl -- ${(u)entries:#unknown}
+}
+
 _hifi() {
     local -a hosts paths subs
     subs=(grep serve completions install help)
@@ -358,11 +395,9 @@ _hifi() {
         return
     fi
     if (( CURRENT == 2 )); then
+        hosts=("${(@f)$(__hifi_hosts)}")
         _describe -t commands 'command' subs
-        if (( $compstate[nmatches] == 0 )); then
-            hosts=("${(@f)$(hifi __complete "${words[CURRENT]}" 2>/dev/null)}")
-            _describe -t hosts 'cached host' hosts
-        fi
+        _describe -t hosts 'cached host' hosts
         return
     fi
     case "${words[2]}" in
@@ -372,7 +407,7 @@ _hifi() {
             ;;
         grep)
             if (( CURRENT == 3 )); then
-                hosts=("${(@f)$(hifi __complete "${words[CURRENT]}" 2>/dev/null)}")
+                hosts=("${(@f)$(__hifi_hosts)}")
                 _describe -t hosts 'cached host' hosts
                 return
             fi
@@ -387,11 +422,36 @@ _hifi() {
     fi
     _arguments '*:flag:(--routes -r --all -a --no-cache --no-daemon --flat --json -h --help)'
 }
+zstyle ':completion:*:*:hifi:*' menu select
 compdef _hifi hifi
 "#;
 
-const FISH_COMPLETION: &str = r#"function __hifi_hosts
-    hifi __complete (commandline -ct) 2>/dev/null
+const FISH_COMPLETION: &str = r#"function __hifi_cache_dir
+    if set -q HIFI_CACHE_DIR
+        echo $HIFI_CACHE_DIR
+    else if test (uname -s) = Darwin
+        echo $HOME/Library/Caches/hifi
+    else if set -q XDG_CACHE_HOME
+        echo $XDG_CACHE_HOME/hifi
+    else
+        echo $HOME/.cache/hifi
+    end
+end
+
+function __hifi_hosts
+    set -l cache_dir (__hifi_cache_dir)
+    set -l hosts
+    for kind in processed assets
+        if test -d $cache_dir/$kind
+            for dir in $cache_dir/$kind/*/
+                set -l name (basename $dir)
+                if test -n "$name" -a "$name" != unknown
+                    set -a hosts $name
+                end
+            end
+        end
+    end
+    printf '%s\n' $hosts | sort -u
 end
 
 function __hifi_host_position

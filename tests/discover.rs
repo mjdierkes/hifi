@@ -1,8 +1,8 @@
+use hifi::url::Url;
 use hifi::{
     scan_document, scan_document_with_config, DocumentKind, DocumentScan, EvidenceKind, Extractor,
     NextConfig,
 };
-use url::Url;
 
 #[test]
 fn discovers_static_dynamic_and_framework_assets() {

@@ -14,22 +14,32 @@ use crate::scan::FindingsBuilder;
 use super::cache::{self, AssetData};
 use super::http::Client;
 use super::net;
+use crate::url::Url;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use lru::LruCache;
 use std::{
     collections::VecDeque,
     num::NonZeroUsize,
     sync::atomic::{AtomicBool, Ordering},
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
     time::Instant,
 };
-use url::Url;
+use tokio::sync::Semaphore;
 
 const ASSET_MEMORY_CACHE_MAX_ENTRIES: usize = 1024;
 pub const MAX_TOTAL_ASSETS: usize = 2048;
 const MAX_LOW_SIGNAL_ASSETS: usize = 64;
 const MAX_PREWARM_HOSTS: usize = 16;
+/// Cap on concurrent background revalidations across the whole process. A
+/// burst of stale-cache hits must not fan out into thousands of HTTP requests
+/// or thousands of in-flight task allocations.
+const MAX_REVALIDATIONS_IN_FLIGHT: usize = 32;
 static FIRST_ASSET_RESPONSE_TRACED: AtomicBool = AtomicBool::new(false);
+
+fn revalidation_semaphore() -> &'static Arc<Semaphore> {
+    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| Arc::new(Semaphore::new(MAX_REVALIDATIONS_IN_FLIGHT)))
+}
 
 pub type AssetMemoryCache = Arc<RwLock<LruCache<String, (Arc<AssetData>, Instant)>>>;
 
@@ -257,7 +267,6 @@ async fn fetch_scan(
     framework_config: FrameworkConfig,
 ) -> Result<ScannedAsset, (AssetRef, FetchFailure)> {
     let mut cached = None;
-    let mut cached_content_hash = None;
     if use_cache {
         let chunk_cache = cache::ChunkCache::new();
         if let Some(asset_data) = read_memory_asset(memory.as_ref(), &asset.url, cache_key) {
@@ -268,21 +277,32 @@ async fn fetch_scan(
         }
         if asset.kind == discover::AssetKind::Script {
             if let Some(chunk) = chunk_cache.read_fresh_url(&asset.url) {
-                let asset_data = Arc::new(chunk.data);
-                write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
+                write_memory_asset(memory.as_ref(), &asset.url, cache_key, chunk.data.clone());
                 return Ok(ScannedAsset {
-                    asset: asset_data,
+                    asset: chunk.data,
                     memory_hit: false,
                 });
             }
         }
         if asset.kind == discover::AssetKind::Script {
             if let Some(chunk) = chunk_cache.read_stale_url(&asset.url) {
-                cached_content_hash = Some(chunk.content_hash);
-                cached = Some(cache::CachedAsset {
-                    data: chunk.data,
-                    age_secs: chunk.age_secs,
-                    validators: chunk.validators,
+                // Stale-while-revalidate: hand the user cached findings now,
+                // refresh the bytes off the critical path. The user sees DRAM
+                // latency instead of an RTT.
+                write_memory_asset(memory.as_ref(), &asset.url, cache_key, chunk.data.clone());
+                spawn_revalidate_chunk(
+                    client.clone(),
+                    asset.clone(),
+                    chunk.validators.clone(),
+                    chunk.content_hash.clone(),
+                    cache_key.map(str::to_owned),
+                    framework_config.clone(),
+                    allow_private,
+                    memory.clone(),
+                );
+                return Ok(ScannedAsset {
+                    asset: chunk.data,
+                    memory_hit: false,
                 });
             }
         }
@@ -316,21 +336,13 @@ async fn fetch_scan(
     {
         FetchedBody::NotModified => {
             let cached = cached.ok_or_else(|| (asset.clone(), FetchFailure::Other))?;
-            cache::write_asset_with_validators(
+            let asset_data = Arc::new(cached.data);
+            cache::write_asset_with_validators_deferred(
                 &asset.url,
-                &cached.data,
+                asset_data.clone(),
                 cache_key,
                 &cached.validators,
             );
-            if let Some(content_hash) = cached_content_hash.as_deref() {
-                cache::ChunkCache::new().write(
-                    &asset.url,
-                    content_hash,
-                    &cached.data,
-                    &cached.validators,
-                );
-            }
-            let asset_data = Arc::new(cached.data);
             write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
             Ok(ScannedAsset {
                 asset: asset_data,
@@ -340,12 +352,17 @@ async fn fetch_scan(
         FetchedBody::Body(scan, validators, content_hash) => {
             let asset_data = Arc::new(*scan);
             if use_cache {
-                cache::write_asset_with_validators(&asset.url, &asset_data, cache_key, &validators);
+                cache::write_asset_with_validators_deferred(
+                    &asset.url,
+                    asset_data.clone(),
+                    cache_key,
+                    &validators,
+                );
                 if let Some(content_hash) = content_hash.as_deref() {
-                    cache::ChunkCache::new().write(
+                    cache::ChunkCache::new().write_deferred(
                         &asset.url,
                         content_hash,
-                        &asset_data,
+                        asset_data.clone(),
                         &validators,
                     );
                 }
@@ -364,16 +381,15 @@ fn read_memory_asset(
     url: &Url,
     cache_key: Option<&str>,
 ) -> Option<Arc<AssetData>> {
+    // Once an entry is in the in-process memory cache it stays valid for the
+    // life of the process. Staleness is acceptable: disk-tier
+    // stale-while-revalidate refreshes the underlying bytes; the LRU cap bounds
+    // memory growth.
     let memory = memory?;
     let key = memory_key(url, cache_key);
     let mut entries = memory.write().ok()?;
-    let (asset, written) = entries.get(&key).cloned()?;
-    if written.elapsed().as_secs() < cache::CACHE_FRESH_SECS {
-        Some(asset)
-    } else {
-        entries.pop(&key);
-        None
-    }
+    let (asset, _) = entries.get(&key).cloned()?;
+    Some(asset)
 }
 
 fn write_memory_asset(
@@ -519,6 +535,82 @@ fn trace_asset_status(url: &Url, status: u16) {
     if std::env::var_os("HIFI_TRACE_HTTP").is_some() {
         eprintln!("hifi: trace: asset status {} {status}", url.as_str());
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_revalidate_chunk(
+    client: Client,
+    asset: AssetRef,
+    cached_validators: cache::AssetValidators,
+    cached_content_hash: String,
+    cache_key: Option<String>,
+    framework_config: FrameworkConfig,
+    allow_private: bool,
+    memory: Option<AssetMemoryCache>,
+) {
+    let sem = revalidation_semaphore().clone();
+    // try_acquire instead of acquire: a burst of stale hits should drop excess
+    // background work rather than queue it. The disk cache is still valid, so
+    // skipping a revalidation just defers freshness until the next scan.
+    let Ok(permit) = sem.try_acquire_owned() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let _permit = permit;
+        let validators = (!cached_validators.is_empty()).then_some(&cached_validators);
+        let Ok(body) = fetch_asset_body(
+            &client,
+            asset.clone(),
+            allow_private,
+            validators,
+            framework_config,
+            true,
+        )
+        .await
+        else {
+            return;
+        };
+        match body {
+            FetchedBody::NotModified => {
+                // Server confirmed bytes unchanged: refresh validator sidecar
+                // timestamps so future scans treat the entry as fresh again.
+                if let Some(existing) = cache::ChunkCache::new().read_stale_url(&asset.url) {
+                    cache::ChunkCache::new().write_deferred(
+                        &asset.url,
+                        &cached_content_hash,
+                        existing.data,
+                        &cached_validators,
+                    );
+                }
+            }
+            FetchedBody::Body(scan, new_validators, content_hash) => {
+                let asset_data = Arc::new(*scan);
+                cache::write_asset_with_validators_deferred(
+                    &asset.url,
+                    asset_data.clone(),
+                    cache_key.as_deref(),
+                    &new_validators,
+                );
+                if let Some(hash) = content_hash.as_deref() {
+                    cache::ChunkCache::new().write_deferred(
+                        &asset.url,
+                        hash,
+                        asset_data.clone(),
+                        &new_validators,
+                    );
+                }
+                // Replace the stale entry the user already received with the
+                // fresh findings for any in-flight or upcoming work in this
+                // process that reads the memory cache.
+                write_memory_asset(
+                    memory.as_ref(),
+                    &asset.url,
+                    cache_key.as_deref(),
+                    asset_data,
+                );
+            }
+        }
+    });
 }
 
 fn asset_validators(headers: &[(String, String)]) -> cache::AssetValidators {

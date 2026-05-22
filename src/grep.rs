@@ -10,9 +10,9 @@ use crate::runtime::config::RuntimeConfig;
 use crate::runtime::fetch::MAX_TOTAL_ASSETS;
 use crate::runtime::http::Client;
 use crate::runtime::net;
+use crate::url::Url;
 use futures_util::{stream, StreamExt};
 use std::sync::Arc;
-use url::Url;
 
 const DEFAULT_MAX_HITS: usize = 50;
 const DEFAULT_MAX_BYTES_PER_HIT: usize = 200;

@@ -4,8 +4,8 @@ use crate::discover::{AssetKind, AssetRef, AssetSource, DocumentKind};
 use crate::scan::next::{self as parser, NextConfig};
 use crate::scan::{Extractor, FindingsBuilder, Shape};
 use crate::source::{self, TemplateMode};
+use crate::url::Url;
 use rustc_hash::FxHashSet;
-use url::Url;
 
 const NEXT_SKIP_FRAGMENTS: &[&str] = &[
     "framework-",

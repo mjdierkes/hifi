@@ -5,30 +5,55 @@
 //! consistent across page, asset, and grep fetches.
 
 use crate::runtime::http::{Client, Response};
+use crate::url::{Host, Url};
 use bytes::{Bytes, BytesMut};
-use std::{io, net::IpAddr};
-use thiserror::Error;
-use url::{Host, Url};
+use std::{fmt, io, net::IpAddr};
 
 pub const MAX_RESPONSE_BYTES: u64 = 50 * 1024 * 1024;
 pub const MAX_REDIRECTS: usize = 10;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum NetError {
-    #[error("unsupported URL scheme '{0}'")]
     BadScheme(String),
-    #[error(
-        "private or local addresses are blocked for '{0}' (set HIFI_ALLOW_PRIVATE=1 to allow)"
-    )]
     PrivateAddress(String),
-    #[error("response too large: {actual} bytes exceeds {limit} bytes")]
     ResponseTooLarge { actual: u64, limit: u64 },
-    #[error("failed to resolve '{0}': {1}")]
     Resolve(String, io::Error),
-    #[error("too many redirects for '{0}'")]
     TooManyRedirects(String),
-    #[error(transparent)]
-    Http(#[from] crate::runtime::http::Error),
+    Http(crate::runtime::http::Error),
+}
+
+impl fmt::Display for NetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadScheme(s) => write!(f, "unsupported URL scheme '{s}'"),
+            Self::PrivateAddress(u) => write!(
+                f,
+                "private or local addresses are blocked for '{u}' (set HIFI_ALLOW_PRIVATE=1 to allow)"
+            ),
+            Self::ResponseTooLarge { actual, limit } => {
+                write!(f, "response too large: {actual} bytes exceeds {limit} bytes")
+            }
+            Self::Resolve(u, e) => write!(f, "failed to resolve '{u}': {e}"),
+            Self::TooManyRedirects(u) => write!(f, "too many redirects for '{u}'"),
+            Self::Http(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for NetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Resolve(_, e) => Some(e),
+            Self::Http(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<crate::runtime::http::Error> for NetError {
+    fn from(e: crate::runtime::http::Error) -> Self {
+        Self::Http(e)
+    }
 }
 
 pub fn validate_url(url: &Url, allow_private: bool) -> Result<(), NetError> {

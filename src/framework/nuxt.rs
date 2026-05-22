@@ -3,8 +3,8 @@
 use crate::discover::{AssetKind, AssetRef, AssetSource};
 use crate::scan::{Extractor, Shape};
 use crate::source::{self, TemplateMode};
+use crate::url::Url;
 use rustc_hash::FxHashSet;
-use url::Url;
 
 const SKIP_FRAGMENTS: &[&str] = &[
     "/_nuxt/error-",

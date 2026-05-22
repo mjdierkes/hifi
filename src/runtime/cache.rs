@@ -9,19 +9,25 @@
 
 use crate::discover::DocumentScan;
 use crate::scan::FindingsBuilder;
+use crate::url::Url;
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock, RwLock},
     time::SystemTime,
 };
-use url::Url;
 
 const SCANNER_CACHE_VERSION: &str = env!("HIFI_BUILD_HASH");
 pub const CACHE_FRESH_SECS: u64 = 300;
 pub const CACHE_STALE_SECS: u64 = 3600;
 pub const CHUNK_URL_FRESH_SECS: u64 = 24 * 60 * 60;
-pub const CHUNK_URL_STALE_SECS: u64 = 7 * 24 * 60 * 60;
+/// Wide stale window because every stale hit returns instantly and triggers a
+/// background revalidate. Past this point we still revalidate in the
+/// foreground via a conditional GET; the content cache makes that cheap.
+pub const CHUNK_URL_STALE_SECS: u64 = 30 * 24 * 60 * 60;
 const CHUNK_CACHE_MAX_BYTES: u64 = 500 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -49,8 +55,14 @@ impl ScanCache {
         read_fresh(&binary_path_for(&self.path), CACHE_STALE_SECS).map(|(bytes, _)| bytes)
     }
 
+    #[allow(dead_code)]
     pub fn write_binary(&self, bytes: &[u8]) {
         write_bytes(&binary_path_for(&self.path), bytes);
+    }
+
+    pub fn write_binary_deferred(&self, bytes: Arc<[u8]>) {
+        let path = binary_path_for(&self.path);
+        spawn_cache_write(move || write_bytes(&path, &bytes));
     }
 }
 
@@ -63,17 +75,39 @@ impl ChunkCache {
     }
 
     pub fn read_fresh_url(&self, url: &Url) -> Option<CachedChunk> {
-        read_chunk_url(url, CHUNK_URL_FRESH_SECS)
+        if let Some(entry) = url_index_memory_get(url) {
+            if entry.age_secs < CHUNK_URL_FRESH_SECS {
+                return Some(entry.into_cached());
+            }
+        }
+        let cached = read_chunk_url(url, CHUNK_URL_FRESH_SECS)?;
+        url_index_memory_put(url, &cached);
+        Some(cached)
     }
 
     pub fn read_stale_url(&self, url: &Url) -> Option<CachedChunk> {
-        read_chunk_url(url, CHUNK_URL_STALE_SECS)
+        if let Some(entry) = url_index_memory_get(url) {
+            if entry.age_secs < CHUNK_URL_STALE_SECS {
+                return Some(entry.into_cached());
+            }
+        }
+        let cached = read_chunk_url(url, CHUNK_URL_STALE_SECS)?;
+        url_index_memory_put(url, &cached);
+        Some(cached)
     }
 
     pub fn read_content_findings(&self, content_hash: &str) -> Option<FindingsBuilder> {
-        read_chunk_findings(content_hash)
+        if let Some(findings) = content_memory_get(content_hash) {
+            // Memory cache stores Arc<FindingsBuilder> so the hot path is a
+            // pointer clone, not a deep clone of the findings struct.
+            return Some((*findings).clone());
+        }
+        let findings = read_chunk_findings(content_hash)?;
+        content_memory_put(content_hash, &findings);
+        Some(findings)
     }
 
+    #[allow(dead_code)]
     pub fn write(
         &self,
         url: &Url,
@@ -81,7 +115,153 @@ impl ChunkCache {
         asset: &AssetData,
         validators: &AssetValidators,
     ) {
-        write_chunk(url, content_hash, asset, validators);
+        self.write_arc(url, content_hash, Arc::new(asset.clone()), validators);
+    }
+
+    #[allow(dead_code)]
+    pub fn write_arc(
+        &self,
+        url: &Url,
+        content_hash: &str,
+        asset: Arc<AssetData>,
+        validators: &AssetValidators,
+    ) {
+        content_memory_put(content_hash, &asset.findings);
+        url_index_memory_put(
+            url,
+            &CachedChunk {
+                data: asset.clone(),
+                age_secs: 0,
+                validators: validators.clone(),
+                content_hash: content_hash.to_owned(),
+            },
+        );
+        write_chunk(url, content_hash, &asset, validators);
+    }
+
+    pub fn write_deferred(
+        &self,
+        url: &Url,
+        content_hash: &str,
+        asset: Arc<AssetData>,
+        validators: &AssetValidators,
+    ) {
+        content_memory_put(content_hash, &asset.findings);
+        url_index_memory_put(
+            url,
+            &CachedChunk {
+                data: asset.clone(),
+                age_secs: 0,
+                validators: validators.clone(),
+                content_hash: content_hash.to_owned(),
+            },
+        );
+        let url = url.clone();
+        let content_hash = content_hash.to_owned();
+        let validators = validators.clone();
+        spawn_cache_write(move || write_chunk(&url, &content_hash, &asset, &validators));
+    }
+}
+
+#[derive(Clone)]
+struct UrlIndexEntry {
+    data: Arc<AssetData>,
+    validators: AssetValidators,
+    content_hash: String,
+    inserted_at: SystemTime,
+}
+
+impl UrlIndexEntry {
+    fn age_secs(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(self.inserted_at)
+            .map(|d| d.as_secs())
+            .unwrap_or(u64::MAX)
+    }
+}
+
+struct UrlIndexHit {
+    entry: UrlIndexEntry,
+    age_secs: u64,
+}
+
+impl UrlIndexHit {
+    fn into_cached(self) -> CachedChunk {
+        CachedChunk {
+            data: self.entry.data,
+            age_secs: self.age_secs,
+            validators: self.entry.validators,
+            content_hash: self.entry.content_hash,
+        }
+    }
+}
+
+// Conservative caps: each entry holds a full DocumentScan or findings struct,
+// which can run into tens of KB on big chunks. The caps below put the
+// worst-case ceiling for both LRUs around ~50 MB combined.
+const URL_INDEX_MEMORY_MAX_ENTRIES: usize = 1024;
+const CONTENT_MEMORY_MAX_ENTRIES: usize = 512;
+
+/// Process-wide in-memory cache: chunk URL -> latest known index entry.
+///
+/// LRU-bounded so a long-running daemon scanning many sites cannot grow it
+/// without limit. Disk remains the source of truth past the cap.
+fn url_index_memory() -> &'static RwLock<LruCache<String, UrlIndexEntry>> {
+    static MEMORY: OnceLock<RwLock<LruCache<String, UrlIndexEntry>>> = OnceLock::new();
+    MEMORY.get_or_init(|| {
+        RwLock::new(LruCache::new(
+            NonZeroUsize::new(URL_INDEX_MEMORY_MAX_ENTRIES).expect("nonzero cache size"),
+        ))
+    })
+}
+
+fn url_index_memory_get(url: &Url) -> Option<UrlIndexHit> {
+    let mut map = url_index_memory().write().ok()?;
+    let entry = map.get(url.as_str())?.clone();
+    let age_secs = entry.age_secs();
+    Some(UrlIndexHit { entry, age_secs })
+}
+
+fn url_index_memory_put(url: &Url, cached: &CachedChunk) {
+    if let Ok(mut map) = url_index_memory().write() {
+        map.put(
+            url.as_str().to_owned(),
+            UrlIndexEntry {
+                data: cached.data.clone(),
+                validators: cached.validators.clone(),
+                content_hash: cached.content_hash.clone(),
+                inserted_at: SystemTime::now()
+                    .checked_sub(std::time::Duration::from_secs(cached.age_secs))
+                    .unwrap_or_else(SystemTime::now),
+            },
+        );
+    }
+}
+
+/// Process-wide in-memory cache: content_hash -> findings.
+///
+/// Different URLs serving identical chunk bytes (same framework version across
+/// sites) collapse to a single entry. Values are reference-counted so hits are
+/// pointer clones, not deep copies of the findings struct.
+fn content_memory() -> &'static RwLock<LruCache<String, Arc<FindingsBuilder>>> {
+    static MEMORY: OnceLock<RwLock<LruCache<String, Arc<FindingsBuilder>>>> = OnceLock::new();
+    MEMORY.get_or_init(|| {
+        RwLock::new(LruCache::new(
+            NonZeroUsize::new(CONTENT_MEMORY_MAX_ENTRIES).expect("nonzero cache size"),
+        ))
+    })
+}
+
+fn content_memory_get(content_hash: &str) -> Option<Arc<FindingsBuilder>> {
+    content_memory().write().ok()?.get(content_hash).cloned()
+}
+
+fn content_memory_put(content_hash: &str, findings: &FindingsBuilder) {
+    if let Ok(mut map) = content_memory().write() {
+        if map.contains(content_hash) {
+            return;
+        }
+        map.put(content_hash.to_owned(), Arc::new(findings.clone()));
     }
 }
 
@@ -147,7 +327,8 @@ struct ChunkIndex {
 }
 
 pub struct CachedChunk {
-    pub data: AssetData,
+    pub data: Arc<AssetData>,
+    #[allow(dead_code)]
     pub age_secs: u64,
     pub validators: AssetValidators,
     pub content_hash: String,
@@ -164,6 +345,7 @@ pub fn read_asset_cached(url: &Url, cache_key: Option<&str>) -> Option<CachedAss
     })
 }
 
+#[allow(dead_code)]
 pub fn write_asset_with_validators(
     url: &Url,
     asset: &AssetData,
@@ -178,6 +360,25 @@ pub fn write_asset_with_validators(
             validators: validators.clone(),
         },
     );
+}
+
+pub fn write_asset_with_validators_deferred(
+    url: &Url,
+    asset: Arc<AssetData>,
+    cache_key: Option<&str>,
+    validators: &AssetValidators,
+) {
+    let path = asset_path_for(url, cache_key);
+    let validators = validators.clone();
+    spawn_cache_write(move || {
+        write_json(
+            &path,
+            &AssetEnvelope {
+                data: (*asset).clone(),
+                validators,
+            },
+        );
+    });
 }
 
 fn read_chunk_findings(content_hash: &str) -> Option<FindingsBuilder> {
@@ -206,11 +407,19 @@ fn read_chunk_url(url: &Url, max_age_secs: u64) -> Option<CachedChunk> {
     let (bytes, age_secs) = read_fresh(&chunk_index_path_for(url), max_age_secs)?;
     let index: ChunkIndex = serde_json::from_slice(&bytes).ok()?;
     Some(CachedChunk {
-        data: index.data,
+        data: Arc::new(index.data),
         age_secs,
         validators: index.validators,
         content_hash: index.content_hash,
     })
+}
+
+fn spawn_cache_write(write: impl FnOnce() + Send + 'static) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(write);
+    } else {
+        write();
+    }
 }
 
 fn chunk_index_path_for(url: &Url) -> PathBuf {
@@ -360,9 +569,28 @@ pub fn cached_hosts() -> Vec<String> {
 }
 
 fn dir() -> PathBuf {
-    directories::ProjectDirs::from("", "", "hifi")
-        .map(|dirs| dirs.cache_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from(".").join(".cache").join("hifi"))
+    platform_cache_dir().unwrap_or_else(|| PathBuf::from(".").join(".cache").join("hifi"))
+}
+
+#[cfg(target_os = "macos")]
+fn platform_cache_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join("Library/Caches/hifi"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_cache_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(xdg).join("hifi"));
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".cache").join("hifi"))
+}
+
+#[cfg(windows)]
+fn platform_cache_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("APPDATA"))?;
+    Some(PathBuf::from(base).join("hifi").join("Cache"))
 }
 
 #[cfg(unix)]

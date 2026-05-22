@@ -2,8 +2,8 @@ use crate::discover::{AssetKind, DocumentKind};
 use crate::scan::next::NextConfig;
 use crate::scan::{Extractor, FindingsBuilder, Shape};
 use crate::source;
+use crate::url::Url;
 use serde::{Deserialize, Serialize};
-use url::Url;
 
 pub mod astro;
 pub mod next;
