@@ -515,27 +515,12 @@ fn object_static_value(
     keys: &[&[u8]],
     bindings: &FxHashMap<String, String>,
 ) -> Option<String> {
-    for key in keys {
-        let mut offset = 0;
-        while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
-            let pos = offset + rel;
-            if !source::is_identifier_boundary_before(bytes, pos) {
-                offset = pos + 1;
-                continue;
-            }
-            let mut i = source::skip_ws(bytes, pos + key.len());
-            if bytes.get(i) != Some(&b':') {
-                offset = pos + 1;
-                continue;
-            }
-            i = source::skip_ws(bytes, i + 1);
-            if let Some((value, _)) = static_string_expr(bytes, i, bindings) {
-                return Some(value);
-            }
-            offset = pos + 1;
+    find_object_key_values(bytes, keys, |i| {
+        if let Some((value, _)) = static_string_expr(bytes, i, bindings) {
+            return Some(value);
         }
-    }
-    None
+        None
+    })
 }
 
 fn static_string_expr(
@@ -652,6 +637,16 @@ fn apiish_receiver_context(bytes: &[u8], dot: usize) -> bool {
 }
 
 fn object_string_value(bytes: &[u8], keys: &[&[u8]]) -> Option<String> {
+    find_object_key_values(bytes, keys, |i| {
+        matches!(bytes.get(i), Some(b'"' | b'\'' | b'`')).then(|| extract::url_arg(bytes, i))?
+    })
+}
+
+fn find_object_key_values<T>(
+    bytes: &[u8],
+    keys: &[&[u8]],
+    mut found: impl FnMut(usize) -> Option<T>,
+) -> Option<T> {
     for key in keys {
         let mut offset = 0;
         while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
@@ -666,8 +661,8 @@ fn object_string_value(bytes: &[u8], keys: &[&[u8]]) -> Option<String> {
                 continue;
             }
             i = source::skip_ws(bytes, i + 1);
-            if matches!(bytes.get(i), Some(b'"' | b'\'' | b'`')) {
-                return extract::url_arg(bytes, i);
+            if let Some(value) = found(i) {
+                return Some(value);
             }
             offset = pos + 1;
         }
