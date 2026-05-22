@@ -146,6 +146,19 @@ fn push_asset(
     }
 }
 
+fn path_contains_any(path: &str, fragments: &[&str]) -> bool {
+    fragments.iter().any(|fragment| path.contains(fragment))
+}
+
+fn route_from_suffix(base: &Url, suffix: &str) -> Option<String> {
+    let route = base.path().strip_suffix(suffix)?;
+    Some(if route.is_empty() {
+        "/".to_owned()
+    } else {
+        route.to_owned()
+    })
+}
+
 pub fn classify_asset(raw: &str) -> Option<AssetKind> {
     let path = raw.split(['?', '#']).next().unwrap_or(raw);
     if MANIFEST_POLICIES.iter().any(|policy| policy(path)) {

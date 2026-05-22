@@ -20,10 +20,7 @@ pub fn is_context(bytes: &[u8], base: &Url) -> bool {
 }
 
 pub fn should_skip(url: &Url) -> bool {
-    let path = url.path();
-    SKIP_FRAGMENTS
-        .iter()
-        .any(|fragment| path.contains(fragment))
+    super::path_contains_any(url.path(), SKIP_FRAGMENTS)
 }
 
 pub fn is_manifest(path: &str) -> bool {

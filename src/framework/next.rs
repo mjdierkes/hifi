@@ -160,10 +160,7 @@ pub fn resolve_asset(base: &Url, raw: &str, context: bool) -> Option<Url> {
 
 pub fn should_skip(url: &Url) -> bool {
     let path = url.path();
-    path.contains("/_next/")
-        && NEXT_SKIP_FRAGMENTS
-            .iter()
-            .any(|fragment| path.contains(fragment))
+    path.contains("/_next/") && super::path_contains_any(path, NEXT_SKIP_FRAGMENTS)
 }
 
 pub fn is_manifest(path: &str) -> bool {

@@ -26,10 +26,7 @@ pub fn is_context(bytes: &[u8], base: &Url) -> bool {
 
 pub fn should_skip(url: &Url) -> bool {
     let path = url.path();
-    path.contains("/_nuxt/")
-        && SKIP_FRAGMENTS
-            .iter()
-            .any(|fragment| path.contains(fragment))
+    path.contains("/_nuxt/") && super::path_contains_any(path, SKIP_FRAGMENTS)
 }
 
 pub fn is_payload(raw: &str, path: &str) -> bool {
@@ -68,13 +65,7 @@ pub fn resolve_context_asset(base: &Url, raw: &str, context: bool) -> Option<Url
 }
 
 pub fn route_from_payload(base: &Url) -> Option<String> {
-    let path = base.path();
-    let route = path.strip_suffix("/_payload.json")?;
-    Some(if route.is_empty() {
-        "/".to_owned()
-    } else {
-        route.to_owned()
-    })
+    super::route_from_suffix(base, "/_payload.json")
 }
 
 pub fn record_routes(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {

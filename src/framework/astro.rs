@@ -16,10 +16,7 @@ pub fn is_context(bytes: &[u8], base: &Url) -> bool {
 
 pub fn should_skip(url: &Url) -> bool {
     let path = url.path();
-    path.contains("/_astro/")
-        && SKIP_FRAGMENTS
-            .iter()
-            .any(|fragment| path.contains(fragment))
+    path.contains("/_astro/") && super::path_contains_any(path, SKIP_FRAGMENTS)
 }
 
 pub fn is_payload(raw: &str, path: &str) -> bool {

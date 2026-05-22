@@ -33,10 +33,7 @@ pub fn is_context(bytes: &[u8], base: &Url) -> bool {
 
 pub fn should_skip(url: &Url) -> bool {
     let path = url.path();
-    path.contains("/immutable/")
-        && SKIP_FRAGMENTS
-            .iter()
-            .any(|fragment| path.contains(fragment))
+    path.contains("/immutable/") && super::path_contains_any(path, SKIP_FRAGMENTS)
 }
 
 pub fn is_manifest(path: &str) -> bool {
@@ -80,13 +77,7 @@ pub fn resolve_context_asset(
 }
 
 pub fn route_from_payload(base: &Url) -> Option<String> {
-    let path = base.path();
-    let route = path.strip_suffix("/__data.json")?;
-    Some(if route.is_empty() {
-        "/".to_owned()
-    } else {
-        route.to_owned()
-    })
+    super::route_from_suffix(base, "/__data.json")
 }
 
 pub fn data_path_for_route(route: &str) -> Option<String> {
