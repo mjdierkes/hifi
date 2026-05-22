@@ -1,6 +1,6 @@
 use super::Error;
+use crate::hash::FxHashMap;
 use crate::url::Url;
-use rustc_hash::FxHashMap;
 use std::{
     io,
     net::SocketAddr,

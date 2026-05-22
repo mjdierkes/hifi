@@ -16,8 +16,7 @@ use super::processor::{
     Processor,
 };
 #[cfg(unix)]
-use rustc_hash::FxHashMap;
-use serde::{Deserialize, Serialize};
+use crate::hash::FxHashMap;
 use std::io;
 #[cfg(unix)]
 use std::{
@@ -40,8 +39,6 @@ type SharedScan = Arc<std::result::Result<Body, DaemonReply>>;
 #[cfg(unix)]
 type Inflight = Arc<Mutex<FxHashMap<String, Vec<oneshot::Sender<SharedScan>>>>>;
 #[cfg(unix)]
-const DAEMON_PROTOCOL: &str = "hifi-daemon-v1";
-#[cfg(unix)]
 const MAX_DAEMON_REQUEST_BYTES: usize = 8192;
 const MAX_DAEMON_REPLY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -49,22 +46,23 @@ const MAX_DAEMON_REPLY_BYTES: usize = 16 * 1024 * 1024;
 pub enum DaemonError {
     #[error(transparent)]
     Io(#[from] io::Error),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
+    #[error("daemon wire decode failed")]
+    WireDecode,
     #[error(transparent)]
     Runtime(#[from] super::processor::RuntimeError),
     #[error(transparent)]
     Utf8(#[from] std::str::Utf8Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
     #[cfg(not(unix))]
     #[error("daemon is unsupported on this platform; run scans without the daemon")]
     UnsupportedPlatform,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct DaemonReply {
     pub exit_code: i32,
     pub stdout: String,
-    #[serde(default)]
     pub stderr: String,
 }
 
@@ -76,16 +74,14 @@ pub enum DaemonRequest {
 }
 
 #[cfg(unix)]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DaemonIdentity {
     version: String,
     build: String,
 }
 
 #[cfg(unix)]
-#[derive(Debug, Serialize, Deserialize)]
 struct WireRequest {
-    protocol: String,
     client: DaemonIdentity,
     no_cache: bool,
     url: String,
@@ -95,7 +91,6 @@ struct WireRequest {
 impl WireRequest {
     fn scan(url: &str, no_cache: bool) -> Self {
         Self {
-            protocol: DAEMON_PROTOCOL.to_string(),
             client: current_identity(),
             no_cache,
             url: url.to_string(),
@@ -104,12 +99,9 @@ impl WireRequest {
 }
 
 #[cfg(unix)]
-#[derive(Debug, Serialize, Deserialize)]
 struct WireReply {
-    protocol: String,
     daemon: DaemonIdentity,
     status: WireStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
     reply: Option<DaemonReply>,
 }
 
@@ -117,7 +109,6 @@ struct WireReply {
 impl WireReply {
     fn ok(reply: DaemonReply) -> Self {
         Self {
-            protocol: DAEMON_PROTOCOL.to_string(),
             daemon: current_identity(),
             status: WireStatus::Ok,
             reply: Some(reply),
@@ -126,7 +117,6 @@ impl WireReply {
 
     fn version_mismatch() -> Self {
         Self {
-            protocol: DAEMON_PROTOCOL.to_string(),
             daemon: current_identity(),
             status: WireStatus::VersionMismatch,
             reply: None,
@@ -135,11 +125,172 @@ impl WireReply {
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WireStatus {
     Ok,
     VersionMismatch,
+}
+
+// Binary wire format. The magic bytes identify the protocol and gate version
+// compatibility: a daemon and CLI built from different versions will fail to
+// decode each other's messages and the stale daemon will retire.
+#[cfg(unix)]
+const WIRE_REQUEST_MAGIC: &[u8; 8] = b"HIFIRQ2\0";
+#[cfg(unix)]
+const WIRE_REPLY_MAGIC: &[u8; 8] = b"HIFIRP2\0";
+
+#[cfg(unix)]
+fn put_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(unix)]
+fn put_string(out: &mut Vec<u8>, value: &str) {
+    put_u32(out, value.len() as u32);
+    out.extend_from_slice(value.as_bytes());
+}
+
+#[cfg(unix)]
+fn put_identity(out: &mut Vec<u8>, id: &DaemonIdentity) {
+    put_string(out, &id.version);
+    put_string(out, &id.build);
+}
+
+#[cfg(unix)]
+struct WireReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+#[cfg(unix)]
+impl<'a> WireReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+    fn expect_magic(&mut self, magic: &[u8; 8]) -> Option<()> {
+        let slice = self.bytes.get(self.pos..self.pos + 8)?;
+        if slice != magic {
+            return None;
+        }
+        self.pos += 8;
+        Some(())
+    }
+    fn u8(&mut self) -> Option<u8> {
+        let b = *self.bytes.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+    fn i32(&mut self) -> Option<i32> {
+        let slice = self.bytes.get(self.pos..self.pos + 4)?;
+        self.pos += 4;
+        Some(i32::from_le_bytes(slice.try_into().ok()?))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        let slice = self.bytes.get(self.pos..self.pos + 4)?;
+        self.pos += 4;
+        Some(u32::from_le_bytes(slice.try_into().ok()?))
+    }
+    fn string(&mut self) -> Option<String> {
+        let len = self.u32()? as usize;
+        let slice = self.bytes.get(self.pos..self.pos + len)?;
+        self.pos += len;
+        std::str::from_utf8(slice).ok().map(str::to_owned)
+    }
+    fn identity(&mut self) -> Option<DaemonIdentity> {
+        Some(DaemonIdentity {
+            version: self.string()?,
+            build: self.string()?,
+        })
+    }
+    fn finish(&self) -> Option<()> {
+        (self.pos == self.bytes.len()).then_some(())
+    }
+}
+
+#[cfg(unix)]
+impl WireRequest {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64 + self.url.len());
+        out.extend_from_slice(WIRE_REQUEST_MAGIC);
+        put_identity(&mut out, &self.client);
+        out.push(self.no_cache as u8);
+        put_string(&mut out, &self.url);
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = WireReader::new(bytes);
+        r.expect_magic(WIRE_REQUEST_MAGIC)?;
+        let client = r.identity()?;
+        let no_cache = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let url = r.string()?;
+        r.finish()?;
+        Some(Self {
+            client,
+            no_cache,
+            url,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl WireReply {
+    fn encode(&self) -> Vec<u8> {
+        let approx = 32
+            + self.daemon.version.len()
+            + self.daemon.build.len()
+            + self
+                .reply
+                .as_ref()
+                .map_or(0, |r| r.stdout.len() + r.stderr.len() + 16);
+        let mut out = Vec::with_capacity(approx);
+        out.extend_from_slice(WIRE_REPLY_MAGIC);
+        put_identity(&mut out, &self.daemon);
+        out.push(match self.status {
+            WireStatus::Ok => 0,
+            WireStatus::VersionMismatch => 1,
+        });
+        match &self.reply {
+            Some(reply) => {
+                out.push(1);
+                out.extend_from_slice(&reply.exit_code.to_le_bytes());
+                put_string(&mut out, &reply.stdout);
+                put_string(&mut out, &reply.stderr);
+            }
+            None => out.push(0),
+        }
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = WireReader::new(bytes);
+        r.expect_magic(WIRE_REPLY_MAGIC)?;
+        let daemon = r.identity()?;
+        let status = match r.u8()? {
+            0 => WireStatus::Ok,
+            1 => WireStatus::VersionMismatch,
+            _ => return None,
+        };
+        let reply = match r.u8()? {
+            0 => None,
+            1 => Some(DaemonReply {
+                exit_code: r.i32()?,
+                stdout: r.string()?,
+                stderr: r.string()?,
+            }),
+            _ => return None,
+        };
+        r.finish()?;
+        Some(Self {
+            daemon,
+            status,
+            reply,
+        })
+    }
 }
 
 #[cfg(unix)]
@@ -219,10 +370,7 @@ pub async fn request(url: &str, no_cache: bool) -> DaemonRequest {
         Err(_) => return DaemonRequest::Unavailable,
     };
     let peer_pid = peer_pid(&stream);
-    let body = match serde_json::to_vec(&WireRequest::scan(url, no_cache)) {
-        Ok(body) => body,
-        Err(_) => return DaemonRequest::Unavailable,
-    };
+    let body = WireRequest::scan(url, no_cache).encode();
     if stream.write_all(&body).await.is_err() || stream.shutdown().await.is_err() {
         return DaemonRequest::Unavailable;
     }
@@ -239,17 +387,14 @@ pub async fn request(url: &str, no_cache: bool) -> DaemonRequest {
     if buf.len() > MAX_DAEMON_REPLY_BYTES {
         return DaemonRequest::Unavailable;
     }
-    let reply = match serde_json::from_slice::<WireReply>(&buf) {
-        Ok(reply) => reply,
-        Err(_) => {
+    let reply = match WireReply::decode(&buf) {
+        Some(reply) => reply,
+        None => {
             retire_daemon(peer_pid);
             return DaemonRequest::StaleDaemon;
         }
     };
-    if reply.protocol != DAEMON_PROTOCOL
-        || reply.daemon != current_identity()
-        || reply.status == WireStatus::VersionMismatch
-    {
+    if reply.daemon != current_identity() || reply.status == WireStatus::VersionMismatch {
         retire_daemon(peer_pid);
         return DaemonRequest::StaleDaemon;
     }
@@ -404,9 +549,9 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
         )
         .await;
     }
-    let wire = match serde_json::from_slice::<WireRequest>(&req) {
-        Ok(wire) if wire.protocol == DAEMON_PROTOCOL => wire,
-        _ => {
+    let wire = match WireRequest::decode(&req) {
+        Some(wire) => wire,
+        None => {
             reply_wire(&mut stream, WireReply::version_mismatch()).await?;
             std::process::exit(0);
         }
@@ -523,8 +668,8 @@ async fn reply(stream: &mut UnixStream, body: DaemonReply) -> Result {
 
 #[cfg(unix)]
 async fn reply_wire(stream: &mut UnixStream, body: WireReply) -> Result {
-    let body = serde_json::to_string(&body)?;
-    stream.write_all(body.as_bytes()).await?;
+    let body = body.encode();
+    stream.write_all(&body).await?;
     Ok(())
 }
 
@@ -601,10 +746,72 @@ mod tests {
     fn wire_request_carries_current_identity() {
         let request = WireRequest::scan("https://example.com/", true);
 
-        assert_eq!(request.protocol, DAEMON_PROTOCOL);
         assert_eq!(request.client, current_identity());
         assert!(request.no_cache);
         assert_eq!(request.url, "https://example.com/");
+    }
+
+    #[test]
+    fn wire_request_roundtrips_through_binary() {
+        let original = WireRequest::scan("https://example.com/foo?q=1", true);
+        let bytes = original.encode();
+        let decoded = WireRequest::decode(&bytes).expect("decode");
+        assert_eq!(decoded.client, original.client);
+        assert_eq!(decoded.no_cache, original.no_cache);
+        assert_eq!(decoded.url, original.url);
+    }
+
+    #[test]
+    fn wire_reply_roundtrips_through_binary() {
+        let original = WireReply::ok(DaemonReply {
+            exit_code: 42,
+            stdout: "hello".into(),
+            stderr: "warn\n".into(),
+        });
+        let bytes = original.encode();
+        let decoded = WireReply::decode(&bytes).expect("decode");
+        assert_eq!(decoded.daemon, original.daemon);
+        assert_eq!(decoded.status, original.status);
+        let reply = decoded.reply.expect("reply present");
+        assert_eq!(reply.exit_code, 42);
+        assert_eq!(reply.stdout, "hello");
+        assert_eq!(reply.stderr, "warn\n");
+    }
+
+    #[test]
+    fn wire_reply_with_no_payload_roundtrips() {
+        let original = WireReply::version_mismatch();
+        let bytes = original.encode();
+        let decoded = WireReply::decode(&bytes).expect("decode");
+        assert_eq!(decoded.status, WireStatus::VersionMismatch);
+        assert!(decoded.reply.is_none());
+    }
+
+    #[test]
+    fn wire_decode_rejects_wrong_magic() {
+        let mut bytes = WireRequest::scan("https://example.com/", false).encode();
+        bytes[0] = b'X';
+        assert!(WireRequest::decode(&bytes).is_none());
+    }
+
+    #[test]
+    fn wire_decode_rejects_trailing_bytes() {
+        let mut bytes = WireRequest::scan("https://example.com/", false).encode();
+        bytes.push(0);
+        assert!(WireRequest::decode(&bytes).is_none());
+
+        let mut bytes = WireReply::version_mismatch().encode();
+        bytes.push(0);
+        assert!(WireReply::decode(&bytes).is_none());
+    }
+
+    #[test]
+    fn wire_request_rejects_invalid_bool() {
+        let mut bytes = WireRequest::scan("https://example.com/", false).encode();
+        let bool_pos =
+            8 + 4 + current_identity().version.len() + 4 + current_identity().build.len();
+        bytes[bool_pos] = 2;
+        assert!(WireRequest::decode(&bytes).is_none());
     }
 
     #[test]

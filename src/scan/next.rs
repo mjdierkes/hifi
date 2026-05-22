@@ -217,21 +217,80 @@ pub fn parse_build_manifest_js(bytes: &[u8]) -> Vec<String> {
         return Vec::new();
     };
     let literal = &bytes[i..=end];
-    let json = match coerce_object_literal_to_json(literal) {
-        Some(s) => s,
-        None => return Vec::new(),
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) else {
-        return Vec::new();
-    };
-    let Some(obj) = value.as_object() else {
-        return Vec::new();
-    };
-    obj.keys()
-        .filter(|k| k.starts_with('/'))
-        .filter(|k| !matches!(k.as_str(), "/_app" | "/_error" | "/_document"))
-        .cloned()
-        .collect()
+    extract_top_level_route_keys(literal)
+}
+
+/// Walk a JS object literal at depth 1 and collect top-level keys that look
+/// like route paths. Skips nested objects/arrays and value strings. Handles
+/// quoted (`"` / `'`) and bare-identifier keys.
+fn extract_top_level_route_keys(literal: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    if literal.first() != Some(&b'{') {
+        return out;
+    }
+    let mut i = 1;
+    let mut depth: i32 = 0;
+    let mut expect_key = true;
+    while i < literal.len() {
+        let b = literal[i];
+        match b {
+            b'{' | b'[' => {
+                depth += 1;
+                expect_key = false;
+                i += 1;
+            }
+            b'}' | b']' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                i += 1;
+            }
+            b',' if depth == 0 => {
+                expect_key = true;
+                i += 1;
+            }
+            b':' if depth == 0 => {
+                expect_key = false;
+                i += 1;
+            }
+            b'"' | b'\'' => {
+                let quote = b;
+                let start = i + 1;
+                let mut j = start;
+                while j < literal.len() && literal[j] != quote {
+                    if literal[j] == b'\\' && j + 1 < literal.len() {
+                        j += 2;
+                        continue;
+                    }
+                    j += 1;
+                }
+                if expect_key && depth == 0 {
+                    if let Ok(s) = std::str::from_utf8(&literal[start..j]) {
+                        if s.starts_with('/') && !matches!(s, "/_app" | "/_error" | "/_document") {
+                            out.push(s.to_string());
+                        }
+                    }
+                }
+                i = j + 1;
+            }
+            b if b.is_ascii_whitespace() => i += 1,
+            b if expect_key
+                && depth == 0
+                && (b == b'_' || b == b'$' || b.is_ascii_alphabetic()) =>
+            {
+                // Bare identifier key — not a route (routes always start with '/'
+                // and must therefore be quoted). Skip the identifier.
+                if let Some(ident) = source::identifier_at(literal, i) {
+                    i += ident.len();
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
 }
 
 fn locate_build_manifest_object(bytes: &[u8]) -> Option<usize> {
@@ -251,121 +310,22 @@ fn locate_build_manifest_inline(bytes: &[u8]) -> Option<usize> {
     (bytes.get(i) == Some(&b'{')).then_some(i)
 }
 
-/// Convert a JavaScript object literal with unquoted keys and single-quoted
-/// strings into a JSON-parseable string. This is intentionally narrow: it
-/// handles what `_buildManifest.js` actually emits (string keys, string
-/// values, arrays of strings, numeric literals) and refuses anything else.
-fn coerce_object_literal_to_json(bytes: &[u8]) -> Option<String> {
-    let mut out = String::with_capacity(bytes.len());
-    let mut i = 0;
-    let mut stack: Vec<u8> = Vec::new();
-    let mut expect_key = false;
-    while i < bytes.len() {
-        let b = bytes[i];
-        let in_object = stack.last() == Some(&b'{');
-        match b {
-            b'{' => {
-                out.push('{');
-                stack.push(b'{');
-                expect_key = true;
-                i += 1;
-            }
-            b'[' => {
-                out.push('[');
-                stack.push(b'[');
-                expect_key = false;
-                i += 1;
-            }
-            b'}' | b']' => {
-                out.push(b as char);
-                stack.pop();
-                expect_key = stack.last() == Some(&b'{');
-                i += 1;
-            }
-            b':' => {
-                out.push(':');
-                expect_key = false;
-                i += 1;
-            }
-            b',' => {
-                out.push(',');
-                expect_key = in_object;
-                i += 1;
-            }
-            b'"' | b'\'' => {
-                let quote = b;
-                let mut j = i + 1;
-                out.push('"');
-                while j < bytes.len() && bytes[j] != quote {
-                    if bytes[j] == b'\\' && j + 1 < bytes.len() {
-                        out.push(bytes[j] as char);
-                        out.push(bytes[j + 1] as char);
-                        j += 2;
-                        continue;
-                    }
-                    if bytes[j] == b'"' && quote == b'\'' {
-                        out.push('\\');
-                    }
-                    out.push(bytes[j] as char);
-                    j += 1;
-                }
-                out.push('"');
-                i = j + 1;
-            }
-            b if b.is_ascii_whitespace() => i += 1,
-            b if b == b'_' || b == b'$' || b.is_ascii_alphabetic() => {
-                let ident_bytes = source::identifier_at(bytes, i)?;
-                i += ident_bytes.len();
-                let ident = std::str::from_utf8(ident_bytes).ok()?;
-                if expect_key {
-                    out.push('"');
-                    out.push_str(ident);
-                    out.push('"');
-                    expect_key = false;
-                } else if matches!(ident, "true" | "false" | "null") {
-                    out.push_str(ident);
-                } else {
-                    // Bare identifier in value position (a closure parameter
-                    // referenced inside the returned literal). We don't need
-                    // chunk URLs from this manifest, only route keys, so
-                    // substitute null and move on.
-                    out.push_str("null");
-                }
-            }
-            b if b.is_ascii_digit() || b == b'-' => {
-                let num_start = i;
-                i += 1;
-                while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
-                    i += 1;
-                }
-                out.push_str(std::str::from_utf8(&bytes[num_start..i]).ok()?);
-            }
-            _ => return None,
-        }
-    }
-    Some(out)
-}
-
 /// Parse `app-build-manifest.json` and return the App Router route patterns
 /// it advertises. The manifest is a JSON object keyed by route pattern with
 /// chunk arrays as values.
 pub fn parse_app_build_manifest(bytes: &[u8]) -> Vec<String> {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return Vec::new();
-    };
-    let Some(pages) = value.get("pages").and_then(|v| v.as_object()) else {
-        // Some Next versions write the routes at the top level.
-        return value
-            .as_object()
-            .map(|obj| {
-                obj.keys()
-                    .filter(|k| k.starts_with('/') || k.contains("/page"))
-                    .map(|k| route_from_app_key(k))
-                    .collect()
-            })
-            .unwrap_or_default();
-    };
-    pages.keys().map(|k| route_from_app_key(k)).collect()
+    if let Some(keys) = crate::json::keys_under(bytes, "pages") {
+        return keys.iter().map(|k| route_from_app_key(k)).collect();
+    }
+    // Some Next versions write the routes at the top level.
+    crate::json::top_level_keys(bytes)
+        .map(|keys| {
+            keys.iter()
+                .filter(|k| k.starts_with('/') || k.contains("/page"))
+                .map(|k| route_from_app_key(k))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn route_from_app_key(key: &str) -> String {
@@ -388,22 +348,72 @@ fn route_from_app_key(key: &str) -> String {
 /// we walk the structure defensively and collect any `name`/`id` pairs that
 /// look route-like.
 pub fn parse_client_reference_manifest(bytes: &[u8]) -> Vec<String> {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return Vec::new();
-    };
+    use crate::json::{Event, Parser};
     let mut out = Vec::new();
-    if let Some(actions) = value.get("serverActions").and_then(|v| v.as_object()) {
-        for (_action_id, payload) in actions {
-            if let Some(workers) = payload.get("workers").and_then(|v| v.as_object()) {
-                for key in workers.keys() {
-                    if let Some(route) = route_from_app_chunk(key) {
-                        out.push(route);
+    let mut p = Parser::new(bytes);
+    if !matches!(p.next(), Some(Event::BeginObject)) {
+        return out;
+    }
+    // Find top-level "serverActions".
+    loop {
+        match p.next() {
+            Some(Event::Key(k)) => {
+                if k.as_str() == "serverActions" {
+                    break;
+                }
+                if p.skip_value().is_none() {
+                    return out;
+                }
+            }
+            Some(Event::EndObject) | None => return out,
+            _ => return out,
+        }
+    }
+    if !matches!(p.next(), Some(Event::BeginObject)) {
+        return out;
+    }
+    // Iterate action_ids.
+    loop {
+        match p.next() {
+            Some(Event::EndObject) => return out,
+            Some(Event::Key(_)) => {
+                // Value is the action payload object. Find its "workers" object.
+                if !matches!(p.next(), Some(Event::BeginObject)) {
+                    return out;
+                }
+                loop {
+                    match p.next() {
+                        Some(Event::EndObject) => break,
+                        Some(Event::Key(k)) => {
+                            if k.as_str() == "workers" {
+                                if !matches!(p.next(), Some(Event::BeginObject)) {
+                                    return out;
+                                }
+                                loop {
+                                    match p.next() {
+                                        Some(Event::EndObject) => break,
+                                        Some(Event::Key(wk)) => {
+                                            if let Some(route) = route_from_app_chunk(wk.as_str()) {
+                                                out.push(route);
+                                            }
+                                            if p.skip_value().is_none() {
+                                                return out;
+                                            }
+                                        }
+                                        _ => return out,
+                                    }
+                                }
+                            } else if p.skip_value().is_none() {
+                                return out;
+                            }
+                        }
+                        _ => return out,
                     }
                 }
             }
+            _ => return out,
         }
     }
-    out
 }
 
 /// Walk every `__next_f.push([N, "..."])` payload in `bytes` and extract
@@ -504,33 +514,15 @@ fn walk_flight_payload(payload: &str, out: &mut Vec<String>) {
         if json.is_empty() {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-            continue;
-        };
-        collect_flight_routes(&value, out);
-    }
-}
-
-fn collect_flight_routes(value: &serde_json::Value, out: &mut Vec<String>) {
-    match value {
-        serde_json::Value::Array(arr) => {
-            for v in arr {
-                collect_flight_routes(v, out);
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            for (k, v) in obj {
-                if matches!(k.as_str(), "href" | "src" | "action" | "url" | "data-href") {
-                    if let Some(s) = v.as_str() {
-                        if looks_like_route(s) {
-                            out.push(s.to_owned());
-                        }
-                    }
+        crate::json::walk_strings(json.as_bytes(), |key, value| {
+            if let Some(k) = key {
+                if matches!(k, "href" | "src" | "action" | "url" | "data-href")
+                    && looks_like_route(value)
+                {
+                    out.push(value.to_owned());
                 }
-                collect_flight_routes(v, out);
             }
-        }
-        _ => {}
+        });
     }
 }
 

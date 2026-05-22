@@ -1,7 +1,7 @@
 use super::{origin::Origin, Error};
+use crate::hash::FxHashMap;
 use crate::url::Url;
 use bytes::{BufMut, Bytes, BytesMut};
-use rustc_hash::FxHashMap;
 use std::{borrow::Cow, sync::OnceLock};
 
 pub(super) fn encode_headers(
@@ -626,14 +626,14 @@ mod tests {
 
         assert_eq!(
             decoder
-                .decode(&[STATIC_TABLE.len() as u8 + 1 | 0x80])
+                .decode(&[(STATIC_TABLE.len() as u8 + 1) | 0x80])
                 .unwrap(),
             vec![("x-a".to_string(), "one".to_string())]
         );
 
         decoder.set_max_size(1);
         assert!(decoder
-            .decode(&[STATIC_TABLE.len() as u8 + 1 | 0x80])
+            .decode(&[(STATIC_TABLE.len() as u8 + 1) | 0x80])
             .is_err());
     }
 

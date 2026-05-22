@@ -432,11 +432,17 @@ fn chunk_content_path_for(content_hash: &str) -> PathBuf {
 }
 
 fn prefixed_path(kind: &str, name: &str, ext: &str) -> PathBuf {
+    use std::fmt::Write;
+    let base = dir();
     let prefix_len = name.len().min(2);
-    dir()
-        .join(kind)
-        .join(&name[..prefix_len])
-        .join(format!("{name}.{ext}"))
+    let mut p = PathBuf::with_capacity(base.as_os_str().len() + kind.len() + name.len() + 8);
+    p.push(base);
+    p.push(kind);
+    p.push(&name[..prefix_len]);
+    let mut leaf = String::with_capacity(name.len() + 1 + ext.len());
+    write!(&mut leaf, "{name}.{ext}").expect("write to String");
+    p.push(leaf);
+    p
 }
 
 fn prune_chunk_cache(max_bytes: u64) {
@@ -499,14 +505,25 @@ fn hashed_path(kind: &str, url: &Url, cache_key: Option<&str>, ext: &str) -> Pat
 }
 
 fn hashed_path_with_hash(kind: &str, url: &Url, hash: u64, ext: &str) -> PathBuf {
-    dir()
-        .join(kind)
-        .join(host(url))
-        .join(format!("{hash:016x}.{ext}"))
+    use std::fmt::Write;
+    let base = dir();
+    let mut p = PathBuf::with_capacity(base.as_os_str().len() + kind.len() + 64);
+    p.push(base);
+    p.push(kind);
+    push_host(&mut p, url);
+    let mut leaf = String::with_capacity(24 + ext.len());
+    write!(&mut leaf, "{hash:016x}.{ext}").expect("write to String");
+    p.push(leaf);
+    p
 }
 
-fn host(url: &Url) -> String {
-    url.host_str().unwrap_or("unknown").replace('/', "_")
+fn push_host(p: &mut PathBuf, url: &Url) {
+    let host = url.host_str().unwrap_or("unknown");
+    if host.contains('/') {
+        p.push(host.replace('/', "_"));
+    } else {
+        p.push(host);
+    }
 }
 
 fn read_fresh(path: &Path, max_age_secs: u64) -> Option<(Vec<u8>, u64)> {
@@ -520,11 +537,36 @@ fn read_fresh(path: &Path, max_age_secs: u64) -> Option<(Vec<u8>, u64)> {
 }
 
 pub fn read_completion_candidates(base: &Url) -> Option<Vec<String>> {
-    serde_json::from_slice(&fs::read(completion_path_for(base)).ok()?).ok()
+    let bytes = fs::read(completion_path_for(base)).ok()?;
+    decode_completion_candidates(&bytes)
 }
 
 pub fn write_completion_candidates(base: &Url, candidates: &[String]) {
-    write_json(&completion_path_for(base), candidates);
+    write_bytes(
+        &completion_path_for(base),
+        &encode_completion_candidates(candidates),
+    );
+}
+
+const COMPLETION_MAGIC: &[u8; 8] = b"HIFICC1\0";
+
+fn encode_completion_candidates(candidates: &[String]) -> Vec<u8> {
+    let est: usize = 16 + candidates.iter().map(|c| c.len() + 4).sum::<usize>();
+    let mut out = Vec::with_capacity(est);
+    out.extend_from_slice(COMPLETION_MAGIC);
+    super::wire::put_string_vec(&mut out, candidates);
+    out
+}
+
+fn decode_completion_candidates(bytes: &[u8]) -> Option<Vec<String>> {
+    let mut r = super::wire::Reader::new(bytes);
+    let magic = r.take_exact(COMPLETION_MAGIC.len())?;
+    if magic != COMPLETION_MAGIC {
+        return None;
+    }
+    let candidates = r.string_vec()?;
+    r.finish()?;
+    Some(candidates)
 }
 
 fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) {
@@ -562,8 +604,11 @@ pub fn cached_hosts() -> Vec<String> {
     hosts.into_iter().collect()
 }
 
-fn dir() -> PathBuf {
-    platform_cache_dir().unwrap_or_else(|| PathBuf::from(".").join(".cache").join("hifi"))
+fn dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        platform_cache_dir().unwrap_or_else(|| PathBuf::from(".").join(".cache").join("hifi"))
+    })
 }
 
 #[cfg(target_os = "macos")]

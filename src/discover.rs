@@ -7,12 +7,12 @@
 
 use crate::framework;
 use crate::framework::{AssetContext as FrameworkContexts, FrameworkConfig};
+use crate::hash::FxHashSet;
 use crate::scan::next::NextConfig;
 use crate::scan::{Extractor, FindingsBuilder};
 use crate::source::{self, TemplateMode};
 use crate::url::Url;
 use aho_corasick::{AhoCorasick, MatchKind};
-use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 

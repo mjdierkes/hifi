@@ -1,10 +1,10 @@
 //! Nuxt discovery policy and runtime hooks.
 
 use crate::discover::{AssetKind, AssetRef, AssetSource};
+use crate::hash::FxHashSet;
 use crate::scan::{Extractor, Shape};
 use crate::source::{self, TemplateMode};
 use crate::url::Url;
-use rustc_hash::FxHashSet;
 
 const SKIP_FRAGMENTS: &[&str] = &[
     "/_nuxt/error-",
@@ -184,17 +184,24 @@ fn collect_literal_manifest_candidates(bytes: &[u8], out: &mut Vec<String>) {
 
 fn parse_routes(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
-        collect_json_routes(&value, &mut out);
-    } else if let Some(start) = bytes.iter().position(|b| matches!(*b, b'{' | b'[')) {
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes[start..]) {
-            collect_json_routes(&value, &mut out);
-        }
-    }
+    let slice = json_slice(bytes);
+    crate::json::walk(slice, |evt| match evt {
+        crate::json::Visit::Key(key) if !route_key_context(key) => push_route(&mut out, key),
+        crate::json::Visit::String(_, value) => push_route(&mut out, value),
+        _ => {}
+    });
     collect_literal_routes(bytes, &mut out);
     out.sort();
     out.dedup();
     out
+}
+
+fn json_slice(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|b| matches!(*b, b'{' | b'[')) {
+        Some(0) => bytes,
+        Some(start) => &bytes[start..],
+        None => bytes,
+    }
 }
 
 fn endpoint_map_urls(bytes: &[u8]) -> Vec<String> {
@@ -209,31 +216,11 @@ fn endpoint_map_urls(bytes: &[u8]) -> Vec<String> {
 }
 
 fn collect_endpoint_json(bytes: &[u8], out: &mut Vec<String>) {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return;
-    };
-    collect_json_endpoints(&value, None, out);
-}
-
-fn collect_json_endpoints(value: &serde_json::Value, key: Option<&str>, out: &mut Vec<String>) {
-    match value {
-        serde_json::Value::String(s) => {
-            if key.is_some_and(endpoint_key_context) {
-                push_endpoint(out, s);
-            }
+    crate::json::walk_strings(bytes, |key, value| {
+        if key.is_some_and(endpoint_key_context) {
+            push_endpoint(out, value);
         }
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                collect_json_endpoints(item, key, out);
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            for (child_key, child_value) in obj {
-                collect_json_endpoints(child_value, Some(child_key), out);
-            }
-        }
-        _ => {}
-    }
+    });
 }
 
 fn collect_endpoint_literals(bytes: &[u8], out: &mut Vec<String>) {
@@ -415,34 +402,6 @@ fn is_relative_endpoint_leaf(raw: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'/'))
         && path.split('/').any(|seg| seg.len() >= 3)
-}
-
-fn collect_json_routes(value: &serde_json::Value, out: &mut Vec<String>) {
-    match value {
-        serde_json::Value::String(s) => push_route(out, s),
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                collect_json_routes(item, out);
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            for (key, value) in obj {
-                if route_key_context(key) {
-                    match value {
-                        serde_json::Value::String(s) => push_route(out, s),
-                        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-                            collect_json_routes(value, out)
-                        }
-                        _ => {}
-                    }
-                } else {
-                    push_route(out, key);
-                    collect_json_routes(value, out);
-                }
-            }
-        }
-        _ => {}
-    }
 }
 
 fn collect_literal_routes(bytes: &[u8], out: &mut Vec<String>) {

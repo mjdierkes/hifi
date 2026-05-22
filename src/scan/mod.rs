@@ -9,9 +9,9 @@
 //! literal with a semantic kind, while `extract`, `classify`, and `shape` keep
 //! parsing details out of the orchestration flow below.
 
+use crate::hash::FxHashMap;
 use crate::source;
 use patterns::{PatternKind, DOCUMENT_AC, DOCUMENT_PATTERNS};
-use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 pub mod classify;

@@ -1,11 +1,11 @@
 //! SvelteKit discovery policy.
 
 use crate::discover::{AssetKind, AssetRef, AssetSource};
+use crate::hash::FxHashSet;
 use crate::scan::{Extractor, Shape};
 use crate::source;
 use crate::source::TemplateMode;
 use crate::url::Url;
-use rustc_hash::FxHashSet;
 
 const SKIP_FRAGMENTS: &[&str] = &[
     "/_app/immutable/chunks/scheduler.",
@@ -206,27 +206,35 @@ pub fn record_form_actions(bytes: &[u8], base: &Url, findings: &mut crate::scan:
 }
 
 pub fn record_data_dependencies(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
-        collect_json_dependencies(&value, None, findings);
-    } else if let Some(start) = bytes.iter().position(|b| matches!(*b, b'{' | b'[')) {
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes[start..]) {
-            collect_json_dependencies(&value, None, findings);
+    let slice = json_slice(bytes);
+    crate::json::walk_strings(slice, |key, value| {
+        if key.is_some_and(dependency_key_context) {
+            record_dependency_url(value, findings);
         }
-    }
+    });
     collect_literal_dependency_values(bytes, findings);
 }
 
 fn parse_routes(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
-        collect_json_routes(&value, None, &mut out);
-    } else if let Some(start) = bytes.iter().position(|b| matches!(*b, b'{' | b'[')) {
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes[start..]) {
-            collect_json_routes(&value, None, &mut out);
+    let slice = json_slice(bytes);
+    crate::json::walk(slice, |evt| match evt {
+        crate::json::Visit::Key(key) if key.starts_with('/') => push_route(&mut out, key),
+        crate::json::Visit::String(Some(k), value) if route_key_context(k) => {
+            push_route(&mut out, value)
         }
-    }
+        _ => {}
+    });
     collect_literal_routes(bytes, &mut out);
     out
+}
+
+fn json_slice(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|b| matches!(*b, b'{' | b'[')) {
+        Some(0) => bytes,
+        Some(start) => &bytes[start..],
+        None => bytes,
+    }
 }
 
 fn immutable_roots(bytes: &[u8], base: &Url) -> Vec<String> {
@@ -317,30 +325,6 @@ fn app_dir(bytes: &[u8]) -> Option<String> {
 
 fn string_value_after_key(bytes: &[u8], key: &[u8]) -> Option<String> {
     source::keyed_string_value(bytes, key, b":=", false)
-}
-
-fn collect_json_routes(value: &serde_json::Value, key: Option<&str>, out: &mut Vec<String>) {
-    match value {
-        serde_json::Value::String(s) => {
-            if key.is_some_and(route_key_context) {
-                push_route(out, s);
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                collect_json_routes(item, key, out);
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            for (child_key, child_value) in obj {
-                if child_key.starts_with('/') {
-                    push_route(out, child_key);
-                }
-                collect_json_routes(child_value, Some(child_key), out);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn collect_literal_routes(bytes: &[u8], out: &mut Vec<String>) {
@@ -498,31 +482,6 @@ fn skip_group(bytes: &[u8], mut i: usize) -> usize {
 
 fn route_literal_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~')
-}
-
-fn collect_json_dependencies(
-    value: &serde_json::Value,
-    key: Option<&str>,
-    findings: &mut crate::scan::FindingsBuilder,
-) {
-    match value {
-        serde_json::Value::String(s) => {
-            if key.is_some_and(dependency_key_context) {
-                record_dependency_url(s, findings);
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                collect_json_dependencies(item, key, findings);
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            for (child_key, child_value) in obj {
-                collect_json_dependencies(child_value, Some(child_key), findings);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn collect_literal_dependency_values(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {

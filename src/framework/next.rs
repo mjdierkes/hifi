@@ -1,11 +1,11 @@
 //! Next.js discovery policy and runtime hooks.
 
 use crate::discover::{AssetKind, AssetRef, AssetSource, DocumentKind};
+use crate::hash::FxHashSet;
 use crate::scan::next::{self as parser, NextConfig};
 use crate::scan::{Extractor, FindingsBuilder, Shape};
 use crate::source::{self, TemplateMode};
 use crate::url::Url;
-use rustc_hash::FxHashSet;
 
 const NEXT_SKIP_FRAGMENTS: &[&str] = &[
     "framework-",

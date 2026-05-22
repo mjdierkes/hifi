@@ -2,6 +2,8 @@ pub mod app;
 mod discover;
 mod framework;
 mod grep;
+pub(crate) mod hash;
+pub(crate) mod json;
 mod runtime;
 mod scan;
 mod source;

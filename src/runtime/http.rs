@@ -4,9 +4,9 @@
 //! TLS connection per origin. HTTP/1.1 remains as a compatibility path for
 //! plain HTTP test servers and TLS origins that do not negotiate `h2`.
 
+use crate::hash::FxHashMap;
 use crate::url::Url;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use rustc_hash::FxHashMap;
 use rustls::{client::Resumption, RootCertStore};
 use rustls_pki_types::ServerName;
 use std::{
@@ -692,7 +692,7 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, Error
 }
 
 async fn apply_settings(session: &H2Session, payload: &[u8]) {
-    if payload.len() % 6 != 0 {
+    if !payload.len().is_multiple_of(6) {
         return;
     }
     for setting in payload.chunks_exact(6) {

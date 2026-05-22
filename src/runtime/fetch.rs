@@ -97,7 +97,7 @@ pub async fn scan_assets(
     out: &mut FindingsBuilder,
 ) -> AssetScanStats {
     let mut stats = AssetScanStats::default();
-    let mut visited = rustc_hash::FxHashSet::default();
+    let mut visited = crate::hash::FxHashSet::default();
     let mut queue = VecDeque::new();
     let mut low_signal_enqueued = 0;
     enqueue_assets(
@@ -163,7 +163,7 @@ pub async fn scan_assets(
 // and the cap counter, so cyclic chunk references cannot grow the queue forever.
 fn enqueue_assets(
     assets: impl IntoIterator<Item = AssetRef>,
-    visited: &mut rustc_hash::FxHashSet<Url>,
+    visited: &mut crate::hash::FxHashSet<Url>,
     queue: &mut VecDeque<AssetRef>,
     stats: &mut AssetScanStats,
     low_signal_enqueued: &mut usize,
@@ -230,7 +230,7 @@ fn is_low_signal_script_path(path: &str) -> bool {
 }
 
 fn prewarm_asset_hosts(client: &Client, assets: &VecDeque<AssetRef>, allow_private: bool) {
-    let mut seen = rustc_hash::FxHashSet::default();
+    let mut seen = crate::hash::FxHashSet::default();
     for url in assets
         .iter()
         .filter(|asset| asset.url.scheme() == "https")

@@ -6,3 +6,4 @@ pub mod fetch;
 pub mod http;
 pub mod net;
 pub mod processor;
+mod wire;
