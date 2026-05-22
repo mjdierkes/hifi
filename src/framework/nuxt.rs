@@ -116,7 +116,13 @@ pub fn push_manifests(
         let Some(url) = resolve_asset(base, &raw).or_else(|| base.join(&raw).ok()) else {
             continue;
         };
-        push_resolved_asset(url, AssetKind::Manifest, seen, out);
+        super::push_asset(
+            url,
+            AssetKind::Manifest,
+            AssetSource::FrameworkManifest,
+            seen,
+            out,
+        );
     }
     let Some(build_id) = build_id(bytes) else {
         return;
@@ -129,7 +135,13 @@ pub fn push_manifests(
             let Ok(url) = root.join(&name) else {
                 continue;
             };
-            push_resolved_asset(url, AssetKind::Manifest, seen, out);
+            super::push_asset(
+                url,
+                AssetKind::Manifest,
+                AssetSource::FrameworkManifest,
+                seen,
+                out,
+            );
         }
     }
 }
@@ -146,9 +158,9 @@ fn manifest_roots(bytes: &[u8], base: &Url) -> Vec<Url> {
     let mut out = Vec::new();
     let base_path = app_base_url(bytes).unwrap_or_else(|| "/".to_owned());
     let assets_dir = build_assets_dir(bytes).unwrap_or_else(|| "/_nuxt/".to_owned());
-    let path = join_paths(&base_path, &assets_dir);
+    let path = super::join_paths(&base_path, &assets_dir);
     if let Some(cdn) = app_cdn_url(bytes) {
-        if let Ok(root) = Url::parse(&join_paths(&cdn, &path)) {
+        if let Ok(root) = Url::parse(&super::join_paths(&cdn, &path)) {
             out.push(root);
         }
     }
@@ -184,7 +196,7 @@ fn collect_literal_manifest_candidates(bytes: &[u8], out: &mut Vec<String>) {
 
 fn parse_routes(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
-    let slice = json_slice(bytes);
+    let slice = super::json_slice(bytes);
     crate::json::walk(slice, |evt| match evt {
         crate::json::Visit::Key(key) if !route_key_context(key) => push_route(&mut out, key),
         crate::json::Visit::String(_, value) => push_route(&mut out, value),
@@ -194,14 +206,6 @@ fn parse_routes(bytes: &[u8]) -> Vec<String> {
     out.sort();
     out.dedup();
     out
-}
-
-fn json_slice(bytes: &[u8]) -> &[u8] {
-    match bytes.iter().position(|b| matches!(*b, b'{' | b'[')) {
-        Some(0) => bytes,
-        Some(start) => &bytes[start..],
-        None => bytes,
-    }
 }
 
 fn endpoint_map_urls(bytes: &[u8]) -> Vec<String> {
@@ -380,7 +384,7 @@ fn push_relative_endpoint(out: &mut Vec<String>, raw: &str, bases: &[String]) {
         return;
     }
     for base in bases {
-        push_endpoint(out, &join_paths(base, raw));
+        push_endpoint(out, &super::join_paths(base, raw));
     }
 }
 
@@ -476,31 +480,6 @@ pub fn build_assets_dir(bytes: &[u8]) -> Option<String> {
     string_value_after_key(bytes, b"buildAssetsDir").filter(|value| value.contains("_nuxt"))
 }
 
-fn join_paths(left: &str, right: &str) -> String {
-    let left = left.trim_end_matches('/');
-    let right = right.trim_start_matches('/');
-    if left.is_empty() {
-        format!("/{right}")
-    } else {
-        format!("{left}/{right}")
-    }
-}
-
 fn string_value_after_key(bytes: &[u8], key: &[u8]) -> Option<String> {
     source::keyed_string_value(bytes, key, b":", true)
-}
-
-fn push_resolved_asset(
-    url: Url,
-    kind: AssetKind,
-    seen: &mut FxHashSet<Url>,
-    out: &mut Vec<AssetRef>,
-) {
-    if seen.insert(url.clone()) {
-        out.push(AssetRef {
-            url,
-            kind,
-            source: AssetSource::FrameworkManifest,
-        });
-    }
 }

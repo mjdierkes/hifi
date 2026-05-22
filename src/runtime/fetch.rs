@@ -331,7 +331,7 @@ async fn fetch_asset_body(
             .map_err(|_| FetchFailure::Other)?;
         let mut request = client.get(current_url.clone());
         for (name, value) in framework::request_headers(&current_url) {
-            request = request.header(name, value);
+            request = request.header(*name, *value);
         }
         if let Some(validators) = validators {
             if let Some(etag) = &validators.etag {

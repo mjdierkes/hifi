@@ -108,7 +108,7 @@ pub fn data_path_for_route_with_base(route: &str, base_path: Option<&str>) -> Op
     else {
         return Some(data);
     };
-    Some(join_paths(base_path, &data))
+    Some(super::join_paths(base_path, &data))
 }
 
 pub fn push_manifests(
@@ -124,13 +124,13 @@ pub fn push_manifests(
         let Ok(url) = base.join(&format!("{app_root}version.json")) else {
             continue;
         };
-        if seen.insert(url.clone()) {
-            out.push(AssetRef {
-                url,
-                kind: AssetKind::Manifest,
-                source: AssetSource::FrameworkManifest,
-            });
-        }
+        super::push_asset(
+            url,
+            AssetKind::Manifest,
+            AssetSource::FrameworkManifest,
+            seen,
+            out,
+        );
     }
 }
 
@@ -148,13 +148,13 @@ pub fn push_data_assets_for_routes(
         let Ok(url) = base.join(&path) else {
             continue;
         };
-        if seen.insert(url.clone()) {
-            out.push(AssetRef {
-                url,
-                kind: AssetKind::Payload,
-                source: AssetSource::FrameworkManifest,
-            });
-        }
+        super::push_asset(
+            url,
+            AssetKind::Payload,
+            AssetSource::FrameworkManifest,
+            seen,
+            out,
+        );
     }
 }
 
@@ -206,7 +206,7 @@ pub fn record_form_actions(bytes: &[u8], base: &Url, findings: &mut crate::scan:
 }
 
 pub fn record_data_dependencies(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
-    let slice = json_slice(bytes);
+    let slice = super::json_slice(bytes);
     crate::json::walk_strings(slice, |key, value| {
         if key.is_some_and(dependency_key_context) {
             record_dependency_url(value, findings);
@@ -217,7 +217,7 @@ pub fn record_data_dependencies(bytes: &[u8], findings: &mut crate::scan::Findin
 
 fn parse_routes(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
-    let slice = json_slice(bytes);
+    let slice = super::json_slice(bytes);
     crate::json::walk(slice, |evt| match evt {
         crate::json::Visit::Key(key) if key.starts_with('/') => push_route(&mut out, key),
         crate::json::Visit::String(Some(k), value) if route_key_context(k) => {
@@ -227,14 +227,6 @@ fn parse_routes(bytes: &[u8]) -> Vec<String> {
     });
     collect_literal_routes(bytes, &mut out);
     out
-}
-
-fn json_slice(bytes: &[u8]) -> &[u8] {
-    match bytes.iter().position(|b| matches!(*b, b'{' | b'[')) {
-        Some(0) => bytes,
-        Some(start) => &bytes[start..],
-        None => bytes,
-    }
 }
 
 fn immutable_roots(bytes: &[u8], base: &Url) -> Vec<String> {
@@ -297,18 +289,6 @@ fn root_before_immutable_child(raw: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn join_paths(left: &str, right: &str) -> String {
-    let left = left.trim_end_matches('/');
-    let right = right.trim_start_matches('/');
-    if left.is_empty() {
-        format!("/{right}")
-    } else if right.is_empty() {
-        left.to_owned()
-    } else {
-        format!("{left}/{right}")
-    }
 }
 
 fn app_dir(bytes: &[u8]) -> Option<String> {

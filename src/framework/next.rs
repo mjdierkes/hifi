@@ -129,7 +129,7 @@ pub fn push_manifests(
         let Ok(url) = root.join(artifact.name) else {
             continue;
         };
-        push_resolved_asset(
+        super::push_asset(
             url,
             AssetKind::Manifest,
             AssetSource::NextManifest,
@@ -350,18 +350,6 @@ fn route_from_payload(base: &Url, config: Option<&NextConfig>) -> Option<String>
     }
     path = parser::normalize_app_route(&path);
     Some(path)
-}
-
-fn push_resolved_asset(
-    url: Url,
-    kind: AssetKind,
-    source: AssetSource,
-    seen: &mut FxHashSet<Url>,
-    out: &mut Vec<AssetRef>,
-) {
-    if seen.insert(url.clone()) {
-        out.push(AssetRef { url, kind, source });
-    }
 }
 
 fn asset_token_string(bytes: &[u8], start: usize) -> Option<String> {

@@ -1,4 +1,5 @@
-use crate::discover::{AssetKind, DocumentKind};
+use crate::discover::{AssetKind, AssetRef, AssetSource, DocumentKind};
+use crate::hash::FxHashSet;
 use crate::scan::next::NextConfig;
 use crate::scan::{Extractor, FindingsBuilder, Shape};
 use crate::source;
@@ -105,11 +106,43 @@ impl FrameworkConfig {
     }
 }
 
-pub fn request_headers(url: &Url) -> Vec<(&'static str, &'static str)> {
+pub fn request_headers(url: &Url) -> &'static [(&'static str, &'static str)] {
     if next::is_rsc_payload(url) {
-        vec![("RSC", "1")]
+        &[("RSC", "1")]
     } else {
-        Vec::new()
+        &[]
+    }
+}
+
+fn json_slice(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|b| matches!(*b, b'{' | b'[')) {
+        Some(0) => bytes,
+        Some(start) => &bytes[start..],
+        None => bytes,
+    }
+}
+
+fn join_paths(left: &str, right: &str) -> String {
+    let left = left.trim_end_matches('/');
+    let right = right.trim_start_matches('/');
+    if left.is_empty() {
+        format!("/{right}")
+    } else if right.is_empty() {
+        left.to_owned()
+    } else {
+        format!("{left}/{right}")
+    }
+}
+
+fn push_asset(
+    url: Url,
+    kind: AssetKind,
+    source: AssetSource,
+    seen: &mut FxHashSet<Url>,
+    out: &mut Vec<AssetRef>,
+) {
+    if seen.insert(url.clone()) {
+        out.push(AssetRef { url, kind, source });
     }
 }
 
