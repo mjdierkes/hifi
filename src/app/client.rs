@@ -1,7 +1,7 @@
 use super::AppError;
+use crate::runtime::cache::CACHE_FRESH_SECS;
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::net;
-use crate::runtime::processor::CACHE_FRESH_SECS;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::Client;
 use std::time::Duration;

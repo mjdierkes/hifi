@@ -15,15 +15,12 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
     num::NonZeroUsize,
-    path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Instant,
 };
 use thiserror::Error;
 use url::Url;
 
-pub const CACHE_FRESH_SECS: u64 = 300;
-pub const CACHE_STALE_SECS: u64 = 3600;
 const MEMORY_CACHE_MAX_ENTRIES: usize = 256;
 
 type Result<T, E = RuntimeError> = std::result::Result<T, E>;
@@ -129,7 +126,7 @@ pub struct Processor<'a> {
 
 struct RequestPlan {
     original_base: Url,
-    cache_path: PathBuf,
+    cache: cache::ScanCache,
 }
 
 struct LoadedPage {
@@ -166,7 +163,7 @@ impl<'a> Processor<'a> {
             .await?;
         if !no_cache && !outcome.used_revision_cache {
             write_caches(
-                &plan.cache_path,
+                &plan.cache,
                 &outcome.output,
                 url,
                 active_cache.memory.clone(),
@@ -197,9 +194,7 @@ impl<'a> Processor<'a> {
         cache_ctx: &CacheContext,
     ) -> Result<ScanOutcome> {
         if use_cache {
-            if let Some((body, age)) =
-                cache::read_cached_value_bytes(&plan.cache_path, CACHE_FRESH_SECS)
-            {
+            if let Some((body, age)) = plan.cache.read_fresh_bytes() {
                 return Ok(ScanOutcome {
                     output: serde_json::from_slice::<Output>(&body)?.mark(
                         t0,
@@ -221,7 +216,7 @@ impl<'a> Processor<'a> {
         // new enough to validate the asset graph, so we can reuse processed
         // output without rescanning every static asset.
         if let (true, Some(revision), Some(t0)) = (use_cache, revision.as_deref(), t0) {
-            if let Some(bytes) = cache::read_revision_bytes(&plan.cache_path, Some(revision)) {
+            if let Some(bytes) = plan.cache.read_revision_bytes(Some(revision)) {
                 return Ok(ScanOutcome {
                     output: serde_json::from_slice::<Output>(&bytes)?.mark(
                         Some(t0),
@@ -247,7 +242,7 @@ impl<'a> Processor<'a> {
             &mut found,
         )
         .await;
-        found.finalize();
+        let found = found.finish();
 
         Ok(ScanOutcome {
             output: Output {
@@ -285,11 +280,11 @@ impl<'a> Processor<'a> {
 impl RequestPlan {
     fn new(url: &str, cache: &CacheContext) -> Result<Self, url::ParseError> {
         let original_base = Url::parse(url)?;
-        let cache_path = cache::path_for(&original_base);
+        let scan_cache = cache::ScanCache::for_base(&original_base);
         let _ = cache;
         Ok(Self {
             original_base,
-            cache_path,
+            cache: scan_cache,
         })
     }
 }
@@ -358,13 +353,13 @@ pub fn mark_cached_body(
 }
 
 fn write_caches(
-    cache_path: &Path,
+    cache_store: &cache::ScanCache,
     out: &Output,
     url: &str,
     memory: Option<MemoryCache>,
 ) -> Result<()> {
     let cached = out.clone().mark(None, CacheStatus::Stored, None);
-    cache::write_with_revision(cache_path, &cached, out.revision.as_deref());
+    cache_store.write_with_revision(&cached, out.revision.as_deref());
     if let Ok(base) = url::Url::parse(url) {
         let candidates = completion_candidates(&cached.evidence);
         if !candidates.is_empty() {
@@ -426,7 +421,7 @@ fn prune_memory(entries: &mut LruCache<String, (Body, Instant)>, now: Instant) {
     let stale = entries
         .iter()
         .filter(|(_, (_, written))| {
-            now.saturating_duration_since(*written).as_secs() >= CACHE_STALE_SECS
+            now.saturating_duration_since(*written).as_secs() >= cache::CACHE_STALE_SECS
         })
         .map(|(url, _)| url.clone())
         .collect::<Vec<_>>();
@@ -551,7 +546,8 @@ mod tests {
             warnings: Vec::new(),
         };
 
-        write_caches(&path, &out, url, Some(memory.clone())).unwrap();
+        let cache_store = cache::ScanCache::at_path(path.clone());
+        write_caches(&cache_store, &out, url, Some(memory.clone())).unwrap();
         let (body, age) = read_memory(&memory, url).unwrap();
         let stored = serde_json::from_str::<Output>(&body).unwrap();
         assert_eq!(stored.cache, CacheStatus::Stored);

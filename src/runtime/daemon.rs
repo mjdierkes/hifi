@@ -4,13 +4,15 @@
 //! simultaneous requests for the same URL. The wire protocol is intentionally
 //! tiny because it is only used by this binary over a private Unix socket.
 
+#[cfg(unix)]
+use super::cache::CACHE_FRESH_SECS;
 use super::config::RuntimeConfig;
 #[cfg(unix)]
 use super::fetch;
 #[cfg(unix)]
 use super::processor::{
     mark_cached_body, memory_cache, read_memory, Body, CacheContext, CacheStatus, MemoryCache,
-    Processor, CACHE_FRESH_SECS,
+    Processor,
 };
 use reqwest::Client;
 #[cfg(unix)]

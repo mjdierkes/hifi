@@ -6,9 +6,9 @@
 //! the runtime to schedule and deduplicate.
 
 use crate::framework;
-use crate::framework::FrameworkConfig;
+use crate::framework::{AssetContext as FrameworkContexts, FrameworkConfig};
 use crate::scan::next::NextConfig;
-use crate::scan::{Extractor, ScanResult, Shape};
+use crate::scan::{Extractor, FindingsBuilder};
 use crate::source::{self, TemplateMode};
 use aho_corasick::{AhoCorasick, MatchKind};
 use rustc_hash::FxHashSet;
@@ -72,16 +72,6 @@ static ASSET_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
         .expect("valid asset literals")
 });
 
-#[derive(Clone, Debug, Default)]
-struct FrameworkContexts {
-    next: bool,
-    nuxt: bool,
-    sveltekit: bool,
-    sveltekit_immutable_root: Option<String>,
-    astro: bool,
-    remix: bool,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DocumentKind {
     Html,
@@ -133,7 +123,7 @@ impl AssetRef {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct DocumentScan {
-    pub findings: ScanResult,
+    pub findings: FindingsBuilder,
     pub assets: Vec<AssetRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
@@ -163,7 +153,7 @@ pub(crate) fn scan_document_with_config_and_findings(
     base: &Url,
     kind: DocumentKind,
     parent_config: Option<&NextConfig>,
-    cached_findings: Option<ScanResult>,
+    cached_findings: Option<FindingsBuilder>,
 ) -> DocumentScan {
     if is_empty_script(bytes, kind) {
         return DocumentScan::default();
@@ -223,12 +213,12 @@ pub(crate) fn scan_document_with_config_and_findings(
     }
 
     push_framework_candidates(bytes, &mut out.findings);
-    scan_framework_data(bytes, base, kind, contexts.clone(), &mut out.findings);
+    framework::scan_data_findings(bytes, base, kind, &contexts, &mut out.findings);
     framework::next::scan_flight(bytes, &mut out.findings);
     framework::next::scan_server_action(bytes, base, kind, next_config.as_ref(), &mut out.findings);
     if contexts.sveltekit {
         let routes = framework::sveltekit::record_routes(bytes, &mut out.findings);
-        push_sveltekit_data_assets(
+        framework::sveltekit::push_data_assets_for_routes(
             &routes,
             base,
             framework::sveltekit::base_path(bytes).as_deref(),
@@ -346,7 +336,7 @@ fn scan_literal_assets(
     bytes: &[u8],
     base: &Url,
     contexts: FrameworkContexts,
-    findings: &mut ScanResult,
+    findings: &mut FindingsBuilder,
     seen: &mut FxHashSet<Url>,
     out: &mut Vec<AssetRef>,
 ) {
@@ -356,7 +346,7 @@ fn scan_literal_assets(
         // Comment substrings, property accesses, and identifier prefixes look
         // identical to real URL literals after `walk_token_start` and produce
         // the bulk of the regular tier's false positives.
-        if !is_string_literal_context(bytes, start) {
+        if !source::is_string_literal_start(bytes, start) {
             continue;
         }
         let Some(raw) = asset_token_string(bytes, start) else {
@@ -367,10 +357,6 @@ fn scan_literal_assets(
         }
         push_asset(base, &raw, &contexts, AssetSource::Literal, seen, out);
     }
-}
-
-fn is_string_literal_context(bytes: &[u8], start: usize) -> bool {
-    start > 0 && matches!(bytes[start - 1], b'"' | b'\'' | b'`')
 }
 
 fn scan_dynamic_assets(
@@ -392,11 +378,11 @@ fn scan_dynamic_assets(
     }
 }
 
-fn push_framework_candidates(bytes: &[u8], findings: &mut ScanResult) {
+fn push_framework_candidates(bytes: &[u8], findings: &mut FindingsBuilder) {
     for marker in FRAMEWORK_DATA_MARKERS {
         for pos in memchr::memmem::find_iter(bytes, marker) {
             let start = source::walk_token_start(bytes, pos);
-            if !is_string_literal_context(bytes, start) {
+            if !source::is_string_literal_start(bytes, start) {
                 continue;
             }
             if let Some(raw) = asset_token_string(bytes, start) {
@@ -406,157 +392,7 @@ fn push_framework_candidates(bytes: &[u8], findings: &mut ScanResult) {
     }
 }
 
-fn scan_framework_data(
-    bytes: &[u8],
-    base: &Url,
-    kind: DocumentKind,
-    contexts: FrameworkContexts,
-    findings: &mut ScanResult,
-) {
-    let extractor = if contexts.nuxt {
-        Some(Extractor::NuxtPayload)
-    } else if contexts.sveltekit {
-        Some(Extractor::SvelteKitData)
-    } else if contexts.remix {
-        Some(Extractor::RemixManifest)
-    } else if contexts.astro {
-        Some(Extractor::AstroIsland)
-    } else {
-        None
-    };
-    let Some(extractor) = extractor else {
-        return;
-    };
-
-    record_framework_route_from_payload(base, kind, extractor, findings);
-    scan_api_tokens(bytes, extractor, findings);
-    if contexts.nuxt {
-        framework::nuxt::record_endpoint_maps(bytes, findings);
-        if matches!(kind, DocumentKind::Manifest | DocumentKind::Payload) {
-            framework::nuxt::record_routes(bytes, findings);
-        } else {
-            framework::nuxt::record_page_route(bytes, findings);
-        }
-        scan_nuxt_islands(bytes, findings);
-    }
-    if contexts.sveltekit {
-        framework::sveltekit::record_form_actions(bytes, base, findings);
-        framework::sveltekit::record_data_dependencies(bytes, findings);
-    }
-    if contexts.astro {
-        scan_astro_actions(bytes, findings);
-    }
-}
-
-fn push_sveltekit_data_assets(
-    routes: &[String],
-    base: &Url,
-    base_path: Option<&str>,
-    seen: &mut FxHashSet<Url>,
-    out: &mut Vec<AssetRef>,
-) {
-    for route in routes {
-        let Some(path) = framework::sveltekit::data_path_for_route_with_base(route, base_path)
-        else {
-            continue;
-        };
-        let Ok(url) = base.join(&path) else {
-            continue;
-        };
-        push_resolved_asset(
-            url,
-            AssetKind::Payload,
-            AssetSource::FrameworkManifest,
-            seen,
-            out,
-        );
-    }
-}
-
-fn record_framework_route_from_payload(
-    base: &Url,
-    kind: DocumentKind,
-    extractor: Extractor,
-    findings: &mut ScanResult,
-) {
-    if kind != DocumentKind::Payload {
-        return;
-    }
-    let path = base.path();
-    let route = if extractor == Extractor::NuxtPayload {
-        framework::nuxt::route_from_payload(base)
-    } else if extractor == Extractor::SvelteKitData {
-        framework::sveltekit::route_from_payload(base)
-    } else if base.query().is_some_and(|query| query.contains("_data=")) {
-        Some(if path.is_empty() { "/" } else { path }.to_owned())
-    } else if let Some(route) = path.strip_suffix("/_payload.json") {
-        Some(if route.is_empty() { "/" } else { route }.to_owned())
-    } else {
-        path.strip_suffix("/__data.json")
-            .map(|route| if route.is_empty() { "/" } else { route }.to_owned())
-    };
-    if let Some(route) = route.filter(|route| crate::scan::classify::is_client_route(route)) {
-        findings.record_route(route, extractor);
-    }
-}
-
-fn scan_api_tokens(bytes: &[u8], extractor: Extractor, findings: &mut ScanResult) {
-    for marker in [
-        b"/api".as_slice(),
-        b"/graphql".as_slice(),
-        b"/trpc".as_slice(),
-    ] {
-        for pos in memchr::memmem::find_iter(bytes, marker) {
-            let start = source::walk_token_start(bytes, pos);
-            if !is_string_literal_context(bytes, start) {
-                continue;
-            }
-            let Some(raw) = asset_token_string(bytes, start) else {
-                continue;
-            };
-            if crate::scan::classify::is_api_candidate(&raw) {
-                findings
-                    .record_candidate(crate::scan::classify::normalize_api_url(&raw), extractor);
-            }
-        }
-    }
-}
-
-fn scan_astro_actions(bytes: &[u8], findings: &mut ScanResult) {
-    for pos in memchr::memmem::find_iter(bytes, b"/_actions/") {
-        let start = source::walk_token_start(bytes, pos);
-        if !is_string_literal_context(bytes, start) {
-            continue;
-        }
-        let Some(raw) = asset_token_string(bytes, start) else {
-            continue;
-        };
-        findings.record_api(
-            raw,
-            Shape::inferred(Some("POST"), true),
-            Extractor::AstroIsland,
-        );
-    }
-}
-
-fn scan_nuxt_islands(bytes: &[u8], findings: &mut ScanResult) {
-    for pos in memchr::memmem::find_iter(bytes, b"/__nuxt_island/") {
-        let start = source::walk_token_start(bytes, pos);
-        if !is_string_literal_context(bytes, start) {
-            continue;
-        }
-        let Some(raw) = asset_token_string(bytes, start) else {
-            continue;
-        };
-        findings.record_api(
-            raw,
-            Shape::inferred(Some("GET"), false),
-            Extractor::NuxtPayload,
-        );
-    }
-}
-
-fn push_candidate(findings: &mut ScanResult, raw: &str) {
+fn push_candidate(findings: &mut FindingsBuilder, raw: &str) {
     framework::next::push_framework_candidate(findings, raw);
     let path = raw.split(['?', '#']).next().unwrap_or(raw);
     if (framework::nuxt::is_payload(raw, path)
@@ -580,18 +416,13 @@ fn push_asset(
     seen: &mut FxHashSet<Url>,
     out: &mut Vec<AssetRef>,
 ) {
-    let Some(kind) = classify_asset(raw) else {
+    let Some(kind) = framework::classify_asset(raw) else {
         return;
     };
-    let Some(url) = resolve_asset(base, raw, contexts) else {
+    let Some(url) = framework::resolve_asset(base, raw, contexts) else {
         return;
     };
-    if framework::next::should_skip(&url)
-        || framework::nuxt::should_skip(&url)
-        || framework::sveltekit::should_skip(&url)
-        || framework::astro::should_skip(&url)
-        || framework::remix::should_skip(&url)
-    {
+    if framework::should_skip(&url) {
         return;
     }
     push_resolved_asset(url, kind, source, seen, out);
@@ -606,98 +437,6 @@ fn push_resolved_asset(
 ) {
     if seen.insert(url.clone()) {
         out.push(AssetRef { url, kind, source });
-    }
-}
-
-fn classify_asset(raw: &str) -> Option<AssetKind> {
-    let path = raw.split(['?', '#']).next().unwrap_or(raw);
-    if framework::next::is_manifest(path)
-        || framework::nuxt::is_manifest(path)
-        || framework::sveltekit::is_manifest(path)
-        || framework::remix::is_manifest(path)
-    {
-        Some(AssetKind::Manifest)
-    } else if framework::next::is_payload(raw, path)
-        || framework::nuxt::is_payload(raw, path)
-        || framework::sveltekit::is_payload(raw, path)
-        || framework::astro::is_payload(raw, path)
-        || framework::remix::is_payload(raw, path)
-    {
-        Some(AssetKind::Payload)
-    } else if is_script_asset(path) {
-        Some(AssetKind::Script)
-    } else {
-        None
-    }
-}
-
-fn is_script_asset(path: &str) -> bool {
-    source::ends_with_ascii_ignore_case(path, ".js")
-        || source::ends_with_ascii_ignore_case(path, ".mjs")
-}
-
-fn is_context_relative_asset(raw: &str) -> bool {
-    raw.starts_with("nodes/")
-        || raw.starts_with("chunks/")
-        || raw.starts_with("entry/")
-        || raw.starts_with("routes/")
-        || raw.starts_with("assets/routes/")
-}
-
-// Bundlers often emit relative chunk names that are only meaningful in a
-// framework context. The Next.js branch rewrites `static/...` to `/_next/...`
-// only when the page or asset already proves that context.
-fn resolve_asset(base: &Url, raw: &str, contexts: &FrameworkContexts) -> Option<Url> {
-    let raw = raw.trim_matches('\\');
-    if raw.is_empty() || raw.starts_with("data:") || raw.starts_with("blob:") {
-        return None;
-    }
-    if let Some(url) = framework::next::resolve_asset(base, raw, contexts.next) {
-        return Some(url);
-    }
-    if let Some(url) = framework::nuxt::resolve_asset(base, raw) {
-        return Some(url);
-    }
-    if let Some(url) = framework::nuxt::resolve_context_asset(base, raw, contexts.nuxt) {
-        return Some(url);
-    }
-    if let Some(url) = framework::sveltekit::resolve_asset(base, raw) {
-        return Some(url);
-    }
-    if let Some(url) = framework::sveltekit::resolve_context_asset(
-        base,
-        raw,
-        contexts.sveltekit,
-        contexts.sveltekit_immutable_root.as_deref(),
-    ) {
-        return Some(url);
-    }
-    if let Some(url) = framework::astro::resolve_asset(base, raw) {
-        return Some(url);
-    }
-    if let Some(url) = framework::remix::resolve_asset(base, raw) {
-        return Some(url);
-    }
-    if let Some(url) = framework::remix::resolve_context_asset(base, raw, contexts.remix) {
-        return Some(url);
-    }
-
-    if is_context_relative_asset(raw) {
-        return None;
-    }
-
-    let absolute = if raw.starts_with("static/") && contexts.next {
-        Some(format!("/_next/{raw}"))
-    } else if (raw.starts_with("assets/") && base.path().contains("/assets/"))
-        || (raw.starts_with("static/") && base.path().contains("/static/"))
-    {
-        Some(format!("/{raw}"))
-    } else {
-        None
-    };
-    match absolute {
-        Some(path) => base.join(&path).ok(),
-        None => base.join(raw).ok(),
     }
 }
 

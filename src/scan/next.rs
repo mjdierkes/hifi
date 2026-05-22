@@ -167,7 +167,7 @@ pub fn parse_build_manifest_js(bytes: &[u8]) -> Vec<String> {
     if bytes.get(i) != Some(&b'{') {
         return Vec::new();
     }
-    let Some(end) = match_brace(bytes, i) else {
+    let Some(end) = source::balanced_end(bytes, i) else {
         return Vec::new();
     };
     let literal = &bytes[i..=end];
@@ -203,38 +203,6 @@ fn locate_build_manifest_inline(bytes: &[u8]) -> Option<usize> {
         i = source::skip_ws(bytes, i);
     }
     (bytes.get(i) == Some(&b'{')).then_some(i)
-}
-
-fn match_brace(bytes: &[u8], open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut i = open;
-    let mut in_str: Option<u8> = None;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(quote) = in_str {
-            if b == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            } else if b == quote {
-                in_str = None;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'"' | b'\'' | b'`' => in_str = Some(b),
-            b'{' | b'[' => depth += 1,
-            b'}' | b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
 }
 
 /// Convert a JavaScript object literal with unquoted keys and single-quoted

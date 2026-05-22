@@ -184,7 +184,7 @@ fn apply_fetch_options_shape(bytes: &[u8], start: usize, shape: &mut Shape) {
 }
 
 fn apply_options_object_shape(bytes: &[u8], start: usize, shape: &mut Shape) {
-    let Some(end) = object_end(bytes, start) else {
+    let Some(end) = source::balanced_end(bytes, start) else {
         return;
     };
     let options = &bytes[start..=end];
@@ -295,29 +295,6 @@ fn method_allows_body(method: u8) -> bool {
 fn first_arg_end(bytes: &[u8], start: usize) -> Option<usize> {
     if let Some(end) = source::quoted_arg_end(bytes, start) {
         return Some(end);
-    }
-    None
-}
-
-fn object_end(bytes: &[u8], open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' | b'\'' | b'`' => {
-                i = source::quoted_end(bytes, i + 1, bytes[i])? + 1;
-                continue;
-            }
-            b'{' | b'[' | b'(' => depth += 1,
-            b'}' | b']' | b')' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
     }
     None
 }

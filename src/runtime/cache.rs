@@ -8,7 +8,7 @@
 //! plus final redirected URL, and per-asset scan data plus HTTP validators.
 
 use crate::discover::{DocumentKind, DocumentScan};
-use crate::scan::ScanResult;
+use crate::scan::FindingsBuilder;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -18,6 +18,38 @@ use std::{
 use url::Url;
 
 const SCANNER_CACHE_VERSION: &str = env!("HIFI_BUILD_HASH");
+pub const CACHE_FRESH_SECS: u64 = 300;
+pub const CACHE_STALE_SECS: u64 = 3600;
+
+#[derive(Clone)]
+pub struct ScanCache {
+    path: PathBuf,
+}
+
+impl ScanCache {
+    pub fn for_base(base: &Url) -> Self {
+        Self {
+            path: path_for(base),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn at_path(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn read_fresh_bytes(&self) -> Option<(Vec<u8>, u64)> {
+        read_cached_value_bytes(&self.path, CACHE_FRESH_SECS)
+    }
+
+    pub fn read_revision_bytes(&self, revision: Option<&str>) -> Option<Vec<u8>> {
+        read_revision_bytes(&self.path, revision)
+    }
+
+    pub fn write_with_revision<T: Serialize>(&self, value: &T, revision: Option<&str>) {
+        write_with_revision(&self.path, value, revision);
+    }
+}
 
 fn hash_parts<'a>(parts: impl Iterator<Item = &'a str>) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -78,7 +110,7 @@ struct RevisionEnvelope<T> {
 
 pub fn read_asset_cached(url: &Url, cache_key: Option<&str>) -> Option<CachedAsset> {
     let path = asset_path_for(url, cache_key);
-    let (bytes, age_secs) = read_fresh(&path, super::processor::CACHE_STALE_SECS)?;
+    let (bytes, age_secs) = read_fresh(&path, CACHE_STALE_SECS)?;
     let envelope: AssetEnvelope = serde_json::from_slice(&bytes).ok()?;
     Some(CachedAsset {
         data: envelope.data,
@@ -112,13 +144,13 @@ pub fn body_hash(bytes: &[u8]) -> u64 {
     h
 }
 
-pub fn read_findings_by_hash(hash: u64, kind: DocumentKind) -> Option<ScanResult> {
+pub fn read_findings_by_hash(hash: u64, kind: DocumentKind) -> Option<FindingsBuilder> {
     let path = findings_hash_path(hash, kind);
-    let (bytes, _) = read_fresh(&path, super::processor::CACHE_STALE_SECS)?;
+    let (bytes, _) = read_fresh(&path, CACHE_STALE_SECS)?;
     serde_json::from_slice(&bytes).ok()
 }
 
-pub fn write_findings_by_hash(hash: u64, kind: DocumentKind, findings: &ScanResult) {
+pub fn write_findings_by_hash(hash: u64, kind: DocumentKind, findings: &FindingsBuilder) {
     write_json(&findings_hash_path(hash, kind), findings);
 }
 

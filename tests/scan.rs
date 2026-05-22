@@ -1,4 +1,4 @@
-use hifi::scan::{scan_endpoints, ScanResult};
+use hifi::{scan_endpoints, ScanResult};
 
 #[rustfmt::skip]
 const API_CASES: &[(&str, &str, &str, &str)] = &[
@@ -193,7 +193,7 @@ fn rejects_real_world_route_noise_without_dropping_routes() {
 }
 
 fn scan(src: &str) -> ScanResult {
-    scan_endpoints(src.as_bytes())
+    scan_endpoints(src.as_bytes()).finish()
 }
 
 fn assert_api(result: &ScanResult, url: &str) {

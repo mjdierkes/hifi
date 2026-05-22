@@ -5,47 +5,30 @@ document and any static assets that the page references.
 
 ## Execution Flow
 
-1. `app` parses CLI arguments into a typed command.
-2. `processor` plans the request, checks processed cache, loads the root page,
-   scans the root document, recursively scans discovered assets, and builds the
-   final output.
-3. `discover` finds static assets and framework payloads worth scanning.
-4. `scan` extracts API calls, API-like candidates, and client routes from bytes.
-5. `fetch` recursively fetches discovered assets with bounded concurrency and a
-   hard cap on total assets.
-6. `cache` stores best-effort processed results, root pages, asset scans, and
-   HTTP validators.
-7. `daemon` keeps warm in-memory caches and coalesces concurrent scans for the
-   same URL.
+`app` parses commands. `processor` checks `ScanCache`, loads the root page,
+scans it, fetches discovered assets, and builds output. `discover` handles
+generic HTML/literal/dynamic references; `framework` owns framework-specific
+context, asset typing, resolution, payload findings, manifests, and headers.
+`fetch` recursively scans assets with bounded concurrency. `daemon` keeps warm
+memory caches and coalesces identical scans.
 
 ## Scanner Shape
 
-The scanner is split by responsibility:
+The scanner is heuristic: it does not evaluate JavaScript or build an AST.
+`source.rs` provides shared byte helpers, `scan/*` turns bytes into evidence,
+`FindingsBuilder` is mutable raw evidence, and `ScanResult` is finalized after
+route canonicalization, candidate demotion, and compaction.
 
-- `scan/patterns.rs`: registers search literals and the kind of evidence each
-  literal represents.
-- `scan/extract.rs`: extracts URL-like values from quoted strings, object
-  values, and raw tokens.
-- `scan/classify.rs`: decides whether a value is an API, candidate, route, or
-  irrelevant asset.
-- `scan/shape.rs`: infers method/body/header/content-type hints for confirmed
-  API calls.
-- `source.rs`: shared byte-level parsing primitives used by both `scan` and
-  `discover`.
+## Framework Policy
 
-The scanner is intentionally heuristic. It is designed to make minified client
-bundles understandable without evaluating JavaScript or requiring a full AST.
+Discovery stays generic. Framework modules own asset classification, resolution,
+skip policy, payload/manifest findings, and request headers.
 
 ## Cache Layers
 
-There are three cache layers:
-
-- Processed output cache: final JSON output for a URL.
-- Page cache: root page body plus its final redirected URL.
-- Asset cache: per-asset scan results, scoped by page revision/cache key.
-
-Cache failures are best-effort. They should not fail a scan; they should only
-make future scans colder.
+Cache failures are best-effort and only make future scans colder. `ScanCache`
+owns processed-output paths, TTL policy, and revision lookup. Asset, findings,
+and completion caches stay in `runtime::cache`.
 
 ## Network Policy
 

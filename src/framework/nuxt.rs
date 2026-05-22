@@ -87,13 +87,13 @@ pub fn route_from_payload(base: &Url) -> Option<String> {
     })
 }
 
-pub fn record_routes(bytes: &[u8], findings: &mut crate::scan::ScanResult) {
+pub fn record_routes(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
     for route in parse_routes(bytes) {
         findings.record_route(route, Extractor::NuxtPayload);
     }
 }
 
-pub fn record_page_route(bytes: &[u8], findings: &mut crate::scan::ScanResult) {
+pub fn record_page_route(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
     for key in [b"routePath".as_slice(), b"path".as_slice()] {
         let Some(route) = string_value_after_key(bytes, key) else {
             continue;
@@ -106,7 +106,7 @@ pub fn record_page_route(bytes: &[u8], findings: &mut crate::scan::ScanResult) {
     }
 }
 
-pub fn record_endpoint_maps(bytes: &[u8], findings: &mut crate::scan::ScanResult) {
+pub fn record_endpoint_maps(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
     for endpoint in endpoint_map_urls(bytes) {
         findings.record_api(
             endpoint,
@@ -179,7 +179,7 @@ fn collect_literal_manifest_candidates(bytes: &[u8], out: &mut Vec<String>) {
     ] {
         for pos in memchr::memmem::find_iter(bytes, marker) {
             let start = source::walk_token_start(bytes, pos);
-            if !is_string_literal_context(bytes, start) {
+            if !source::is_string_literal_start(bytes, start) {
                 continue;
             }
             let Some(raw) = source::token_string(bytes, start, TemplateMode::Preserve) else {
@@ -257,7 +257,7 @@ fn collect_endpoint_literals(bytes: &[u8], out: &mut Vec<String>) {
         let mut offset = 0;
         while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
             let pos = offset + rel;
-            if !key_boundary(bytes, pos, key.len()) {
+            if !source::is_identifier_boundary(bytes, pos, key.len()) {
                 offset = pos + key.len();
                 continue;
             }
@@ -271,7 +271,7 @@ fn collect_endpoint_literals(bytes: &[u8], out: &mut Vec<String>) {
         let mut offset = 0;
         while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
             let pos = offset + rel;
-            if key_boundary(bytes, pos, key.len()) {
+            if source::is_identifier_boundary(bytes, pos, key.len()) {
                 collect_api_strings(&bytes[pos..bytes.len().min(pos + 4096)], out);
             }
             offset = pos + key.len();
@@ -293,7 +293,7 @@ fn collect_relative_endpoint_literals(bytes: &[u8], bases: &[String], out: &mut 
         let mut offset = 0;
         while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
             let pos = offset + rel;
-            if key_boundary(bytes, pos, key.len()) {
+            if source::is_identifier_boundary(bytes, pos, key.len()) {
                 collect_relative_api_strings(&bytes[pos..bytes.len().min(pos + 4096)], bases, out);
             }
             offset = pos + key.len();
@@ -332,7 +332,7 @@ fn runtime_api_bases(bytes: &[u8]) -> Vec<String> {
         let mut offset = 0;
         while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
             let pos = offset + rel;
-            if key_boundary(bytes, pos, key.len()) {
+            if source::is_identifier_boundary(bytes, pos, key.len()) {
                 if let Some(value) = string_value_after_key(&bytes[pos..], key) {
                     push_runtime_api_base(&mut out, &value);
                 }
@@ -539,46 +539,7 @@ fn join_paths(left: &str, right: &str) -> String {
 }
 
 fn string_value_after_key(bytes: &[u8], key: &[u8]) -> Option<String> {
-    let mut offset = 0;
-    while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
-        let pos = offset + rel;
-        if !key_boundary(bytes, pos, key.len()) {
-            offset = pos + 1;
-            continue;
-        }
-        let mut i = source::skip_ws(bytes, pos + key.len());
-        if matches!(bytes.get(i), Some(b'"' | b'\'')) {
-            let quote = bytes[i];
-            i = source::skip_ws(bytes, i + 1);
-            if bytes.get(i) == Some(&quote) {
-                i = source::skip_ws(bytes, i + 1);
-            }
-        }
-        if bytes.get(i) != Some(&b':') {
-            offset = pos + 1;
-            continue;
-        }
-        i = source::skip_ws(bytes, i + 1);
-        if matches!(bytes.get(i), Some(b'"' | b'\'' | b'`')) {
-            let quote = bytes[i];
-            return source::quoted_string(bytes, i + 1, quote, TemplateMode::Preserve);
-        }
-        offset = pos + 1;
-    }
-    None
-}
-
-fn key_boundary(bytes: &[u8], pos: usize, len: usize) -> bool {
-    let before_ok = pos == 0 || !source::is_identifier_continue(bytes[pos - 1]);
-    let after = pos + len;
-    let after_ok = bytes
-        .get(after)
-        .is_none_or(|b| !source::is_identifier_continue(*b));
-    before_ok && after_ok
-}
-
-fn is_string_literal_context(bytes: &[u8], start: usize) -> bool {
-    start > 0 && matches!(bytes[start - 1], b'"' | b'\'' | b'`')
+    source::keyed_string_value(bytes, key, b":", true)
 }
 
 fn push_resolved_asset(

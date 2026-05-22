@@ -134,6 +134,30 @@ pub fn push_manifests(
     }
 }
 
+pub fn push_data_assets_for_routes(
+    routes: &[String],
+    base: &Url,
+    base_path: Option<&str>,
+    seen: &mut FxHashSet<Url>,
+    out: &mut Vec<AssetRef>,
+) {
+    for route in routes {
+        let Some(path) = data_path_for_route_with_base(route, base_path) else {
+            continue;
+        };
+        let Ok(url) = base.join(&path) else {
+            continue;
+        };
+        if seen.insert(url.clone()) {
+            out.push(AssetRef {
+                url,
+                kind: AssetKind::Payload,
+                source: AssetSource::FrameworkManifest,
+            });
+        }
+    }
+}
+
 pub fn primary_immutable_root(bytes: &[u8], base: &Url) -> Option<String> {
     observed_immutable_root(base)
         .or_else(|| {
@@ -159,7 +183,7 @@ pub fn routes(bytes: &[u8]) -> Vec<String> {
     routes
 }
 
-pub fn record_routes(bytes: &[u8], findings: &mut crate::scan::ScanResult) -> Vec<String> {
+pub fn record_routes(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) -> Vec<String> {
     let routes = routes(bytes);
     for route in &routes {
         findings.record_route(route.clone(), Extractor::SvelteKitData);
@@ -167,7 +191,7 @@ pub fn record_routes(bytes: &[u8], findings: &mut crate::scan::ScanResult) -> Ve
     routes
 }
 
-pub fn record_form_actions(bytes: &[u8], base: &Url, findings: &mut crate::scan::ScanResult) {
+pub fn record_form_actions(bytes: &[u8], base: &Url, findings: &mut crate::scan::FindingsBuilder) {
     scan_action_attrs(bytes, base, findings);
     scan_action_literals(bytes, base, findings);
     if source::contains(bytes, b"x-sveltekit-action") || source::contains(bytes, b"enhance(") {
@@ -181,7 +205,7 @@ pub fn record_form_actions(bytes: &[u8], base: &Url, findings: &mut crate::scan:
     }
 }
 
-pub fn record_data_dependencies(bytes: &[u8], findings: &mut crate::scan::ScanResult) {
+pub fn record_data_dependencies(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
         collect_json_dependencies(&value, None, findings);
     } else if let Some(start) = bytes.iter().position(|b| matches!(*b, b'{' | b'[')) {
@@ -239,7 +263,7 @@ fn collect_literal_immutable_roots(bytes: &[u8], out: &mut Vec<String>) {
     ] {
         for pos in memchr::memmem::find_iter(bytes, marker) {
             let start = source::walk_token_start(bytes, pos);
-            if !is_string_literal_context(bytes, start) {
+            if !source::is_string_literal_start(bytes, start) {
                 continue;
             }
             let Some(raw) = source::token_string(bytes, start, TemplateMode::Preserve) else {
@@ -292,29 +316,7 @@ fn app_dir(bytes: &[u8]) -> Option<String> {
 }
 
 fn string_value_after_key(bytes: &[u8], key: &[u8]) -> Option<String> {
-    let mut offset = 0;
-    while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
-        let pos = offset + rel;
-        if !source::is_identifier_boundary_before(bytes, pos) {
-            offset = pos + key.len();
-            continue;
-        }
-        let mut i = source::skip_ws(bytes, pos + key.len());
-        if bytes.get(i) == Some(&b'"') || bytes.get(i) == Some(&b'\'') {
-            offset = pos + key.len();
-            continue;
-        }
-        if bytes.get(i) != Some(&b':') && bytes.get(i) != Some(&b'=') {
-            offset = pos + key.len();
-            continue;
-        }
-        i = source::skip_ws(bytes, i + 1);
-        if let Some(value) = quoted_string_at(bytes, i) {
-            return Some(value);
-        }
-        offset = pos + key.len();
-    }
-    None
+    source::keyed_string_value(bytes, key, b":=", false)
 }
 
 fn collect_json_routes(value: &serde_json::Value, key: Option<&str>, out: &mut Vec<String>) {
@@ -367,7 +369,7 @@ fn collect_keyed_literal_routes(bytes: &[u8], out: &mut Vec<String>) {
                 continue;
             }
             i = source::skip_ws(bytes, i + 1);
-            let Some(route) = quoted_string_at(bytes, i) else {
+            let Some(route) = source::quoted_string_at(bytes, i, TemplateMode::Preserve) else {
                 offset = pos + key.len();
                 continue;
             };
@@ -381,7 +383,7 @@ fn collect_route_id_literals(bytes: &[u8], out: &mut Vec<String>) {
     for marker in [b"/[".as_slice(), b"/(".as_slice()] {
         for pos in memchr::memmem::find_iter(bytes, marker) {
             let start = source::walk_token_start(bytes, pos);
-            if !is_string_literal_context(bytes, start) {
+            if !source::is_string_literal_start(bytes, start) {
                 continue;
             }
             let Some(route) = source::token_string(bytes, start, TemplateMode::Preserve) else {
@@ -458,7 +460,7 @@ fn params_from_window(bytes: &[u8]) -> Vec<String> {
         };
         let mut i = pos + key.len();
         while i < bytes.len().min(pos + 256) {
-            if let Some(value) = quoted_string_at(bytes, i) {
+            if let Some(value) = source::quoted_string_at(bytes, i, TemplateMode::Preserve) {
                 if value
                     .bytes()
                     .all(|b| b == b'_' || b == b'-' || b.is_ascii_alphanumeric())
@@ -501,7 +503,7 @@ fn route_literal_byte(b: u8) -> bool {
 fn collect_json_dependencies(
     value: &serde_json::Value,
     key: Option<&str>,
-    findings: &mut crate::scan::ScanResult,
+    findings: &mut crate::scan::FindingsBuilder,
 ) {
     match value {
         serde_json::Value::String(s) => {
@@ -523,7 +525,7 @@ fn collect_json_dependencies(
     }
 }
 
-fn collect_literal_dependency_values(bytes: &[u8], findings: &mut crate::scan::ScanResult) {
+fn collect_literal_dependency_values(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
     for key in [
         b"dependencies".as_slice(),
         b"dependency".as_slice(),
@@ -540,7 +542,7 @@ fn collect_literal_dependency_values(bytes: &[u8], findings: &mut crate::scan::S
     }
 }
 
-fn scan_dependency_window(bytes: &[u8], findings: &mut crate::scan::ScanResult) {
+fn scan_dependency_window(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
     for marker in [
         b"/api".as_slice(),
         b"/graphql".as_slice(),
@@ -548,7 +550,7 @@ fn scan_dependency_window(bytes: &[u8], findings: &mut crate::scan::ScanResult) 
     ] {
         for pos in memchr::memmem::find_iter(bytes, marker) {
             let start = source::walk_token_start(bytes, pos);
-            if !is_string_literal_context(bytes, start) {
+            if !source::is_string_literal_start(bytes, start) {
                 continue;
             }
             let Some(raw) = source::token_string(bytes, start, TemplateMode::Preserve) else {
@@ -559,7 +561,7 @@ fn scan_dependency_window(bytes: &[u8], findings: &mut crate::scan::ScanResult) 
     }
 }
 
-fn scan_action_attrs(bytes: &[u8], base: &Url, findings: &mut crate::scan::ScanResult) {
+fn scan_action_attrs(bytes: &[u8], base: &Url, findings: &mut crate::scan::FindingsBuilder) {
     let mut offset = 0;
     while let Some(rel) = source::find_ascii_ignore_case(&bytes[offset..], b"action") {
         let pos = offset + rel;
@@ -573,7 +575,7 @@ fn scan_action_attrs(bytes: &[u8], base: &Url, findings: &mut crate::scan::ScanR
             continue;
         }
         i = source::skip_ws(bytes, i + 1);
-        let Some(raw) = quoted_string_at(bytes, i) else {
+        let Some(raw) = source::quoted_string_at(bytes, i, TemplateMode::Preserve) else {
             offset = pos + 1;
             continue;
         };
@@ -582,11 +584,11 @@ fn scan_action_attrs(bytes: &[u8], base: &Url, findings: &mut crate::scan::ScanR
     }
 }
 
-fn scan_action_literals(bytes: &[u8], base: &Url, findings: &mut crate::scan::ScanResult) {
+fn scan_action_literals(bytes: &[u8], base: &Url, findings: &mut crate::scan::FindingsBuilder) {
     for marker in [b"?/".as_slice(), b"/__data.json?/".as_slice()] {
         for pos in memchr::memmem::find_iter(bytes, marker) {
             let start = source::walk_token_start(bytes, pos);
-            if !is_string_literal_context(bytes, start) {
+            if !source::is_string_literal_start(bytes, start) {
                 continue;
             }
             let Some(raw) = source::token_string(bytes, start, TemplateMode::Preserve) else {
@@ -597,7 +599,7 @@ fn scan_action_literals(bytes: &[u8], base: &Url, findings: &mut crate::scan::Sc
     }
 }
 
-fn record_action(raw: &str, base: &Url, findings: &mut crate::scan::ScanResult) {
+fn record_action(raw: &str, base: &Url, findings: &mut crate::scan::FindingsBuilder) {
     let route = if raw.starts_with("?/") {
         route_from_page(base)
     } else if raw.contains("/__data.json?/") {
@@ -620,7 +622,7 @@ fn record_action(raw: &str, base: &Url, findings: &mut crate::scan::ScanResult) 
     );
 }
 
-fn record_dependency_url(raw: &str, findings: &mut crate::scan::ScanResult) {
+fn record_dependency_url(raw: &str, findings: &mut crate::scan::FindingsBuilder) {
     if !crate::scan::classify::is_api_candidate(raw) {
         return;
     }
@@ -638,14 +640,6 @@ fn route_from_page(base: &Url) -> Option<String> {
         let path = base.path();
         crate::scan::classify::is_client_route(path).then(|| path.to_owned())
     })
-}
-
-fn quoted_string_at(bytes: &[u8], i: usize) -> Option<String> {
-    let quote = *bytes.get(i)?;
-    if !matches!(quote, b'"' | b'\'' | b'`') {
-        return None;
-    }
-    source::quoted_string(bytes, i + 1, quote, TemplateMode::Preserve)
 }
 
 fn push_route(out: &mut Vec<String>, raw: &str) {
@@ -682,10 +676,6 @@ fn dependency_key_context(key: &str) -> bool {
         key,
         "dependencies" | "dependency" | "depends" | "href" | "url" | "action"
     )
-}
-
-fn is_string_literal_context(bytes: &[u8], start: usize) -> bool {
-    start > 0 && matches!(bytes[start - 1], b'"' | b'\'' | b'`')
 }
 
 fn attr_name_boundary(bytes: &[u8], pos: usize) -> bool {

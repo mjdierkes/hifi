@@ -1,5 +1,7 @@
-use hifi::discover::{scan_document, scan_document_with_config, DocumentKind};
-use hifi::scan::{next::NextConfig, EvidenceKind, Extractor};
+use hifi::{
+    scan_document, scan_document_with_config, DocumentKind, DocumentScan, EvidenceKind, Extractor,
+    NextConfig,
+};
 use url::Url;
 
 #[test]
@@ -708,7 +710,7 @@ fn flight_payloads_add_browser_surface_without_64k_truncation() {
     assert_route(&scan_html(&html), "/late-route");
 }
 
-fn scan_html(src: &str) -> hifi::discover::DocumentScan {
+fn scan_html(src: &str) -> DocumentScan {
     scan(
         src.as_bytes(),
         &url("https://example.com/"),
@@ -716,7 +718,7 @@ fn scan_html(src: &str) -> hifi::discover::DocumentScan {
     )
 }
 
-fn scan(bytes: &[u8], base: &Url, kind: DocumentKind) -> hifi::discover::DocumentScan {
+fn scan(bytes: &[u8], base: &Url, kind: DocumentKind) -> DocumentScan {
     scan_document(bytes, base, kind)
 }
 
@@ -724,7 +726,7 @@ fn url(raw: &str) -> Url {
     Url::parse(raw).unwrap()
 }
 
-fn assert_asset(result: &hifi::discover::DocumentScan, expected: &str) {
+fn assert_asset(result: &DocumentScan, expected: &str) {
     let assets = asset_urls(result);
     assert!(
         assets.contains(&expected.to_string()),
@@ -732,13 +734,13 @@ fn assert_asset(result: &hifi::discover::DocumentScan, expected: &str) {
     );
 }
 
-fn assert_assets(result: &hifi::discover::DocumentScan, expected: &[&str]) {
+fn assert_assets(result: &DocumentScan, expected: &[&str]) {
     for url in expected {
         assert_asset(result, url);
     }
 }
 
-fn assert_no_asset_containing(result: &hifi::discover::DocumentScan, needle: &str) {
+fn assert_no_asset_containing(result: &DocumentScan, needle: &str) {
     let assets = asset_urls(result);
     assert!(
         !assets.iter().any(|url| url.contains(needle)),
@@ -746,7 +748,7 @@ fn assert_no_asset_containing(result: &hifi::discover::DocumentScan, needle: &st
     );
 }
 
-fn assert_api(result: &hifi::discover::DocumentScan, url: &str) {
+fn assert_api(result: &DocumentScan, url: &str) {
     assert!(
         result.findings.api_map().contains_key(url),
         "{url} not in {:?}",
@@ -754,7 +756,7 @@ fn assert_api(result: &hifi::discover::DocumentScan, url: &str) {
     );
 }
 
-fn assert_no_api(result: &hifi::discover::DocumentScan, url: &str) {
+fn assert_no_api(result: &DocumentScan, url: &str) {
     assert!(
         !result.findings.api_map().contains_key(url),
         "{url} unexpectedly in {:?}",
@@ -762,7 +764,7 @@ fn assert_no_api(result: &hifi::discover::DocumentScan, url: &str) {
     );
 }
 
-fn assert_candidate(result: &hifi::discover::DocumentScan, url: &str) {
+fn assert_candidate(result: &DocumentScan, url: &str) {
     assert!(
         result.findings.candidate_map().contains_key(url),
         "{url} not in {:?}",
@@ -770,7 +772,7 @@ fn assert_candidate(result: &hifi::discover::DocumentScan, url: &str) {
     );
 }
 
-fn assert_route(result: &hifi::discover::DocumentScan, url: &str) {
+fn assert_route(result: &DocumentScan, url: &str) {
     assert!(
         result.findings.route_map().contains_key(url),
         "{url} not in {:?}",
@@ -778,18 +780,13 @@ fn assert_route(result: &hifi::discover::DocumentScan, url: &str) {
     );
 }
 
-fn assert_routes(result: &hifi::discover::DocumentScan, routes: &[&str]) {
+fn assert_routes(result: &DocumentScan, routes: &[&str]) {
     for route in routes {
         assert_route(result, route);
     }
 }
 
-fn assert_evidence(
-    result: &hifi::discover::DocumentScan,
-    url: &str,
-    kind: EvidenceKind,
-    extractor: Extractor,
-) {
+fn assert_evidence(result: &DocumentScan, url: &str, kind: EvidenceKind, extractor: Extractor) {
     assert!(
         result
             .findings
@@ -800,7 +797,7 @@ fn assert_evidence(
     );
 }
 
-fn asset_urls(result: &hifi::discover::DocumentScan) -> Vec<String> {
+fn asset_urls(result: &DocumentScan) -> Vec<String> {
     result
         .assets
         .iter()

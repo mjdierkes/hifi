@@ -87,24 +87,27 @@ pub struct Evidence {
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
-pub struct ScanResult {
+pub struct FindingsBuilder {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
 }
 
-impl ScanResult {
-    pub fn merge(&mut self, other: ScanResult) {
-        self.merge_findings(&other);
+impl FindingsBuilder {
+    pub fn extend(&mut self, other: FindingsBuilder) {
+        self.evidence.extend(other.evidence);
     }
 
-    pub fn merge_findings(&mut self, other: &ScanResult) {
+    pub fn extend_result(&mut self, other: &ScanResult) {
         self.evidence.extend(other.evidence.iter().cloned());
     }
 
-    pub fn finalize(&mut self) {
+    pub fn finish(mut self) -> ScanResult {
         self.canonicalize_routes();
         self.drop_demoted();
         self.compact();
+        ScanResult {
+            evidence: self.evidence,
+        }
     }
 
     pub fn record_api(&mut self, url: String, shape: Shape, extractor: Extractor) {
@@ -135,34 +138,6 @@ impl ScanResult {
             confidence: extractor.confidence(),
             shape: None,
         });
-    }
-
-    pub fn api_map(&self) -> ApiMap {
-        let mut out = ApiMap::default();
-        for evidence in &self.evidence {
-            if evidence.kind == EvidenceKind::Api {
-                if let Some(shape) = &evidence.shape {
-                    out.entry(evidence.url.clone()).or_default().merge(shape);
-                }
-            }
-        }
-        out
-    }
-
-    pub fn route_map(&self) -> RouteMap {
-        self.evidence
-            .iter()
-            .filter(|e| e.kind == EvidenceKind::Route)
-            .map(|e| (e.url.clone(), ()))
-            .collect()
-    }
-
-    pub fn candidate_map(&self) -> CandidateMap {
-        self.evidence
-            .iter()
-            .filter(|e| e.kind == EvidenceKind::Candidate)
-            .map(|e| (e.url.clone(), ()))
-            .collect()
     }
 
     fn canonicalize_routes(&mut self) {
@@ -202,6 +177,68 @@ impl ScanResult {
     }
 }
 
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct ScanResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<Evidence>,
+}
+
+impl ScanResult {
+    pub fn api_map(&self) -> ApiMap {
+        api_map_from(&self.evidence)
+    }
+
+    pub fn route_map(&self) -> RouteMap {
+        route_map_from(&self.evidence)
+    }
+
+    pub fn candidate_map(&self) -> CandidateMap {
+        candidate_map_from(&self.evidence)
+    }
+}
+
+impl FindingsBuilder {
+    pub fn api_map(&self) -> ApiMap {
+        api_map_from(&self.evidence)
+    }
+
+    pub fn route_map(&self) -> RouteMap {
+        route_map_from(&self.evidence)
+    }
+
+    pub fn candidate_map(&self) -> CandidateMap {
+        candidate_map_from(&self.evidence)
+    }
+}
+
+fn api_map_from(evidence: &[Evidence]) -> ApiMap {
+    let mut out = ApiMap::default();
+    for evidence in evidence {
+        if evidence.kind == EvidenceKind::Api {
+            if let Some(shape) = &evidence.shape {
+                out.entry(evidence.url.clone()).or_default().merge(shape);
+            }
+        }
+    }
+    out
+}
+
+fn route_map_from(evidence: &[Evidence]) -> RouteMap {
+    evidence
+        .iter()
+        .filter(|e| e.kind == EvidenceKind::Route)
+        .map(|e| (e.url.clone(), ()))
+        .collect()
+}
+
+fn candidate_map_from(evidence: &[Evidence]) -> CandidateMap {
+    evidence
+        .iter()
+        .filter(|e| e.kind == EvidenceKind::Candidate)
+        .map(|e| (e.url.clone(), ()))
+        .collect()
+}
+
 fn canonicalize_route(s: &str) -> String {
     // Strip fragment and query; for navigation routes the path is canonical.
     let path = s.split(['?', '#']).next().unwrap_or(s);
@@ -214,8 +251,8 @@ fn canonicalize_route(s: &str) -> String {
     }
 }
 
-pub fn scan_endpoints(bytes: &[u8]) -> ScanResult {
-    let mut out = ScanResult::default();
+pub fn scan_endpoints(bytes: &[u8]) -> FindingsBuilder {
+    let mut out = FindingsBuilder::default();
 
     for m in DOCUMENT_AC.find_iter(bytes) {
         let pattern = DOCUMENT_PATTERNS[m.pattern().as_usize()];
@@ -240,7 +277,13 @@ pub(crate) fn has_document_pattern(bytes: &[u8]) -> bool {
     DOCUMENT_AC.is_match(bytes)
 }
 
-fn record_api_call(bytes: &[u8], start: usize, after: usize, anchor: &str, out: &mut ScanResult) {
+fn record_api_call(
+    bytes: &[u8],
+    start: usize,
+    after: usize,
+    anchor: &str,
+    out: &mut FindingsBuilder,
+) {
     let Some((url, mut shape)) = shape::scan_call(bytes, start, after, anchor) else {
         return;
     };
@@ -254,13 +297,13 @@ fn record_api_call(bytes: &[u8], start: usize, after: usize, anchor: &str, out: 
     out.record_api(url, shape, Extractor::ApiCall);
 }
 
-fn record_route_call(bytes: &[u8], after: usize, out: &mut ScanResult) {
+fn record_route_call(bytes: &[u8], after: usize, out: &mut FindingsBuilder) {
     if let Some(url) = extract::url_arg(bytes, after).filter(|url| classify::is_client_route(url)) {
         out.record_route(url, Extractor::RouteCall);
     }
 }
 
-fn record_route_value(bytes: &[u8], start: usize, after: usize, out: &mut ScanResult) {
+fn record_route_value(bytes: &[u8], start: usize, after: usize, out: &mut FindingsBuilder) {
     if !source::is_identifier_boundary_before(bytes, start) {
         return;
     }
@@ -271,7 +314,7 @@ fn record_route_value(bytes: &[u8], start: usize, after: usize, out: &mut ScanRe
     }
 }
 
-fn record_route_start(bytes: &[u8], after: usize, out: &mut ScanResult) {
+fn record_route_start(bytes: &[u8], after: usize, out: &mut FindingsBuilder) {
     let slash = after.saturating_sub(1);
     if !push_candidate(bytes, slash, out) {
         if let Some(url) =
@@ -282,7 +325,7 @@ fn record_route_start(bytes: &[u8], after: usize, out: &mut ScanResult) {
     }
 }
 
-fn push_candidate(bytes: &[u8], pos: usize, out: &mut ScanResult) -> bool {
+fn push_candidate(bytes: &[u8], pos: usize, out: &mut FindingsBuilder) -> bool {
     let Some(url) = extract::token_before(bytes, pos) else {
         return false;
     };
@@ -295,7 +338,7 @@ fn push_candidate(bytes: &[u8], pos: usize, out: &mut ScanResult) -> bool {
     true
 }
 
-fn scan_api_clients(bytes: &[u8], out: &mut ScanResult) {
+fn scan_api_clients(bytes: &[u8], out: &mut FindingsBuilder) {
     let bindings = collect_string_bindings(bytes);
     for anchor in [
         b"$fetch(".as_slice(),
@@ -350,7 +393,7 @@ fn record_first_arg_client(
     bytes: &[u8],
     after: usize,
     bindings: &FxHashMap<String, String>,
-    out: &mut ScanResult,
+    out: &mut FindingsBuilder,
 ) {
     record_first_arg_client_with_method(bytes, after, method_near(bytes, after), bindings, out);
 }
@@ -360,7 +403,7 @@ fn record_first_arg_client_with_method(
     after: usize,
     method: Option<&str>,
     bindings: &FxHashMap<String, String>,
-    out: &mut ScanResult,
+    out: &mut FindingsBuilder,
 ) {
     let Some(url) = first_arg_url(bytes, after, bindings) else {
         return;
@@ -381,13 +424,15 @@ fn record_object_client(
     bytes: &[u8],
     after: usize,
     bindings: &FxHashMap<String, String>,
-    out: &mut ScanResult,
+    out: &mut FindingsBuilder,
 ) {
     let i = source::skip_ws(bytes, after);
     if bytes.get(i) != Some(&b'{') {
         return;
     }
-    let end = object_end(bytes, i).unwrap_or_else(|| bytes.len().min(i + 1024));
+    let end = source::balanced_end(bytes, i)
+        .map(|end| end + 1)
+        .unwrap_or_else(|| bytes.len().min(i + 1024));
     let obj = &bytes[i..end];
     let Some(url) = object_url_value(obj, &[b"url", b"URL", b"endpoint", b"path"], bindings) else {
         return;
@@ -412,7 +457,7 @@ fn record_object_client(
 fn scan_generic_method_clients(
     bytes: &[u8],
     bindings: &FxHashMap<String, String>,
-    out: &mut ScanResult,
+    out: &mut FindingsBuilder,
 ) {
     for (anchor, method) in [
         (b".get(".as_slice(), "GET"),
@@ -680,27 +725,4 @@ fn contains_key(bytes: &[u8], key: &[u8]) -> bool {
         offset = pos + 1;
     }
     false
-}
-
-fn object_end(bytes: &[u8], open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' | b'\'' | b'`' => {
-                i = source::quoted_end(bytes, i + 1, bytes[i])? + 1;
-                continue;
-            }
-            b'{' | b'[' | b'(' => depth += 1,
-            b'}' | b']' | b')' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(i + 1);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
 }

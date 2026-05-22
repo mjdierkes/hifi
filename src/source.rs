@@ -229,6 +229,14 @@ pub fn quoted_string(
     string_from_parts(bytes, start, bytes.len(), normalized)
 }
 
+pub fn quoted_string_at(bytes: &[u8], i: usize, template_mode: TemplateMode) -> Option<String> {
+    let quote = *bytes.get(i)?;
+    if !matches!(quote, b'"' | b'\'' | b'`') {
+        return None;
+    }
+    quoted_string(bytes, i + 1, quote, template_mode)
+}
+
 pub fn quoted_end(bytes: &[u8], mut i: usize, quote: u8) -> Option<usize> {
     while i < bytes.len() {
         if bytes[i] == b'\\' && i + 1 < bytes.len() {
@@ -250,6 +258,10 @@ pub fn token_string(bytes: &[u8], start: usize, template_mode: TemplateMode) -> 
 
 pub fn walk_token_start(bytes: &[u8], pos: usize) -> usize {
     rfind_token_delim(&bytes[..pos], true).map_or(0, |idx| idx + 1)
+}
+
+pub fn is_string_literal_start(bytes: &[u8], start: usize) -> bool {
+    start > 0 && matches!(bytes[start - 1], b'"' | b'\'' | b'`')
 }
 
 pub fn identifier_at(bytes: &[u8], start: usize) -> Option<&[u8]> {
@@ -285,6 +297,70 @@ pub fn skip_template_expr(bytes: &[u8], mut i: usize) -> usize {
 
 pub fn is_identifier_boundary_before(bytes: &[u8], pos: usize) -> bool {
     pos == 0 || !is_identifier_continue(bytes[pos - 1])
+}
+
+pub fn is_identifier_boundary(bytes: &[u8], pos: usize, len: usize) -> bool {
+    is_identifier_boundary_before(bytes, pos)
+        && bytes
+            .get(pos + len)
+            .is_none_or(|b| !is_identifier_continue(*b))
+}
+
+pub fn keyed_string_value(
+    bytes: &[u8],
+    key: &[u8],
+    separators: &[u8],
+    allow_quoted_key: bool,
+) -> Option<String> {
+    let mut offset = 0;
+    while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
+        let pos = offset + rel;
+        offset = pos + key.len();
+        if !is_identifier_boundary(bytes, pos, key.len()) {
+            continue;
+        }
+        let mut i = skip_ws(bytes, pos + key.len());
+        if allow_quoted_key && matches!(bytes.get(i), Some(b'"' | b'\'')) {
+            let quote = bytes[i];
+            i = skip_ws(bytes, i + 1);
+            if bytes.get(i) == Some(&quote) {
+                i = skip_ws(bytes, i + 1);
+            }
+        } else if matches!(bytes.get(i), Some(b'"' | b'\'')) {
+            continue;
+        }
+        if !bytes.get(i).is_some_and(|b| separators.contains(b)) {
+            continue;
+        }
+        i = skip_ws(bytes, i + 1);
+        if let Some(value) = quoted_string_at(bytes, i, TemplateMode::Preserve) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+pub fn balanced_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'"' | b'\'' | b'`') => {
+                i = quoted_end(bytes, i + 1, quote)? + 1;
+                continue;
+            }
+            b'{' | b'[' | b'(' => depth += 1,
+            b'}' | b']' | b')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn token_end(

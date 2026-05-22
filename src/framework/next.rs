@@ -2,7 +2,7 @@
 
 use crate::discover::{AssetKind, AssetRef, AssetSource, DocumentKind};
 use crate::scan::next::{self as parser, NextConfig};
-use crate::scan::{Extractor, ScanResult, Shape};
+use crate::scan::{Extractor, FindingsBuilder, Shape};
 use crate::source::{self, TemplateMode};
 use rustc_hash::FxHashSet;
 use url::Url;
@@ -177,14 +177,14 @@ pub fn is_payload(raw: &str, path: &str) -> bool {
         || raw.contains("&_rsc=")
 }
 
-pub fn push_framework_candidate(findings: &mut ScanResult, raw: &str) {
+pub fn push_framework_candidate(findings: &mut FindingsBuilder, raw: &str) {
     let path = raw.split(['?', '#']).next().unwrap_or(raw);
     if is_framework_data(raw, path) && raw.len() <= 512 {
         findings.record_candidate(raw.to_owned(), Extractor::Literal);
     }
 }
 
-pub fn scan_flight(bytes: &[u8], findings: &mut ScanResult) {
+pub fn scan_flight(bytes: &[u8], findings: &mut FindingsBuilder) {
     for route in parser::extract_flight_routes(bytes) {
         if crate::scan::classify::is_api_candidate(&route) {
             let url = crate::scan::classify::normalize_api_url(&route);
@@ -209,7 +209,7 @@ pub fn scan_server_action(
     base: &Url,
     kind: DocumentKind,
     config: Option<&NextConfig>,
-    findings: &mut ScanResult,
+    findings: &mut FindingsBuilder,
 ) {
     if !matches!(kind, DocumentKind::Html | DocumentKind::Payload)
         || !NEXT_ACTION_MARKERS

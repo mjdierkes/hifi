@@ -2,14 +2,14 @@
 //!
 //! The processor gives this module initial `AssetRef`s. Fetch keeps a bounded
 //! breadth-first queue, reads each static asset, scans it for more references,
-//! and merges findings back into the caller's `ScanResult`.
+//! and merges findings back into the caller's `FindingsBuilder`.
 //!
 //! Asset caching is revision-aware: the same URL can produce different scanned
 //! data across builds, so the processed asset cache is scoped by cache key.
 
 use crate::discover::{self, AssetRef, AssetSource, DocumentScan};
 use crate::framework::{self, FrameworkConfig};
-use crate::scan::ScanResult;
+use crate::scan::FindingsBuilder;
 
 use super::cache::{self, AssetData};
 use super::net;
@@ -81,7 +81,7 @@ pub async fn scan_assets(
     client: Client,
     initial: impl IntoIterator<Item = AssetRef>,
     opts: AssetScanOptions,
-    out: &mut ScanResult,
+    out: &mut FindingsBuilder,
 ) -> AssetScanStats {
     let mut stats = AssetScanStats::default();
     let mut visited = rustc_hash::FxHashSet::default();
@@ -115,7 +115,7 @@ pub async fn scan_assets(
                 if result.memory_hit {
                     stats.memory_hits += 1;
                 }
-                out.merge_findings(&result.asset.findings);
+                out.extend(result.asset.findings.clone());
                 enqueue_assets(
                     result.asset.assets.iter().cloned(),
                     &mut visited,
@@ -212,7 +212,7 @@ async fn fetch_scan(
             });
         }
         if let Some(asset_data) = cache::read_asset_cached(&asset.url, cache_key) {
-            if asset_data.age_secs < super::processor::CACHE_FRESH_SECS {
+            if asset_data.age_secs < cache::CACHE_FRESH_SECS {
                 let asset_data = Arc::new(asset_data.data);
                 write_memory_asset(memory.as_ref(), &asset.url, cache_key, asset_data.clone());
                 return Ok(ScannedAsset {
@@ -274,7 +274,7 @@ fn read_memory_asset(
     let key = memory_key(url, cache_key);
     let mut entries = memory.write().ok()?;
     let (asset, written) = entries.get(&key).cloned()?;
-    if written.elapsed().as_secs() < super::processor::CACHE_FRESH_SECS {
+    if written.elapsed().as_secs() < cache::CACHE_FRESH_SECS {
         Some(asset)
     } else {
         entries.pop(&key);
@@ -439,7 +439,7 @@ mod tests {
         let memory = asset_memory_cache();
         let initial = script_asset(format!("http://{addr}/_next/static/chunks/a.js"));
 
-        let mut first = ScanResult::default();
+        let mut first = FindingsBuilder::default();
         let first_stats = scan_assets(
             client.clone(),
             [initial.clone()],
@@ -455,11 +455,11 @@ mod tests {
         )
         .await;
         assert_eq!(first_stats.discovered, 2);
-        let first_apis = first.api_map();
+        let first_apis = first.finish().api_map();
         assert!(first_apis.contains_key("/api/a"));
         assert!(first_apis.contains_key("/api/b"));
 
-        let mut second = ScanResult::default();
+        let mut second = FindingsBuilder::default();
         let second_stats = scan_assets(
             client,
             [initial],
@@ -476,7 +476,7 @@ mod tests {
         .await;
         assert_eq!(second_stats.discovered, 2);
         assert_eq!(second_stats.memory_hits, 2);
-        let second_apis = second.api_map();
+        let second_apis = second.finish().api_map();
         assert!(second_apis.contains_key("/api/a"));
         assert!(second_apis.contains_key("/api/b"));
     }
@@ -502,7 +502,7 @@ mod tests {
 
         let client = Client::new();
         let initial = script_asset(format!("http://{addr}/_next/static/chunks/a.js"));
-        let mut found = ScanResult::default();
+        let mut found = FindingsBuilder::default();
         let stats = scan_assets(
             client,
             [initial],
@@ -519,7 +519,7 @@ mod tests {
         .await;
 
         assert_eq!(stats.discovered, 6);
-        assert!(found.api_map().contains_key("/api/f"));
+        assert!(found.finish().api_map().contains_key("/api/f"));
     }
 
     fn script_asset(url: String) -> AssetRef {
