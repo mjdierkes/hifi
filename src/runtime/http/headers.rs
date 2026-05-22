@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use crate::runtime::bytes::HiBuf;
 
 pub(super) fn value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
@@ -7,7 +7,7 @@ pub(super) fn value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&
         .map(|(_, value)| value.as_str())
 }
 
-pub(super) fn reserve_body(headers: &[(String, String)], body: &mut BytesMut) {
+pub(super) fn reserve_body(headers: &[(String, String)], body: &mut HiBuf) {
     if body.capacity() != 0 {
         return;
     }

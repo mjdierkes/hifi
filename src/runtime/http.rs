@@ -4,8 +4,8 @@
 //! one TLS connection per origin. Plain HTTP uses HTTP/1.1.
 
 use crate::hash::FxHashMap;
+use crate::runtime::bytes::{HiBuf, HiBytes};
 use crate::url::Url;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rustls::{client::Resumption, RootCertStore};
 use rustls_pki_types::ServerName;
 use std::{
@@ -63,7 +63,7 @@ pub struct Response {
     version: Version,
     url: Url,
     headers: Vec<(String, String)>,
-    body: Bytes,
+    body: HiBytes,
 }
 
 pub struct Request {
@@ -259,7 +259,7 @@ impl Response {
         self.header("content-length")?.parse().ok()
     }
 
-    pub fn body(self) -> Bytes {
+    pub fn body(self) -> HiBytes {
         self.body
     }
 }
@@ -273,7 +273,7 @@ struct H2Session {
 }
 
 enum H2Write {
-    Frames(Vec<Bytes>),
+    Frames(Vec<HiBytes>),
 }
 
 async fn connect_h2(origin: Origin, tls: TlsConnector) -> Result<Arc<H2Session>, Error> {
@@ -348,7 +348,7 @@ impl H2Session {
 
         let mut status = None;
         let mut response_headers = Vec::new();
-        let mut body = BytesMut::new();
+        let mut body = HiBuf::new();
         while let Some(message) = rx.recv().await {
             match message {
                 StreamMessage::Headers {
@@ -391,7 +391,7 @@ impl H2Session {
     }
 }
 
-fn header_block_frames(stream_id: u32, block: &[u8]) -> Result<Vec<Bytes>, Error> {
+fn header_block_frames(stream_id: u32, block: &[u8]) -> Result<Vec<HiBytes>, Error> {
     let mut chunks = block.chunks(MAX_FRAME_SIZE).peekable();
     let Some(first) = chunks.next() else {
         return Err(Error::H2("empty request header block"));
@@ -439,7 +439,7 @@ async fn write_h2(
     }
 }
 
-fn append_write(command: H2Write, pending: &mut Vec<Bytes>) {
+fn append_write(command: H2Write, pending: &mut Vec<HiBytes>) {
     match command {
         H2Write::Frames(mut frames) => pending.append(&mut frames),
     }
@@ -447,7 +447,7 @@ fn append_write(command: H2Write, pending: &mut Vec<Bytes>) {
 
 async fn write_vectored_all<W: AsyncWrite + Unpin>(
     writer: &mut W,
-    frames: &[Bytes],
+    frames: &[HiBytes],
 ) -> io::Result<()> {
     let mut frame_index = 0usize;
     let mut offset = 0usize;
@@ -531,7 +531,7 @@ async fn read_h2(session: Arc<H2Session>, mut reader: ReadHalf<TlsStream<TcpStre
                     pending_headers = Some(PendingHeaders {
                         stream_id: frame.header.stream_id,
                         end_stream: frame.header.flags & END_STREAM != 0,
-                        block: BytesMut::from(block),
+                        block: HiBuf::from_slice(block),
                     });
                     continue;
                 }
@@ -576,7 +576,12 @@ async fn read_h2(session: Arc<H2Session>, mut reader: ReadHalf<TlsStream<TcpStre
                 end_stream: frame.header.flags & END_STREAM != 0,
             },
             x if x == FrameType::RstStream as u8 => {
-                let code = frame.payload.as_ref().get_u32();
+                let code = u32::from_be_bytes([
+                    frame.payload[0],
+                    frame.payload[1],
+                    frame.payload[2],
+                    frame.payload[3],
+                ]);
                 StreamMessage::Reset(code)
             }
             _ => continue,
@@ -601,7 +606,7 @@ enum StreamMessage {
         end_stream: bool,
     },
     Data {
-        payload: Bytes,
+        payload: HiBytes,
         end_stream: bool,
     },
     Reset(u32),
@@ -611,13 +616,13 @@ enum StreamMessage {
 struct PendingHeaders {
     stream_id: u32,
     end_stream: bool,
-    block: BytesMut,
+    block: HiBuf,
 }
 
 #[derive(Clone)]
 struct Frame {
     header: FrameHeader,
-    payload: Bytes,
+    payload: HiBytes,
 }
 
 #[derive(Clone, Copy)]
@@ -643,9 +648,9 @@ enum FrameType {
 fn settings_payload() -> [u8; 12] {
     let mut out = [0u8; 12];
     out[1] = 0x04;
-    (&mut out[2..6]).put_u32(SCANNER_INITIAL_WINDOW);
+    out[2..6].copy_from_slice(&SCANNER_INITIAL_WINDOW.to_be_bytes());
     out[7] = 0x05;
-    (&mut out[8..12]).put_u32(MAX_FRAME_SIZE as u32);
+    out[8..12].copy_from_slice(&(MAX_FRAME_SIZE as u32).to_be_bytes());
     out
 }
 
@@ -656,7 +661,7 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, Error
     if len > MAX_FRAME_PAYLOAD {
         return Err(Error::H2("frame payload too large"));
     }
-    let mut payload = BytesMut::zeroed(len as usize);
+    let mut payload = HiBuf::zeroed(len as usize);
     reader.read_exact(&mut payload).await?;
     Ok(Frame {
         header: FrameHeader {
@@ -716,20 +721,20 @@ fn release_window(session: &H2Session, stream_id: u32, len: usize) {
     ]));
 }
 
-fn encode_frame(header: FrameHeader, payload: &[u8]) -> Bytes {
-    let mut out = BytesMut::with_capacity(9 + payload.len());
-    out.put_u8(((header.len >> 16) & 0xff) as u8);
-    out.put_u8(((header.len >> 8) & 0xff) as u8);
-    out.put_u8((header.len & 0xff) as u8);
-    out.put_u8(header.kind);
-    out.put_u8(header.flags);
+fn encode_frame(header: FrameHeader, payload: &[u8]) -> HiBytes {
+    let mut out = HiBuf::with_capacity(9 + payload.len());
+    out.push(((header.len >> 16) & 0xff) as u8);
+    out.push(((header.len >> 8) & 0xff) as u8);
+    out.push((header.len & 0xff) as u8);
+    out.push(header.kind);
+    out.push(header.flags);
     out.extend_from_slice(&(header.stream_id & 0x7fff_ffff).to_be_bytes());
     out.extend_from_slice(payload);
     out.freeze()
 }
 
-async fn read_http1_bytes<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Bytes, Error> {
-    let mut bytes = BytesMut::with_capacity(16 * 1024);
+async fn read_http1_bytes<S: AsyncRead + Unpin>(stream: &mut S) -> Result<HiBytes, Error> {
+    let mut bytes = HiBuf::with_capacity(16 * 1024);
     let mut buf = [0u8; 16 * 1024];
     let mut reserved_body = false;
     loop {
@@ -772,7 +777,7 @@ fn header_block_payload(frame: &Frame) -> Option<&[u8]> {
     frame.payload.get(start..end)
 }
 
-fn data_payload(frame: &Frame) -> Option<Bytes> {
+fn data_payload(frame: &Frame) -> Option<HiBytes> {
     let mut start = 0usize;
     let mut end = frame.payload.len();
     if frame.header.flags & PADDED != 0 {
@@ -846,7 +851,7 @@ async fn http1_exchange<S: AsyncRead + AsyncWrite + Unpin>(
     parse_http1(url, version, bytes)
 }
 
-fn parse_http1(url: Url, version: Version, bytes: Bytes) -> Result<Response, Error> {
+fn parse_http1(url: Url, version: Version, bytes: HiBytes) -> Result<Response, Error> {
     let split = bytes
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -882,9 +887,9 @@ fn parse_http1(url: Url, version: Version, bytes: Bytes) -> Result<Response, Err
     })
 }
 
-fn decode_chunks(bytes: &[u8]) -> Result<Bytes, Error> {
+fn decode_chunks(bytes: &[u8]) -> Result<HiBytes, Error> {
     let mut pos = 0;
-    let mut out = BytesMut::new();
+    let mut out = HiBuf::new();
     loop {
         let line_end = find_crlf(bytes, pos).ok_or(Error::BadHttp1)?;
         let size_text = std::str::from_utf8(&bytes[pos..line_end]).map_err(|_| Error::BadHttp1)?;
@@ -928,7 +933,7 @@ mod tests {
                 flags: PADDED | PRIORITY,
                 stream_id: 1,
             },
-            payload: Bytes::from_static(&[2, 0, 0, 0, 0, 0, b'a', b'b', 0, 0]),
+            payload: HiBytes::from_static(&[2, 0, 0, 0, 0, 0, b'a', b'b', 0, 0]),
         };
         assert_eq!(header_block_payload(&frame).unwrap(), b"ab");
 
@@ -939,14 +944,14 @@ mod tests {
                 flags: PADDED,
                 stream_id: 1,
             },
-            payload: Bytes::from_static(&[1, b'x', b'y', b'z', 0]),
+            payload: HiBytes::from_static(&[1, b'x', b'y', b'z', 0]),
         };
-        assert_eq!(data_payload(&frame).unwrap(), Bytes::from_static(b"xyz"));
+        assert_eq!(data_payload(&frame).unwrap(), HiBytes::from_static(b"xyz"));
     }
 
     #[test]
     fn http1_chunked_body_is_decoded() {
         let body = decode_chunks(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n").unwrap();
-        assert_eq!(body, Bytes::from_static(b"Wikipedia"));
+        assert_eq!(body, HiBytes::from_static(b"Wikipedia"));
     }
 }

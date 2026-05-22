@@ -161,7 +161,10 @@ pub async fn scan_site(
     Ok(output)
 }
 
-async fn scan_root_document(html: bytes::Bytes, final_base: Url) -> Result<discover::DocumentScan> {
+async fn scan_root_document(
+    html: crate::runtime::bytes::HiBytes,
+    final_base: Url,
+) -> Result<discover::DocumentScan> {
     tokio::task::spawn_blocking(move || {
         discover::scan_document(&html, &final_base, DocumentKind::Html)
     })

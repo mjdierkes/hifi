@@ -103,7 +103,6 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "blake3",
- "bytes",
  "memchr",
  "mimalloc",
  "parking_lot",

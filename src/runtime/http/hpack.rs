@@ -1,7 +1,7 @@
 use super::{origin::Origin, Error};
 use crate::hash::FxHashMap;
+use crate::runtime::bytes::{HiBuf, HiBytes};
 use crate::url::Url;
-use bytes::{BufMut, Bytes, BytesMut};
 use std::{borrow::Cow, sync::OnceLock};
 
 pub(super) fn encode_headers(
@@ -9,8 +9,8 @@ pub(super) fn encode_headers(
     origin: &Origin,
     extra: Vec<(String, String)>,
     defaults: &[(String, String)],
-) -> Bytes {
-    let mut out = BytesMut::new();
+) -> HiBytes {
+    let mut out = HiBuf::new();
     let path = match url.query() {
         Some(query) => format!("{}?{query}", url.path()),
         None => {
@@ -35,30 +35,30 @@ pub(super) fn encode_headers(
     out.freeze()
 }
 
-pub(super) fn literal_header(out: &mut BytesMut, name: &str, value: &str) {
-    out.put_u8(0x00);
+pub(super) fn literal_header(out: &mut HiBuf, name: &str, value: &str) {
+    out.push(0x00);
     hpack_string(out, name);
     hpack_string(out, value);
 }
 
-pub(super) fn hpack_string(out: &mut BytesMut, value: &str) {
+pub(super) fn hpack_string(out: &mut HiBuf, value: &str) {
     hpack_int(out, value.len(), 7, 0);
     out.extend_from_slice(value.as_bytes());
 }
 
-pub(super) fn hpack_int(out: &mut BytesMut, mut value: usize, prefix: u8, marker: u8) {
+pub(super) fn hpack_int(out: &mut HiBuf, mut value: usize, prefix: u8, marker: u8) {
     let max = (1usize << prefix) - 1;
     if value < max {
-        out.put_u8(marker | value as u8);
+        out.push(marker | value as u8);
         return;
     }
-    out.put_u8(marker | max as u8);
+    out.push(marker | max as u8);
     value -= max;
     while value >= 128 {
-        out.put_u8((value as u8 & 0x7f) | 0x80);
+        out.push((value as u8 & 0x7f) | 0x80);
         value >>= 7;
     }
-    out.put_u8(value as u8);
+    out.push(value as u8);
 }
 
 pub(super) struct HpackDecoder {
@@ -599,8 +599,6 @@ pub(super) const STATIC_TABLE: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::{BufMut, BytesMut};
-
     #[test]
     fn huffman_decodes_reference_samples() {
         assert_eq!(hpack_huffman_decode(&[0b0011_1111]).unwrap(), b"o");
@@ -615,8 +613,8 @@ mod tests {
     #[test]
     fn dynamic_table_indexes_and_evicts() {
         let mut decoder = HpackDecoder::default();
-        let mut block = BytesMut::new();
-        block.put_u8(0x40);
+        let mut block = HiBuf::new();
+        block.push(0x40);
         hpack_string(&mut block, "x-a");
         hpack_string(&mut block, "one");
         assert_eq!(
@@ -640,14 +638,14 @@ mod tests {
     #[test]
     fn rejects_late_or_oversized_table_updates() {
         let mut decoder = HpackDecoder::default();
-        let mut late = BytesMut::new();
+        let mut late = HiBuf::new();
         literal_header(&mut late, "x-a", "one");
-        late.put_u8(0x20);
+        late.push(0x20);
         assert!(decoder.decode(&late).is_err());
 
         let mut decoder = HpackDecoder::default();
         decoder.set_allowed_max_size(8);
-        let mut oversized = BytesMut::new();
+        let mut oversized = HiBuf::new();
         hpack_int(&mut oversized, 9, 5, 0x20);
         assert!(decoder.decode(&oversized).is_err());
     }

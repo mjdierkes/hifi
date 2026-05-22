@@ -4,9 +4,9 @@
 //! private-address policy, status handling, and response size limits remain
 //! consistent across page, asset, and grep fetches.
 
+use crate::runtime::bytes::{HiBuf, HiBytes};
 use crate::runtime::http::{Client, Response};
 use crate::url::{Host, Url};
-use bytes::{Bytes, BytesMut};
 use std::{fmt, io, net::IpAddr};
 
 pub const MAX_RESPONSE_BYTES: u64 = 50 * 1024 * 1024;
@@ -128,7 +128,7 @@ pub async fn get_limited(
     Err(NetError::TooManyRedirects(current.to_string()))
 }
 
-pub async fn read_limited(response: Response) -> Result<Bytes, NetError> {
+pub async fn read_limited(response: Response) -> Result<HiBytes, NetError> {
     let content_length = response.content_length();
     if let Some(len) = content_length {
         if len > MAX_RESPONSE_BYTES {
@@ -140,7 +140,7 @@ pub async fn read_limited(response: Response) -> Result<Bytes, NetError> {
     }
 
     let mut body =
-        BytesMut::with_capacity(content_length.unwrap_or(0).min(MAX_RESPONSE_BYTES) as usize);
+        HiBuf::with_capacity(content_length.unwrap_or(0).min(MAX_RESPONSE_BYTES) as usize);
     let bytes = response.body();
     for chunk in bytes.chunks(16 * 1024) {
         let next_len = body.len() as u64 + chunk.len() as u64;
@@ -159,7 +159,7 @@ pub async fn get_bytes_limited(
     client: &Client,
     url: Url,
     allow_private: bool,
-) -> Result<Bytes, NetError> {
+) -> Result<HiBytes, NetError> {
     read_limited(get_limited(client, url, allow_private).await?).await
 }
 
