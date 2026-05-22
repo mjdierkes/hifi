@@ -9,8 +9,6 @@ aho-corasick = "1"
 blake3 = "1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-h2 = "0.4"
-http = "1"
 memchr = "2"
 lru = "0.16"
 mimalloc = { version = "0.1", default-features = false }
