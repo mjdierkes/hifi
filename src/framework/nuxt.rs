@@ -19,15 +19,9 @@ const SKIP_FRAGMENTS: &[&str] = &[
 pub fn is_context(bytes: &[u8], base: &Url) -> bool {
     base.path().contains("/_nuxt/")
         || base.path().ends_with("_payload.json")
-        || base.path().ends_with("/payload.js")
         || source::contains(bytes, b"/_nuxt/")
         || source::contains(bytes, b"__NUXT_DATA__")
-        || source::contains(bytes, b"__NUXT__=")
-        || source::contains(bytes, b"window.__NUXT__")
-        || source::contains(bytes, b"serverRendered")
-        || source::contains(bytes, b"staticAssetsBase")
         || source::contains(bytes, b"_payload.json")
-        || source::contains(bytes, b"payload.js")
 }
 
 pub fn should_skip(url: &Url) -> bool {
@@ -41,14 +35,12 @@ pub fn should_skip(url: &Url) -> bool {
 pub fn is_payload(raw: &str, path: &str) -> bool {
     source::ends_with_ascii_ignore_case(path, "_payload.json")
         || raw.contains("/_payload.json?")
-        || source::ends_with_ascii_ignore_case(path, "/payload.js")
         || path.contains("/__nuxt_island/")
 }
 
 pub fn is_manifest(path: &str) -> bool {
     path.contains("/_nuxt/builds/") && source::ends_with_ascii_ignore_case(path, ".json")
         || source::ends_with_ascii_ignore_case(path, "/_nuxt/manifest.json")
-        || source::ends_with_ascii_ignore_case(path, "/_nuxt/routes.json")
         || source::ends_with_ascii_ignore_case(path, "/_nuxt/prerendered.json")
 }
 
@@ -77,9 +69,7 @@ pub fn resolve_context_asset(base: &Url, raw: &str, context: bool) -> Option<Url
 
 pub fn route_from_payload(base: &Url) -> Option<String> {
     let path = base.path();
-    let route = path
-        .strip_suffix("/_payload.json")
-        .or_else(|| path.strip_suffix("/payload.js"))?;
+    let route = path.strip_suffix("/_payload.json")?;
     Some(if route.is_empty() {
         "/".to_owned()
     } else {
@@ -174,7 +164,6 @@ fn collect_literal_manifest_candidates(bytes: &[u8], out: &mut Vec<String>) {
     for marker in [
         b"/_nuxt/builds/".as_slice(),
         b"_nuxt/builds/".as_slice(),
-        b"/_nuxt/routes.json".as_slice(),
         b"/_nuxt/prerendered.json".as_slice(),
     ] {
         for pos in memchr::memmem::find_iter(bytes, marker) {

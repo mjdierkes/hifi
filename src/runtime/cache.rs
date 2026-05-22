@@ -38,24 +38,12 @@ impl ScanCache {
         Self { path }
     }
 
-    pub fn read_fresh_bytes(&self) -> Option<(Vec<u8>, u64)> {
-        read_cached_value_bytes(&self.path, CACHE_FRESH_SECS)
-    }
-
     pub fn read_fresh_binary(&self) -> Option<(Vec<u8>, u64)> {
         read_fresh(&binary_path_for(&self.path), CACHE_FRESH_SECS)
     }
 
     pub fn read_stale_binary(&self) -> Option<Vec<u8>> {
         read_fresh(&binary_path_for(&self.path), CACHE_STALE_SECS).map(|(bytes, _)| bytes)
-    }
-
-    pub fn read_revision_bytes(&self, revision: Option<&str>) -> Option<Vec<u8>> {
-        read_revision_bytes(&self.path, revision)
-    }
-
-    pub fn write_with_revision<T: Serialize>(&self, value: &T, revision: Option<&str>) {
-        write_with_revision(&self.path, value, revision);
     }
 
     pub fn write_binary(&self, bytes: &[u8]) {
@@ -115,13 +103,6 @@ struct AssetEnvelope {
     data: AssetData,
     #[serde(default, skip_serializing_if = "AssetValidators::is_empty")]
     validators: AssetValidators,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RevisionEnvelope<T> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    revision: Option<String>,
-    value: T,
 }
 
 pub fn read_asset_cached(url: &Url, cache_key: Option<&str>) -> Option<CachedAsset> {
@@ -208,20 +189,6 @@ fn host(url: &Url) -> String {
     url.host_str().unwrap_or("unknown").replace('/', "_")
 }
 
-pub fn read_revision_bytes(path: &Path, revision: Option<&str>) -> Option<Vec<u8>> {
-    let expected = revision?;
-    let envelope: RevisionEnvelope<serde_json::Value> =
-        serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    (envelope.revision.as_deref() == Some(expected))
-        .then(|| serde_json::to_vec(&envelope.value).ok())?
-}
-
-pub fn read_cached_value_bytes(path: &Path, max_age_secs: u64) -> Option<(Vec<u8>, u64)> {
-    let (bytes, age_secs) = read_fresh(path, max_age_secs)?;
-    let envelope: RevisionEnvelope<serde_json::Value> = serde_json::from_slice(&bytes).ok()?;
-    Some((serde_json::to_vec(&envelope.value).ok()?, age_secs))
-}
-
 fn read_fresh(path: &Path, max_age_secs: u64) -> Option<(Vec<u8>, u64)> {
     let meta = fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
@@ -230,16 +197,6 @@ fn read_fresh(path: &Path, max_age_secs: u64) -> Option<(Vec<u8>, u64)> {
         return None;
     }
     Some((fs::read(path).ok()?, age))
-}
-
-pub fn write_with_revision<T: Serialize>(path: &Path, value: &T, revision: Option<&str>) {
-    write_json(
-        path,
-        &RevisionEnvelope {
-            revision: revision.map(str::to_string),
-            value,
-        },
-    );
 }
 
 pub fn read_completion_candidates(base: &Url) -> Option<Vec<String>> {

@@ -407,15 +407,8 @@ async fn handle_conn(mut stream: UnixStream, state: State) -> Result {
     let wire = match serde_json::from_slice::<WireRequest>(&req) {
         Ok(wire) if wire.protocol == DAEMON_PROTOCOL => wire,
         _ => {
-            return reply_legacy(
-                &mut stream,
-                DaemonReply {
-                    exit_code: 2,
-                    stdout: String::new(),
-                    stderr: "hifi: daemon protocol mismatch; restart hifi\n".into(),
-                },
-            )
-            .await;
+            reply_wire(&mut stream, WireReply::version_mismatch()).await?;
+            std::process::exit(0);
         }
     };
     if !client_matches_daemon(&wire.client) {
@@ -530,13 +523,6 @@ async fn reply(stream: &mut UnixStream, body: DaemonReply) -> Result {
 
 #[cfg(unix)]
 async fn reply_wire(stream: &mut UnixStream, body: WireReply) -> Result {
-    let body = serde_json::to_string(&body)?;
-    stream.write_all(body.as_bytes()).await?;
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn reply_legacy(stream: &mut UnixStream, body: DaemonReply) -> Result {
     let body = serde_json::to_string(&body)?;
     stream.write_all(body.as_bytes()).await?;
     Ok(())

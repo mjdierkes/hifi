@@ -203,16 +203,6 @@ impl<'a> Processor<'a> {
                     });
                 }
             }
-            if let Some((body, age)) = plan.cache.read_fresh_bytes() {
-                return Ok(ScanOutcome {
-                    output: serde_json::from_slice::<Output>(&body)?.mark(
-                        t0,
-                        CacheStatus::Fresh,
-                        Some(age),
-                    ),
-                    used_revision_cache: true,
-                });
-            }
         }
 
         let page = self.load_page(plan, use_cache, cache_ctx).await?;
@@ -234,16 +224,6 @@ impl<'a> Processor<'a> {
                         });
                     }
                 }
-            }
-            if let Some(bytes) = plan.cache.read_revision_bytes(Some(revision)) {
-                return Ok(ScanOutcome {
-                    output: serde_json::from_slice::<Output>(&bytes)?.mark(
-                        Some(t0),
-                        CacheStatus::RevisionHit,
-                        None,
-                    ),
-                    used_revision_cache: true,
-                });
             }
         }
 
@@ -379,7 +359,6 @@ fn write_caches(
 ) -> Result<()> {
     let cached = out.clone().mark(None, CacheStatus::Stored, None);
     cache_store.write_binary(&encode_output_binary(&cached));
-    cache_store.write_with_revision(&cached, out.revision.as_deref());
     if let Ok(base) = url::Url::parse(url) {
         let candidates = completion_candidates(&cached.evidence);
         if !candidates.is_empty() {

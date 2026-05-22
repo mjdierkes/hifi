@@ -50,14 +50,12 @@ const ASSET_LITERALS: &[&str] = &[
     "&_data=",
     ".rsc",
     "_payload.json",
-    "payload.js",
     "__data.json",
 ];
 const FRAMEWORK_DATA_MARKERS: &[&[u8]] = &[
     b"/_next/data/",
     b"/_payload.json",
     b"_payload.json",
-    b"payload.js",
     b"/__data.json",
     b"__data.json",
     b"?_data=",
