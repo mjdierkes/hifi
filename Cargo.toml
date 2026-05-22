@@ -8,7 +8,6 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 aho-corasick = "1"
 blake3 = "1"
 bytes = "1"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
 memchr = "2"
 mimalloc = { version = "0.1", default-features = false }
 parking_lot = "0.12"

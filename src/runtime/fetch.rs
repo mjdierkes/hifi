@@ -12,10 +12,10 @@ use crate::framework::{self, FrameworkConfig};
 use crate::scan::FindingsBuilder;
 
 use super::cache::{self, AssetData};
+use super::concurrent::BoundedUnordered;
 use super::http::Client;
 use super::net;
 use crate::url::Url;
-use futures_util::{stream::FuturesUnordered, StreamExt};
 use std::{
     collections::VecDeque,
     sync::atomic::{AtomicBool, Ordering},
@@ -83,7 +83,7 @@ pub async fn scan_assets(
     );
     prewarm_asset_hosts(&env.client, &queue, env.allow_private);
 
-    let mut fetched = FuturesUnordered::new();
+    let mut fetched = BoundedUnordered::new();
     let concurrency = env.concurrency.max(1);
 
     loop {

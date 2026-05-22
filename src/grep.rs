@@ -6,12 +6,12 @@
 
 use crate::app::{escape_terminal, normalize_url, AppError};
 use crate::discover::{self, AssetRef, DocumentKind};
+use crate::runtime::concurrent;
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::engine::MAX_TOTAL_ASSETS;
 use crate::runtime::http::Client;
 use crate::runtime::net;
 use crate::url::Url;
-use futures_util::{stream, StreamExt};
 use std::sync::Arc;
 
 const DEFAULT_MAX_HITS: usize = 50;
@@ -149,8 +149,10 @@ async fn grep_assets(
 ) -> GrepResult {
     let pat = Arc::new(pattern.to_string());
     let options = Arc::new(options);
-    let mut searched = stream::iter(assets.into_iter().enumerate())
-        .map(|(idx, asset)| {
+    let searched = concurrent::bounded_map(
+        assets.into_iter().enumerate(),
+        config.chunk_concurrency,
+        |(idx, asset)| {
             grep_one(
                 client.clone(),
                 idx,
@@ -159,12 +161,13 @@ async fn grep_assets(
                 options.clone(),
                 config.allow_private,
             )
-        })
-        .buffer_unordered(config.chunk_concurrency);
+        },
+    )
+    .await;
 
     let mut chunks = Vec::new();
     let mut result = GrepResult::default();
-    while let Some(chunk) = searched.next().await {
+    for chunk in searched {
         match chunk {
             Ok(chunk) => chunks.push(chunk),
             Err(()) => result.files_failed += 1,

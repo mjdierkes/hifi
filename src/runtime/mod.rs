@@ -1,5 +1,6 @@
 pub mod cache;
 mod cache_writer;
+pub(crate) mod concurrent;
 pub mod config;
 pub mod engine;
 mod fetch;
