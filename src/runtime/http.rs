@@ -115,15 +115,7 @@ impl Client {
             return Ok(());
         }
         let origin = Origin::for_url(url)?;
-        if self.inner.h2.lock().await.contains_key(&origin) {
-            return Ok(());
-        }
-        let session = connect_h2(origin.clone(), self.inner.tls_h2.clone()).await?;
-        let mut sessions = self.inner.h2.lock().await;
-        if sessions.contains_key(&origin) {
-            return Ok(());
-        }
-        sessions.insert(origin, session);
+        let _ = self.h2_session(origin).await?;
         Ok(())
     }
 
@@ -141,32 +133,27 @@ impl Client {
         headers: Vec<(String, String)>,
     ) -> Result<Response, Error> {
         let origin = Origin::for_url(&url)?;
-        let session = {
-            let mut sessions = self.inner.h2.lock().await;
-            if let Some(session) = sessions.get(&origin) {
-                session.clone()
-            } else {
-                match connect_h2(origin.clone(), self.inner.tls_h2.clone()).await {
-                    Ok(session) => {
-                        sessions.insert(origin, session.clone());
-                        session
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-        };
-
+        let session = self.h2_session(origin.clone()).await?;
         match session
-            .request(url.clone(), headers.clone(), &self.inner.default_headers)
+            .request(url, headers, &self.inner.default_headers)
             .await
         {
             Ok(response) => Ok(response),
             Err(err) => {
                 let mut sessions = self.inner.h2.lock().await;
-                sessions.remove(&Origin::for_url(&url)?);
+                sessions.remove(&origin);
                 Err(err)
             }
         }
+    }
+
+    async fn h2_session(&self, origin: Origin) -> Result<Arc<H2Session>, Error> {
+        if let Some(session) = self.inner.h2.lock().await.get(&origin).cloned() {
+            return Ok(session);
+        }
+        let session = connect_h2(origin.clone(), self.inner.tls_h2.clone()).await?;
+        let mut sessions = self.inner.h2.lock().await;
+        Ok(sessions.entry(origin).or_insert(session).clone())
     }
 }
 
