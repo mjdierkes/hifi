@@ -249,6 +249,159 @@ fn framework_80_20_expansion_follows_manifests_payloads_and_islands() {
 }
 
 #[test]
+fn nuxt_deep_support_seeds_build_metadata_and_relative_chunks() {
+    let nuxt = scan(
+        br#"
+        <script id="__NUXT_DATA__">[{"buildId":"b123"}]</script>
+        <script>window.__NUXT__={config:{app:{baseURL:"/docs/",buildAssetsDir:"/_nuxt/",cdnURL:"https://cdn.example.com"}}}</script>
+        <script>
+        const page="pages/products.abc.js";
+        const chunk="chunks/catalog.def.js";
+        const component="components/Product.ghi.js";
+        const island="/__nuxt_island/product-card.json";
+        const payload="/docs/products/_payload.json";
+        const api="/api/nuxt-deep";
+        </script>
+    "#,
+        &url("https://example.com/docs/"),
+        DocumentKind::Html,
+    );
+    assert_eq!(nuxt.framework_config.label().as_deref(), Some("Nuxt"));
+    assert_assets(
+        &nuxt,
+        &[
+            "https://cdn.example.com/docs/_nuxt/builds/meta/b123.json",
+            "https://cdn.example.com/docs/_nuxt/builds/latest.json",
+            "https://example.com/_nuxt/pages/products.abc.js",
+            "https://example.com/_nuxt/chunks/catalog.def.js",
+            "https://example.com/_nuxt/components/Product.ghi.js",
+            "https://example.com/__nuxt_island/product-card.json",
+            "https://example.com/docs/products/_payload.json",
+        ],
+    );
+    assert_api(&nuxt, "/__nuxt_island/product-card.json");
+    assert_evidence(
+        &nuxt,
+        "/api/nuxt-deep",
+        EvidenceKind::Candidate,
+        Extractor::NuxtPayload,
+    );
+}
+
+#[test]
+fn nuxt_legacy_and_payload_js_emit_routes_and_apis() {
+    let legacy = scan_html(
+        r#"
+        <script>window.__NUXT__={serverRendered:true,routePath:"/legacy",staticAssetsBase:"/_nuxt/static/abc",config:{endpoint:"/api/legacy"}}</script>
+        <script>const payload="/legacy/payload.js"; const manifest="/_nuxt/routes.json";</script>
+    "#,
+    );
+    assert_eq!(legacy.framework_config.label().as_deref(), Some("Nuxt"));
+    assert_assets(
+        &legacy,
+        &[
+            "https://example.com/legacy/payload.js",
+            "https://example.com/_nuxt/routes.json",
+        ],
+    );
+    assert_evidence(
+        &legacy,
+        "/legacy",
+        EvidenceKind::Route,
+        Extractor::NuxtPayload,
+    );
+    assert_evidence(
+        &legacy,
+        "/api/legacy",
+        EvidenceKind::Candidate,
+        Extractor::NuxtPayload,
+    );
+
+    let payload = scan(
+        br#"export default {"path":"/payload-page","api":"/api/payload-js","prerenderedRoutes":["/payload-prerender"]}"#,
+        &url("https://example.com/payload-page/payload.js"),
+        DocumentKind::Payload,
+    );
+    assert_route(&payload, "/payload-page");
+    assert_evidence(
+        &payload,
+        "/payload-prerender",
+        EvidenceKind::Route,
+        Extractor::NuxtPayload,
+    );
+    assert_evidence(
+        &payload,
+        "/api/payload-js",
+        EvidenceKind::Candidate,
+        Extractor::NuxtPayload,
+    );
+
+    let manifest = scan(
+        br#"{"routes":["/shop","/blog/[slug]"],"prerenderedRoutes":["/pricing"],"/nested":{"path":"/nested"}}"#,
+        &url("https://example.com/_nuxt/routes.json"),
+        DocumentKind::Manifest,
+    );
+    for route in ["/shop", "/blog/[slug]", "/pricing", "/nested"] {
+        assert_evidence(
+            &manifest,
+            route,
+            EvidenceKind::Route,
+            Extractor::NuxtPayload,
+        );
+    }
+}
+
+#[test]
+fn nuxt_endpoint_maps_promote_api_evidence() {
+    let result = scan_html(
+        r#"
+        <script id="__NUXT_DATA__">[{}]</script>
+        <script>
+        window.__NUXT__={config:{public:{
+          endpoints:{
+            player:"/api/players/player",
+            search:"/api/players/search",
+            flags:"https://edge.api.flagsmith.com/api/v1/"
+          },
+          mediaUrl:"/images/logo.png"
+        }}}
+        </script>
+    "#,
+    );
+    for api in [
+        "/api/players/player",
+        "/api/players/search",
+        "https://edge.api.flagsmith.com/api/v1/",
+    ] {
+        assert_evidence(&result, api, EvidenceKind::Api, Extractor::NuxtPayload);
+    }
+    assert_no_api(&result, "/images/logo.png");
+}
+
+#[test]
+fn nuxt_runtime_config_bases_promote_relative_endpoints() {
+    let result = scan_html(
+        r#"
+        <script id="__NUXT_DATA__">[{}]</script>
+        <script>
+        window.__NUXT__={config:{public:{
+          apiBase:"/api",
+          endpoints:{
+            player:"players/player",
+            standings:"schedules/standings",
+            image:"images/logo"
+          }
+        }}}
+        </script>
+    "#,
+    );
+    for api in ["/api/players/player", "/api/schedules/standings"] {
+        assert_evidence(&result, api, EvidenceKind::Api, Extractor::NuxtPayload);
+    }
+    assert_no_api(&result, "/api/images/logo");
+}
+
+#[test]
 fn rejects_asset_false_positives() {
     let result = scan_html(
         r#"
@@ -422,6 +575,14 @@ fn assert_api(result: &hifi::discover::DocumentScan, url: &str) {
     assert!(
         result.findings.api_map().contains_key(url),
         "{url} not in {:?}",
+        result.findings.api_map().keys().collect::<Vec<_>>()
+    );
+}
+
+fn assert_no_api(result: &hifi::discover::DocumentScan, url: &str) {
+    assert!(
+        !result.findings.api_map().contains_key(url),
+        "{url} unexpectedly in {:?}",
         result.findings.api_map().keys().collect::<Vec<_>>()
     );
 }

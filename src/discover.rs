@@ -20,6 +20,11 @@ const ASSET_LITERALS: &[&str] = &[
     "/_next/static/",
     "/_nuxt/",
     "_nuxt/",
+    "/__nuxt_island/",
+    "pages/",
+    "components/",
+    "composables/",
+    "plugins/",
     "/_app/immutable/",
     "_app/immutable/",
     "nodes/",
@@ -45,12 +50,14 @@ const ASSET_LITERALS: &[&str] = &[
     "&_data=",
     ".rsc",
     "_payload.json",
+    "payload.js",
     "__data.json",
 ];
 const FRAMEWORK_DATA_MARKERS: &[&[u8]] = &[
     b"/_next/data/",
     b"/_payload.json",
     b"_payload.json",
+    b"payload.js",
     b"/__data.json",
     b"__data.json",
     b"?_data=",
@@ -240,6 +247,9 @@ pub(crate) fn scan_document_with_config_and_findings(
                 &mut out.assets,
             );
         }
+        if nuxt_context {
+            framework::nuxt::push_manifests(bytes, base, &mut seen, &mut out.assets);
+        }
     }
 
     out
@@ -403,6 +413,15 @@ fn scan_framework_data(
 
     record_framework_route_from_payload(base, kind, extractor, findings);
     scan_api_tokens(bytes, extractor, findings);
+    if contexts.nuxt {
+        framework::nuxt::record_endpoint_maps(bytes, findings);
+        if matches!(kind, DocumentKind::Manifest | DocumentKind::Payload) {
+            framework::nuxt::record_routes(bytes, findings);
+        } else {
+            framework::nuxt::record_page_route(bytes, findings);
+        }
+        scan_nuxt_islands(bytes, findings);
+    }
     if contexts.astro {
         scan_astro_actions(bytes, findings);
     }
@@ -418,17 +437,18 @@ fn record_framework_route_from_payload(
         return;
     }
     let path = base.path();
-    let route = if base.query().is_some_and(|query| query.contains("_data=")) {
-        Some(if path.is_empty() { "/" } else { path })
+    let route = if extractor == Extractor::NuxtPayload {
+        framework::nuxt::route_from_payload(base)
+    } else if base.query().is_some_and(|query| query.contains("_data=")) {
+        Some(if path.is_empty() { "/" } else { path }.to_owned())
     } else if let Some(route) = path.strip_suffix("/_payload.json") {
-        Some(if route.is_empty() { "/" } else { route })
-    } else if let Some(route) = path.strip_suffix("/__data.json") {
-        Some(if route.is_empty() { "/" } else { route })
+        Some(if route.is_empty() { "/" } else { route }.to_owned())
     } else {
-        None
+        path.strip_suffix("/__data.json")
+            .map(|route| if route.is_empty() { "/" } else { route }.to_owned())
     };
     if let Some(route) = route.filter(|route| crate::scan::classify::is_client_route(route)) {
-        findings.record_route(route.to_owned(), extractor);
+        findings.record_route(route, extractor);
     }
 }
 
@@ -467,6 +487,23 @@ fn scan_astro_actions(bytes: &[u8], findings: &mut ScanResult) {
             raw,
             Shape::inferred(Some("POST"), true),
             Extractor::AstroIsland,
+        );
+    }
+}
+
+fn scan_nuxt_islands(bytes: &[u8], findings: &mut ScanResult) {
+    for pos in memchr::memmem::find_iter(bytes, b"/__nuxt_island/") {
+        let start = source::walk_token_start(bytes, pos);
+        if !is_string_literal_context(bytes, start) {
+            continue;
+        }
+        let Some(raw) = asset_token_string(bytes, start) else {
+            continue;
+        };
+        findings.record_api(
+            raw,
+            Shape::inferred(Some("GET"), false),
+            Extractor::NuxtPayload,
         );
     }
 }
@@ -532,8 +569,6 @@ fn classify_asset(raw: &str) -> Option<AssetKind> {
         || framework::remix::is_manifest(path)
     {
         Some(AssetKind::Manifest)
-    } else if is_script_asset(path) {
-        Some(AssetKind::Script)
     } else if framework::next::is_payload(raw, path)
         || framework::nuxt::is_payload(raw, path)
         || framework::sveltekit::is_payload(raw, path)
@@ -541,6 +576,8 @@ fn classify_asset(raw: &str) -> Option<AssetKind> {
         || framework::remix::is_payload(raw, path)
     {
         Some(AssetKind::Payload)
+    } else if is_script_asset(path) {
+        Some(AssetKind::Script)
     } else {
         None
     }
@@ -571,6 +608,9 @@ fn resolve_asset(base: &Url, raw: &str, contexts: FrameworkContexts) -> Option<U
         return Some(url);
     }
     if let Some(url) = framework::nuxt::resolve_asset(base, raw) {
+        return Some(url);
+    }
+    if let Some(url) = framework::nuxt::resolve_context_asset(base, raw, contexts.nuxt) {
         return Some(url);
     }
     if let Some(url) = framework::sveltekit::resolve_asset(base, raw) {

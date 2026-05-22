@@ -26,7 +26,21 @@ fn api_client_recognizers_cover_common_wrappers() {
         $fetch("/api/nuxt", { method: "POST", body: payload });
         useFetch("/api/composable?limit=10");
         ky("/api/ky", { method: "PATCH" });
+        useRequestFetch()("/api/request-fetch");
+        useNuxtApp().$fetch("/api/nuxt-app");
+        nuxtApp.$fetch("/api/app-fetch", { method: "POST" });
+        this.$api.$get("/api/plugin-get");
+        this.$api.$post("/api/plugin-post", payload);
+        app.$axios.$delete("/api/axios-delete");
+        const API_BASE="/api";
+        const playerPath=API_BASE + "/players/player";
+        const searchPath=`${API_BASE}/players/search`;
+        apiClient.get(playerPath);
+        videoService.post(searchPath, payload);
+        const gql="/graphql";
+        httpClient.post(gql);
         axios({ url: "/api/object", method: "delete" });
+        axios({ url: playerPath, method: "put" });
         axios.request({ endpoint: "/graphql", method: "POST", data: body });
     "#,
     );
@@ -34,6 +48,14 @@ fn api_client_recognizers_cover_common_wrappers() {
         ("/api/nuxt", "POST"),
         ("/api/composable", "GET"),
         ("/api/ky", "PATCH"),
+        ("/api/request-fetch", "GET"),
+        ("/api/nuxt-app", "GET"),
+        ("/api/app-fetch", "POST"),
+        ("/api/plugin-get", "GET"),
+        ("/api/plugin-post", "POST"),
+        ("/api/axios-delete", "DELETE"),
+        ("/api/players/player", "GET,PUT"),
+        ("/api/players/search", "POST"),
         ("/api/object", "DELETE"),
         ("/graphql", "POST"),
     ] {
