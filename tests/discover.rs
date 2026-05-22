@@ -379,6 +379,181 @@ fn nuxt_endpoint_maps_promote_api_evidence() {
 }
 
 #[test]
+fn sveltekit_deep_support_seeds_version_data_routes_and_actions() {
+    let result = scan(
+        br#"
+        <script>window.__sveltekit_abc={};</script>
+        <script>
+        const manifest={
+          routes:[
+            {id:"/products/[slug]", pattern:/^\/products\/([^/]+?)\/?$/, page:{leaf:2}},
+            {route:"/account/settings", page:{leaf:3}}
+          ],
+          nodes:[()=>import("nodes/2.abc.js"),()=>import("chunks/settings.def.js")]
+        };
+        const api="/api/sveltekit-products";
+        const namedAction="?/save";
+        const dataAction="/cart/__data.json?/add";
+        </script>
+    "#,
+        &url("https://example.com/account/settings"),
+        DocumentKind::Html,
+    );
+    assert_eq!(
+        result.framework_config.label().as_deref(),
+        Some("SvelteKit")
+    );
+    assert_assets(
+        &result,
+        &[
+            "https://example.com/_app/version.json",
+            "https://example.com/products/[slug]/__data.json",
+            "https://example.com/account/settings/__data.json",
+            "https://example.com/_app/immutable/nodes/2.abc.js",
+            "https://example.com/_app/immutable/chunks/settings.def.js",
+        ],
+    );
+    assert_evidence(
+        &result,
+        "/products/[slug]",
+        EvidenceKind::Route,
+        Extractor::SvelteKitData,
+    );
+    assert_evidence(
+        &result,
+        "/account/settings",
+        EvidenceKind::Route,
+        Extractor::SvelteKitData,
+    );
+    assert_evidence(
+        &result,
+        "/api/sveltekit-products",
+        EvidenceKind::Candidate,
+        Extractor::SvelteKitData,
+    );
+    assert_evidence(
+        &result,
+        "/account/settings",
+        EvidenceKind::Api,
+        Extractor::SvelteKitData,
+    );
+    assert_evidence(
+        &result,
+        "/cart",
+        EvidenceKind::Api,
+        Extractor::SvelteKitData,
+    );
+}
+
+#[test]
+fn sveltekit_payloads_map_back_to_routes_and_dependencies() {
+    let result = scan(
+        br#"{"type":"data","nodes":[{"route":"/shop","uses":{"dependencies":["/api/products","/images/logo.png"]}}]}"#,
+        &url("https://example.com/shop/__data.json"),
+        DocumentKind::Payload,
+    );
+    assert_route(&result, "/shop");
+    assert_evidence(
+        &result,
+        "/api/products",
+        EvidenceKind::Candidate,
+        Extractor::SvelteKitData,
+    );
+    assert_evidence(
+        &result,
+        "/api/products",
+        EvidenceKind::Api,
+        Extractor::SvelteKitData,
+    );
+    assert_no_api(&result, "/images/logo.png");
+}
+
+#[test]
+fn sveltekit_minified_patterns_and_node_assets_are_recovered() {
+    let result = scan(
+        br#"
+        window.__sveltekit_x={};
+        const route={pattern:/^\/blog\/([^/]+?)\/comments\/([^/]+?)\/?$/,params:["slug","comment"]};
+        const asset="assets/widget.abc.js";
+        const node={uses:{dependencies:["/graphql?query=Post","/trpc/posts.byId?id=1"]}};
+        "#,
+        &url("https://example.com/_app/immutable/nodes/5.abc.js"),
+        DocumentKind::Script,
+    );
+    assert_assets(
+        &result,
+        &[
+            "https://example.com/_app/immutable/assets/widget.abc.js",
+            "https://example.com/blog/[slug]/comments/[comment]/__data.json",
+        ],
+    );
+    assert_evidence(
+        &result,
+        "/blog/[slug]/comments/[comment]",
+        EvidenceKind::Route,
+        Extractor::SvelteKitData,
+    );
+    assert_evidence(
+        &result,
+        "/graphql",
+        EvidenceKind::Api,
+        Extractor::SvelteKitData,
+    );
+    assert_evidence(
+        &result,
+        "/trpc/posts.byId",
+        EvidenceKind::Api,
+        Extractor::SvelteKitData,
+    );
+}
+
+#[test]
+fn sveltekit_custom_app_dir_and_base_paths_are_respected() {
+    let result = scan(
+        br#"
+        <script>window.__sveltekit_custom={base:"/docs",appDir:"_client"};</script>
+        <script src="/docs/_client/immutable/entry/start.abc.js"></script>
+        <script>
+        const route={id:"/guide/[slug]"};
+        const node="nodes/3.node.js";
+        const chunk="chunks/guide.chunk.js";
+        </script>
+    "#,
+        &url("https://example.com/docs/guide/intro"),
+        DocumentKind::Html,
+    );
+    assert_assets(
+        &result,
+        &[
+            "https://example.com/docs/_client/immutable/entry/start.abc.js",
+            "https://example.com/docs/_client/immutable/nodes/3.node.js",
+            "https://example.com/docs/_client/immutable/chunks/guide.chunk.js",
+            "https://example.com/docs/_client/version.json",
+            "https://example.com/docs/guide/[slug]/__data.json",
+        ],
+    );
+    assert_evidence(
+        &result,
+        "/guide/[slug]",
+        EvidenceKind::Route,
+        Extractor::SvelteKitData,
+    );
+
+    let node = scan(
+        br#"window.__sveltekit_custom={}; const dep="chunks/child.node.js"; const route={id:"/node-route"};"#,
+        &url("https://example.com/docs/_client/immutable/nodes/3.node.js"),
+        DocumentKind::Script,
+    );
+    assert_assets(
+        &node,
+        &[
+            "https://example.com/docs/_client/immutable/chunks/child.node.js",
+            "https://example.com/node-route/__data.json",
+        ],
+    );
+}
+
+#[test]
 fn nuxt_runtime_config_bases_promote_relative_endpoints() {
     let result = scan_html(
         r#"

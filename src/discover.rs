@@ -72,11 +72,12 @@ static ASSET_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
         .expect("valid asset literals")
 });
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct FrameworkContexts {
     next: bool,
     nuxt: bool,
     sveltekit: bool,
+    sveltekit_immutable_root: Option<String>,
     astro: bool,
     remix: bool,
 }
@@ -181,6 +182,9 @@ pub(crate) fn scan_document_with_config_and_findings(
         next: next_context,
         nuxt: nuxt_context,
         sveltekit: sveltekit_context,
+        sveltekit_immutable_root: sveltekit_context
+            .then(|| framework::sveltekit::primary_immutable_root(bytes, base))
+            .flatten(),
         astro: astro_context,
         remix: remix_context,
     };
@@ -219,16 +223,26 @@ pub(crate) fn scan_document_with_config_and_findings(
     }
 
     push_framework_candidates(bytes, &mut out.findings);
-    scan_framework_data(bytes, base, kind, contexts, &mut out.findings);
+    scan_framework_data(bytes, base, kind, contexts.clone(), &mut out.findings);
     framework::next::scan_flight(bytes, &mut out.findings);
     framework::next::scan_server_action(bytes, base, kind, next_config.as_ref(), &mut out.findings);
+    if contexts.sveltekit {
+        let routes = framework::sveltekit::record_routes(bytes, &mut out.findings);
+        push_sveltekit_data_assets(
+            &routes,
+            base,
+            framework::sveltekit::base_path(bytes).as_deref(),
+            &mut seen,
+            &mut out.assets,
+        );
+    }
     if kind == DocumentKind::Html {
-        scan_html_assets(bytes, base, contexts, &mut seen, &mut out.assets);
+        scan_html_assets(bytes, base, contexts.clone(), &mut seen, &mut out.assets);
     }
     scan_literal_assets(
         bytes,
         base,
-        contexts,
+        contexts.clone(),
         &mut out.findings,
         &mut seen,
         &mut out.assets,
@@ -249,6 +263,9 @@ pub(crate) fn scan_document_with_config_and_findings(
         }
         if nuxt_context {
             framework::nuxt::push_manifests(bytes, base, &mut seen, &mut out.assets);
+        }
+        if sveltekit_context {
+            framework::sveltekit::push_manifests(bytes, base, &mut seen, &mut out.assets);
         }
     }
 
@@ -287,7 +304,7 @@ fn scan_html_assets(
         let Some(src) = attr_value(tag, b"src") else {
             return;
         };
-        push_asset(base, src, contexts, AssetSource::HtmlScript, seen, out);
+        push_asset(base, src, &contexts, AssetSource::HtmlScript, seen, out);
     });
 
     scan_tags(bytes, b"<link", |tag| {
@@ -300,7 +317,7 @@ fn scan_html_assets(
                 || matches_ignore_ascii_case(v, "modulepreload")
                 || matches_ignore_ascii_case(v, "prefetch")
         }) {
-            push_asset(base, href, contexts, AssetSource::HtmlPreload, seen, out);
+            push_asset(base, href, &contexts, AssetSource::HtmlPreload, seen, out);
         }
     });
     scan_tags(bytes, b"<astro-island", |tag| {
@@ -308,7 +325,7 @@ fn scan_html_assets(
             let Some(raw) = attr_value(tag, attr) else {
                 continue;
             };
-            push_asset(base, raw, contexts, AssetSource::HtmlPreload, seen, out);
+            push_asset(base, raw, &contexts, AssetSource::HtmlPreload, seen, out);
         }
     });
 }
@@ -348,7 +365,7 @@ fn scan_literal_assets(
         if raw.starts_with("/_next/data/") {
             push_candidate(findings, &raw);
         }
-        push_asset(base, &raw, contexts, AssetSource::Literal, seen, out);
+        push_asset(base, &raw, &contexts, AssetSource::Literal, seen, out);
     }
 }
 
@@ -365,12 +382,12 @@ fn scan_dynamic_assets(
 ) {
     for pos in memchr::memmem::find_iter(bytes, b"import(") {
         if let Some(raw) = source::quoted_arg(bytes, pos + b"import(".len()) {
-            push_asset(base, raw, contexts, AssetSource::DynamicImport, seen, out);
+            push_asset(base, raw, &contexts, AssetSource::DynamicImport, seen, out);
         }
     }
     for pos in memchr::memmem::find_iter(bytes, b"new URL(") {
         if let Some(raw) = source::quoted_arg(bytes, pos + b"new URL(".len()) {
-            push_asset(base, raw, contexts, AssetSource::NewUrl, seen, out);
+            push_asset(base, raw, &contexts, AssetSource::NewUrl, seen, out);
         }
     }
 }
@@ -422,8 +439,37 @@ fn scan_framework_data(
         }
         scan_nuxt_islands(bytes, findings);
     }
+    if contexts.sveltekit {
+        framework::sveltekit::record_form_actions(bytes, base, findings);
+        framework::sveltekit::record_data_dependencies(bytes, findings);
+    }
     if contexts.astro {
         scan_astro_actions(bytes, findings);
+    }
+}
+
+fn push_sveltekit_data_assets(
+    routes: &[String],
+    base: &Url,
+    base_path: Option<&str>,
+    seen: &mut FxHashSet<Url>,
+    out: &mut Vec<AssetRef>,
+) {
+    for route in routes {
+        let Some(path) = framework::sveltekit::data_path_for_route_with_base(route, base_path)
+        else {
+            continue;
+        };
+        let Ok(url) = base.join(&path) else {
+            continue;
+        };
+        push_resolved_asset(
+            url,
+            AssetKind::Payload,
+            AssetSource::FrameworkManifest,
+            seen,
+            out,
+        );
     }
 }
 
@@ -439,6 +485,8 @@ fn record_framework_route_from_payload(
     let path = base.path();
     let route = if extractor == Extractor::NuxtPayload {
         framework::nuxt::route_from_payload(base)
+    } else if extractor == Extractor::SvelteKitData {
+        framework::sveltekit::route_from_payload(base)
     } else if base.query().is_some_and(|query| query.contains("_data=")) {
         Some(if path.is_empty() { "/" } else { path }.to_owned())
     } else if let Some(route) = path.strip_suffix("/_payload.json") {
@@ -527,7 +575,7 @@ fn push_candidate(findings: &mut ScanResult, raw: &str) {
 fn push_asset(
     base: &Url,
     raw: &str,
-    contexts: FrameworkContexts,
+    contexts: &FrameworkContexts,
     source: AssetSource,
     seen: &mut FxHashSet<Url>,
     out: &mut Vec<AssetRef>,
@@ -599,7 +647,7 @@ fn is_context_relative_asset(raw: &str) -> bool {
 // Bundlers often emit relative chunk names that are only meaningful in a
 // framework context. The Next.js branch rewrites `static/...` to `/_next/...`
 // only when the page or asset already proves that context.
-fn resolve_asset(base: &Url, raw: &str, contexts: FrameworkContexts) -> Option<Url> {
+fn resolve_asset(base: &Url, raw: &str, contexts: &FrameworkContexts) -> Option<Url> {
     let raw = raw.trim_matches('\\');
     if raw.is_empty() || raw.starts_with("data:") || raw.starts_with("blob:") {
         return None;
@@ -616,7 +664,12 @@ fn resolve_asset(base: &Url, raw: &str, contexts: FrameworkContexts) -> Option<U
     if let Some(url) = framework::sveltekit::resolve_asset(base, raw) {
         return Some(url);
     }
-    if let Some(url) = framework::sveltekit::resolve_context_asset(base, raw, contexts.sveltekit) {
+    if let Some(url) = framework::sveltekit::resolve_context_asset(
+        base,
+        raw,
+        contexts.sveltekit,
+        contexts.sveltekit_immutable_root.as_deref(),
+    ) {
         return Some(url);
     }
     if let Some(url) = framework::astro::resolve_asset(base, raw) {
