@@ -4,11 +4,14 @@
 //! fetched bytes. It is intentionally separate from the endpoint scanner because
 //! callers expect grep-like text hits, not interpreted API shapes.
 
-use crate::app::{escape_terminal, normalize_url, AppError};
-use crate::discover::{self, AssetRef, DocumentKind};
+use crate::app::AppError;
+use crate::util::{escape_terminal, normalize_url};
+use crate::discover::{self, scan_assets, AssetRef, DocumentKind};
+use crate::framework::DetectedSite;
 use crate::runtime::concurrent;
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::engine::MAX_TOTAL_ASSETS;
+use crate::runtime::fetch_root;
 use crate::runtime::http::Client;
 use crate::runtime::net;
 use crate::url::Url;
@@ -94,11 +97,11 @@ pub async fn run(args: &[String], client: Client, config: RuntimeConfig) -> Resu
     }
     let url = normalize_url(&url)?;
 
-    let base = Url::parse(&url)?;
-    let response = net::get_limited(&client, base.clone(), config.allow_private).await?;
-    let final_base = response.url().clone();
-    let html = net::read_limited(response).await?;
-    let mut assets = discover::scan_document(&html, &final_base, DocumentKind::Html).assets;
+    let doc = fetch_root::fetch_root_document(&client, &url, config.allow_private).await?;
+    let final_base = doc.url;
+    let html = doc.body;
+    let site = DetectedSite::detect(&html, &final_base, None);
+    let mut assets = scan_assets(&html, &final_base, DocumentKind::Html, &site);
     let assets_capped = assets.len() > MAX_TOTAL_ASSETS;
     if assets_capped {
         assets.truncate(MAX_TOTAL_ASSETS);

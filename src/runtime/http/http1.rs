@@ -188,7 +188,7 @@ async fn read_response<S: AsyncRead + Unpin>(
     let bytes = bytes.freeze();
     let body = bytes.slice(body_start..);
     let body = match head.body {
-        BodyShape::Chunked => decode_chunks(&body)?,
+        BodyShape::Chunked => ChunkedBodyReader::decode(&body)?,
         _ => body,
     };
     let response = Response {
@@ -227,7 +227,7 @@ async fn read_chunked_body<S: AsyncRead + Unpin>(
 ) -> Result<(), Error> {
     let mut buf = [0u8; 16 * 1024];
     loop {
-        if chunked_complete(&bytes[body_start..]) {
+        if ChunkedBodyReader::is_complete(&bytes[body_start..]) {
             return Ok(());
         }
         let n = stream.read(&mut buf).await?;
@@ -367,51 +367,52 @@ fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
-fn chunked_complete(body: &[u8]) -> bool {
-    let mut pos = 0;
-    while pos < body.len() {
-        let Some(line_end) = find_crlf(body, pos) else {
-            return false;
-        };
-        let size_text = match std::str::from_utf8(&body[pos..line_end]) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        let Ok(size) = usize::from_str_radix(size_text.split(';').next().unwrap_or(""), 16) else {
-            return false;
-        };
-        let after_size_crlf = line_end + 2;
-        if size == 0 {
-            return find_sub(&body[after_size_crlf.saturating_sub(2)..], b"\r\n\r\n").is_some();
-        }
-        let chunk_end = after_size_crlf + size + 2;
-        if chunk_end > body.len() {
-            return false;
-        }
-        pos = chunk_end;
-    }
-    false
-}
+struct ChunkedBodyReader;
 
-fn decode_chunks(bytes: &[u8]) -> Result<HiBytes, Error> {
-    let mut pos = 0;
-    let mut out = HiBuf::new();
-    loop {
-        let line_end = find_crlf(bytes, pos).ok_or(Error::BadHttp1)?;
-        let size_text = std::str::from_utf8(&bytes[pos..line_end]).map_err(|_| Error::BadHttp1)?;
+impl ChunkedBodyReader {
+    fn chunk_size(body: &[u8], pos: usize) -> Result<Option<(usize, usize)>, Error> {
+        let Some(line_end) = find_crlf(body, pos) else {
+            return Ok(None);
+        };
+        let size_text = std::str::from_utf8(&body[pos..line_end]).map_err(|_| Error::BadHttp1)?;
         let size = usize::from_str_radix(size_text.split(';').next().unwrap_or(""), 16)
             .map_err(|_| Error::BadHttp1)?;
-        pos = line_end + 2;
-        if size == 0 {
-            break;
-        }
-        let end = pos.checked_add(size).ok_or(Error::BadHttp1)?;
-        out.extend_from_slice(bytes.get(pos..end).ok_or(Error::BadHttp1)?);
-        pos = end + 2;
+        Ok(Some((size, line_end + 2)))
     }
-    Ok(out.freeze())
-}
 
+    fn is_complete(body: &[u8]) -> bool {
+        let mut pos = 0;
+        loop {
+            let Some((size, data_start)) = Self::chunk_size(body, pos).ok().flatten() else {
+                return false;
+            };
+            if size == 0 {
+                return find_sub(&body[data_start.saturating_sub(2)..], b"\r\n\r\n").is_some();
+            }
+            let chunk_end = data_start + size + 2;
+            if chunk_end > body.len() {
+                return false;
+            }
+            pos = chunk_end;
+        }
+    }
+
+    fn decode(body: &[u8]) -> Result<HiBytes, Error> {
+        let mut pos = 0;
+        let mut out = HiBuf::new();
+        loop {
+            let (size, data_start) = Self::chunk_size(body, pos)?.ok_or(Error::BadHttp1)?;
+            pos = data_start;
+            if size == 0 {
+                break;
+            }
+            let end = pos.checked_add(size).ok_or(Error::BadHttp1)?;
+            out.extend_from_slice(body.get(pos..end).ok_or(Error::BadHttp1)?);
+            pos = end + 2;
+        }
+        Ok(out.freeze())
+    }
+}
 fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     memchr::memmem::find(haystack, needle)
 }
@@ -430,7 +431,7 @@ mod tests {
 
     #[test]
     fn chunked_body_is_decoded() {
-        let body = decode_chunks(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n").unwrap();
+        let body = ChunkedBodyReader::decode(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n").unwrap();
         assert_eq!(body, HiBytes::from_static(b"Wikipedia"));
     }
 
@@ -448,9 +449,9 @@ mod tests {
 
     #[test]
     fn chunked_complete_detects_terminator() {
-        assert!(chunked_complete(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"));
-        assert!(!chunked_complete(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n"));
-        assert!(!chunked_complete(b"4\r\nWiki\r\n"));
+        assert!(ChunkedBodyReader::is_complete(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"));
+        assert!(!ChunkedBodyReader::is_complete(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n"));
+        assert!(!ChunkedBodyReader::is_complete(b"4\r\nWiki\r\n"));
     }
 
     #[test]

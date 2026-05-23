@@ -298,11 +298,10 @@ fn locate_build_manifest_object(bytes: &[u8]) -> Option<usize> {
 /// it advertises. The manifest is a JSON object keyed by route pattern with
 /// chunk arrays as values.
 pub fn parse_app_build_manifest(bytes: &[u8]) -> Vec<String> {
-    if let Some(keys) = crate::json::keys_under(bytes, "pages") {
+    if let Some(keys) = crate::json::object_keys(bytes, Some("pages")) {
         return keys.iter().map(|k| route_from_app_key(k)).collect();
     }
-    // Some Next versions write the routes at the top level.
-    crate::json::top_level_keys(bytes)
+    crate::json::object_keys(bytes, None)
         .map(|keys| {
             keys.iter()
                 .filter(|k| k.starts_with('/') || k.contains("/page"))
@@ -501,7 +500,7 @@ fn walk_flight_payload(payload: &str, out: &mut Vec<String>) {
         crate::json::walk_strings(json.as_bytes(), |key, value| {
             if let Some(k) = key {
                 if matches!(k, "href" | "src" | "action" | "url" | "data-href")
-                    && looks_like_route(value)
+                    && flight_value_ok(value)
                 {
                     out.push(value.to_owned());
                 }
@@ -510,13 +509,15 @@ fn walk_flight_payload(payload: &str, out: &mut Vec<String>) {
     }
 }
 
-fn looks_like_route(s: &str) -> bool {
-    !s.is_empty()
-        && s.starts_with('/')
-        && !s.starts_with("//")
-        && s.len() <= 512
-        && !s.contains('\n')
-        && !s.contains(' ')
+fn flight_value_ok(s: &str) -> bool {
+    crate::scan::classify::is_client_route(s)
+        || crate::scan::classify::is_api_candidate(s)
+        || (!s.is_empty()
+            && s.starts_with('/')
+            && !s.starts_with("//")
+            && s.len() <= 512
+            && !s.contains('\n')
+            && !s.contains(' '))
 }
 
 fn route_from_app_chunk(key: &str) -> Option<String> {

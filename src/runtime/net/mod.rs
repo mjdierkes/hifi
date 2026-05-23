@@ -1,11 +1,12 @@
 //! Network policy and bounded response reads.
-//!
-//! Every outbound request should pass through this module so URL scheme checks,
-//! private-address policy, status handling, and response size limits remain
-//! consistent across page, asset, and grep fetches.
 
-use crate::runtime::bytes::{HiBuf, HiBytes};
-use crate::runtime::http::{Client, Response};
+mod fetch;
+
+pub use fetch::{
+    fetch, fetch_bytes, get_bytes_limited, get_limited, read_limited, FetchOptions,
+};
+
+use crate::runtime::http::Response;
 use crate::url::{Host, Url};
 use std::{fmt, io, net::IpAddr};
 
@@ -63,10 +64,6 @@ pub fn validate_url(url: &Url, allow_private: bool) -> Result<(), NetError> {
     if allow_private {
         return Ok(());
     }
-    // This validates the URL host as written: literal private IPs and local
-    // names are blocked here. It does not resolve public hostnames and inspect
-    // their DNS answers; add resolver-level checks before relying on this as an
-    // SSRF boundary for hostile input.
     let Some(host) = url.host() else {
         return Err(NetError::PrivateAddress(url.to_string()));
     };
@@ -101,66 +98,6 @@ pub async fn validate_request_url(url: &Url, allow_private: bool) -> Result<(), 
         }
     }
     Ok(())
-}
-
-pub async fn get_limited(
-    client: &Client,
-    url: Url,
-    allow_private: bool,
-) -> Result<Response, NetError> {
-    let mut current = url;
-    for _ in 0..MAX_REDIRECTS {
-        validate_request_url(&current, allow_private).await?;
-        let response = client.get(current.clone()).send().await?;
-        if response.is_redirection() {
-            if let Some(next) = redirect_target(&response) {
-                current = next;
-                continue;
-            }
-        }
-        if response.is_success() {
-            return Ok(response);
-        }
-        return Err(NetError::Http(crate::runtime::http::Error::H2(
-            "HTTP status was not successful",
-        )));
-    }
-    Err(NetError::TooManyRedirects(current.to_string()))
-}
-
-pub async fn read_limited(response: Response) -> Result<HiBytes, NetError> {
-    let content_length = response.content_length();
-    if let Some(len) = content_length {
-        if len > MAX_RESPONSE_BYTES {
-            return Err(NetError::ResponseTooLarge {
-                actual: len,
-                limit: MAX_RESPONSE_BYTES,
-            });
-        }
-    }
-
-    let mut body =
-        HiBuf::with_capacity(content_length.unwrap_or(0).min(MAX_RESPONSE_BYTES) as usize);
-    let bytes = response.body();
-    for chunk in bytes.chunks(16 * 1024) {
-        let next_len = body.len() as u64 + chunk.len() as u64;
-        if next_len > MAX_RESPONSE_BYTES {
-            return Err(NetError::ResponseTooLarge {
-                actual: next_len,
-                limit: MAX_RESPONSE_BYTES,
-            });
-        }
-        body.extend_from_slice(chunk);
-    }
-    Ok(body.freeze())
-}
-
-pub async fn get_bytes_limited(
-    client: &Client,
-    url: Url,
-    allow_private: bool,
-) -> Result<HiBytes, NetError> {
-    read_limited(get_limited(client, url, allow_private).await?).await
 }
 
 pub fn redirect_target(response: &Response) -> Option<Url> {

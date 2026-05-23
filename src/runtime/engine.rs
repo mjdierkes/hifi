@@ -1,9 +1,8 @@
 //! Vertical scan engine: URL bytes in, internal API surface out.
 
-use crate::discover::{self, DocumentKind};
 use crate::scan::{Evidence, EvidenceKind, Shape};
 
-use super::{cache, fetch, http::Client, net};
+use super::{fetch, http::Client, net};
 use crate::url::Url;
 use std::collections::BTreeMap;
 use std::{fmt, sync::Arc, time::Instant};
@@ -103,77 +102,10 @@ pub async fn scan_site(
     no_cache: bool,
     t0: Instant,
 ) -> Result<Output> {
-    let base = Url::parse(url)?;
-    let cache_store = cache::ScanCache::for_base(&base);
-    let use_cache = !no_cache;
-
-    if use_cache {
-        if let Some((body, age)) = cache_store.read_fresh_binary() {
-            if let Some(output) = decode_output_binary(&body) {
-                return Ok(output.mark(Some(t0), CacheStatus::Fresh, Some(age)));
-            }
-        }
-    }
-
-    let response = net::get_limited(client, base, allow_private).await?;
-    let final_base = response.url().clone();
-    let html = net::read_limited(response).await?;
-    let root_scan = scan_root_document(html, final_base).await?;
-    let mut found = root_scan.findings;
-    let mut initial_assets = root_scan.assets;
-    let revision = root_scan.revision.clone();
-
-    if let (true, Some(revision)) = (use_cache, revision.as_deref()) {
-        if let Some(bytes) = cache_store.read_stale_binary() {
-            if let Some(output) = decode_output_binary(&bytes) {
-                if output.revision.as_deref() == Some(revision) {
-                    return Ok(output.mark(Some(t0), CacheStatus::RevisionHit, None));
-                }
-            }
-        }
-    }
-
-    client.backpressure().set_capacity(concurrency);
-    let asset_stats = fetch::scan_assets(
-        fetch::ScanEnv {
-            client: client.clone(),
-            concurrency,
-            use_cache,
-            cache_key: revision.clone(),
-            allow_private,
-            framework_config: root_scan.framework_config,
-        },
-        initial_assets.drain(..),
-        &mut found,
-    )
-    .await;
-    let found = found.finish();
-    let output = Output {
-        apis: collect_apis(&found.evidence),
-        revision,
-        cache: CacheStatus::Miss,
-        cache_age_secs: None,
-        elapsed_us: Some(t0.elapsed().as_micros()),
-        warnings: warnings_from_assets(&asset_stats),
-    };
-    if use_cache {
-        write_caches(&cache_store, &output);
-    }
-    Ok(output)
+    super::processor::scan_site(client, url, concurrency, allow_private, no_cache, t0).await
 }
 
-async fn scan_root_document(
-    html: crate::runtime::bytes::HiBytes,
-    final_base: Url,
-) -> Result<discover::DocumentScan> {
-    tokio::task::spawn_blocking(move || {
-        discover::scan_document(&html, &final_base, DocumentKind::Html)
-    })
-    .await
-    .map_err(RuntimeError::from)
-}
-
-fn warnings_from_assets(asset_stats: &fetch::AssetScanStats) -> Vec<String> {
+pub(crate) fn warnings_from_assets(asset_stats: &fetch::AssetScanStats) -> Vec<String> {
     let mut warnings = Vec::new();
     if asset_stats.failed > 0 {
         let total = asset_stats.failed;
@@ -201,7 +133,7 @@ fn warnings_from_assets(asset_stats: &fetch::AssetScanStats) -> Vec<String> {
     warnings
 }
 
-fn collect_apis(evidence: &[Evidence]) -> Vec<Api> {
+pub(crate) fn collect_apis(evidence: &[Evidence]) -> Vec<Api> {
     let mut merged = BTreeMap::<String, Shape>::new();
     for item in evidence {
         if item.kind != EvidenceKind::Api {
@@ -239,12 +171,7 @@ fn prettify_path(path: &str) -> String {
     path.replace("{dynamic}", ":id")
 }
 
-fn write_caches(cache_store: &cache::ScanCache, out: &Output) {
-    let cached = out.clone().mark(None, CacheStatus::Stored, None);
-    cache_store.write_binary_deferred(Arc::from(encode_output_binary(&cached)));
-}
-
-const OUTPUT_BINARY_MAGIC: &[u8; 8] = b"HIFIOU2\0";
+const OUTPUT_BINARY_MAGIC: &[u8; 8] = b"HIFI3\0\0\0";
 
 pub(crate) fn encode_output_binary(out: &Output) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(out.apis.len().saturating_mul(48) + 128);
@@ -253,7 +180,7 @@ pub(crate) fn encode_output_binary(out: &Output) -> Vec<u8> {
     put_u32(&mut bytes, out.apis.len());
     for api in &out.apis {
         put_string(&mut bytes, &api.path);
-        put_shape(&mut bytes, &api.shape);
+        document::put_shape(&mut bytes, &api.shape);
     }
     put_u32(&mut bytes, out.warnings.len());
     for warning in &out.warnings {
@@ -292,22 +219,7 @@ pub(crate) fn decode_output_binary(bytes: &[u8]) -> Option<Output> {
     })
 }
 
-fn put_shape(bytes: &mut Vec<u8>, shape: &Shape) {
-    let (methods, has_body, has_headers, content_types, auth, next_server_action, query_params) =
-        shape.binary_parts();
-    bytes.push(methods);
-    bytes.push(has_body as u8);
-    bytes.push(has_headers as u8);
-    bytes.push(content_types);
-    bytes.push(auth as u8);
-    bytes.push(next_server_action as u8);
-    put_u32(bytes, query_params.len());
-    for param in query_params {
-        put_string(bytes, param);
-    }
-}
-
-use super::wire::{put_opt_string, put_string, put_u32, Reader as BinaryReader};
+use super::codec::{document, put_opt_string, put_string, put_u32, Reader as BinaryReader};
 
 trait ReaderExt {
     fn shape(&mut self) -> Option<Shape>;
@@ -315,22 +227,7 @@ trait ReaderExt {
 
 impl<'a> ReaderExt for BinaryReader<'a> {
     fn shape(&mut self) -> Option<Shape> {
-        let methods = self.u8()?;
-        let has_body = self.bool()?;
-        let has_headers = self.bool()?;
-        let content_types = self.u8()?;
-        let auth = self.bool()?;
-        let next_server_action = self.bool()?;
-        let query_params = self.string_vec()?;
-        Some(Shape::from_binary_parts(
-            methods,
-            has_body,
-            has_headers,
-            content_types,
-            auth,
-            next_server_action,
-            query_params,
-        ))
+        document::read_shape(self)
     }
 }
 

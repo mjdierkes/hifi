@@ -1,0 +1,15 @@
+# Framework skip fragments and asset literal tables (reference; policy logic lives in framework/mod.rs).
+
+[next.skip]
+fragments = [
+  "framework-",
+  "polyfills-",
+  "/_astro/hoisted.",
+  "/build/_shared/",
+]
+
+[astro.skip]
+fragments = ["/_astro/hoisted.", "/_astro/polyfills", "/_astro/client."]
+
+[remix.skip]
+fragments = ["/build/_shared/", "/build/manifest-", "/assets/manifest-", "/entry.client-"]

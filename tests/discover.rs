@@ -1,7 +1,7 @@
 use hifi::url::Url;
 use hifi::{
-    scan_document, scan_document_with_config, DocumentKind, DocumentScan, EvidenceKind, Extractor,
-    NextConfig,
+    scan_document, scan_document_with_config, Channel, DocumentKind, DocumentScan, EvidenceKind,
+    FrameworkId, NextConfig, Provenance,
 };
 
 #[test]
@@ -129,7 +129,7 @@ fn lightweight_framework_support_detects_assets_payloads_and_labels() {
         <script>const payload="/products/_payload.json"; import("_nuxt/chunk.456.js")</script>
     "#,
     );
-    assert_eq!(nuxt.framework_config.label().as_deref(), Some("Nuxt"));
+    assert_eq!(nuxt.site.label().as_deref(), Some("Nuxt"));
     assert_assets(
         &nuxt,
         &[
@@ -148,7 +148,7 @@ fn lightweight_framework_support_detects_assets_payloads_and_labels() {
     "#,
     );
     assert_eq!(
-        svelte.framework_config.label().as_deref(),
+        svelte.site.label().as_deref(),
         Some("SvelteKit")
     );
     assert_assets(
@@ -166,7 +166,7 @@ fn lightweight_framework_support_detects_assets_payloads_and_labels() {
         <script>const action="/_actions/add-to-cart"; import("_astro/client.def.js")</script>
     "#,
     );
-    assert_eq!(astro.framework_config.label().as_deref(), Some("Astro"));
+    assert_eq!(astro.site.label().as_deref(), Some("Astro"));
     assert_asset(&astro, "https://example.com/_actions/add-to-cart");
     assert_no_asset_containing(&astro, "/_astro/client.def.js");
 
@@ -175,7 +175,7 @@ fn lightweight_framework_support_detects_assets_payloads_and_labels() {
         <script>window.__remixContext={}; const data="/products?_data=routes/products"; import("build/routes/products-abc.js")</script>
     "#,
     );
-    assert_eq!(remix.framework_config.label().as_deref(), Some("Remix"));
+    assert_eq!(remix.site.label().as_deref(), Some("Remix"));
     assert_assets(
         &remix,
         &[
@@ -198,7 +198,7 @@ fn framework_80_20_expansion_follows_manifests_payloads_and_islands() {
         &nuxt,
         "/api/catalog",
         EvidenceKind::Candidate,
-        Extractor::NuxtPayload,
+        Provenance::framework(Channel::Literal, FrameworkId::Nuxt),
     );
 
     let nuxt_payload = scan(
@@ -211,7 +211,7 @@ fn framework_80_20_expansion_follows_manifests_payloads_and_islands() {
         &nuxt_payload,
         "/api/products",
         EvidenceKind::Candidate,
-        Extractor::NuxtPayload,
+        Provenance::framework(Channel::Literal, FrameworkId::Nuxt),
     );
 
     let svelte = scan_html(
@@ -246,7 +246,7 @@ fn framework_80_20_expansion_follows_manifests_payloads_and_islands() {
         &astro,
         "/_actions/cart.add",
         EvidenceKind::Api,
-        Extractor::AstroIsland,
+        Provenance::framework(Channel::Literal, FrameworkId::Astro),
     );
 }
 
@@ -267,7 +267,7 @@ fn nuxt_deep_support_seeds_build_metadata_and_relative_chunks() {
         &url("https://example.com/docs/"),
         DocumentKind::Html,
     );
-    assert_eq!(nuxt.framework_config.label().as_deref(), Some("Nuxt"));
+    assert_eq!(nuxt.site.label().as_deref(), Some("Nuxt"));
     assert_assets(
         &nuxt,
         &[
@@ -285,7 +285,7 @@ fn nuxt_deep_support_seeds_build_metadata_and_relative_chunks() {
         &nuxt,
         "/api/nuxt-deep",
         EvidenceKind::Candidate,
-        Extractor::NuxtPayload,
+        Provenance::framework(Channel::Literal, FrameworkId::Nuxt),
     );
 }
 
@@ -311,7 +311,7 @@ fn nuxt_endpoint_maps_promote_api_evidence() {
         "/api/players/search",
         "https://edge.api.flagsmith.com/api/v1/",
     ] {
-        assert_evidence(&result, api, EvidenceKind::Api, Extractor::NuxtPayload);
+        assert_evidence(&result, api, EvidenceKind::Api, Provenance::framework(Channel::Literal, FrameworkId::Nuxt));
     }
     assert_no_api(&result, "/images/logo.png");
 }
@@ -338,7 +338,7 @@ fn sveltekit_deep_support_seeds_version_data_routes_and_actions() {
         DocumentKind::Html,
     );
     assert_eq!(
-        result.framework_config.label().as_deref(),
+        result.site.label().as_deref(),
         Some("SvelteKit")
     );
     assert_assets(
@@ -355,31 +355,31 @@ fn sveltekit_deep_support_seeds_version_data_routes_and_actions() {
         &result,
         "/products/[slug]",
         EvidenceKind::Route,
-        Extractor::SvelteKitData,
+        Provenance::framework(Channel::Manifest, FrameworkId::SvelteKit),
     );
     assert_evidence(
         &result,
         "/account/settings",
         EvidenceKind::Route,
-        Extractor::SvelteKitData,
+        Provenance::framework(Channel::Manifest, FrameworkId::SvelteKit),
     );
     assert_evidence(
         &result,
         "/api/sveltekit-products",
         EvidenceKind::Candidate,
-        Extractor::SvelteKitData,
+        Provenance::framework(Channel::Literal, FrameworkId::SvelteKit),
     );
     assert_evidence(
         &result,
         "/account/settings",
         EvidenceKind::Api,
-        Extractor::SvelteKitData,
+        Provenance::framework(Channel::Literal, FrameworkId::SvelteKit),
     );
     assert_evidence(
         &result,
         "/cart",
         EvidenceKind::Api,
-        Extractor::SvelteKitData,
+        Provenance::framework(Channel::Literal, FrameworkId::SvelteKit),
     );
 }
 
@@ -395,13 +395,13 @@ fn sveltekit_payloads_map_back_to_routes_and_dependencies() {
         &result,
         "/api/products",
         EvidenceKind::Candidate,
-        Extractor::SvelteKitData,
+        Provenance::framework(Channel::Literal, FrameworkId::SvelteKit),
     );
     assert_evidence(
         &result,
         "/api/products",
         EvidenceKind::Api,
-        Extractor::SvelteKitData,
+        Provenance::framework(Channel::Literal, FrameworkId::SvelteKit),
     );
     assert_no_api(&result, "/images/logo.png");
 }
@@ -429,19 +429,19 @@ fn sveltekit_minified_patterns_and_node_assets_are_recovered() {
         &result,
         "/blog/[slug]/comments/[comment]",
         EvidenceKind::Route,
-        Extractor::SvelteKitData,
+        Provenance::framework(Channel::Manifest, FrameworkId::SvelteKit),
     );
     assert_evidence(
         &result,
         "/graphql",
         EvidenceKind::Api,
-        Extractor::SvelteKitData,
+        Provenance::framework(Channel::Literal, FrameworkId::SvelteKit),
     );
     assert_evidence(
         &result,
         "/trpc/posts.byId",
         EvidenceKind::Api,
-        Extractor::SvelteKitData,
+        Provenance::framework(Channel::Literal, FrameworkId::SvelteKit),
     );
 }
 
@@ -474,7 +474,7 @@ fn sveltekit_custom_app_dir_and_base_paths_are_respected() {
         &result,
         "/guide/[slug]",
         EvidenceKind::Route,
-        Extractor::SvelteKitData,
+        Provenance::framework(Channel::Manifest, FrameworkId::SvelteKit),
     );
 
     let node = scan(
@@ -509,7 +509,7 @@ fn nuxt_runtime_config_bases_promote_relative_endpoints() {
     "#,
     );
     for api in ["/api/players/player", "/api/schedules/standings"] {
-        assert_evidence(&result, api, EvidenceKind::Api, Extractor::NuxtPayload);
+        assert_evidence(&result, api, EvidenceKind::Api, Provenance::framework(Channel::Literal, FrameworkId::Nuxt));
     }
     assert_no_api(&result, "/api/images/logo");
 }
@@ -601,7 +601,7 @@ fn manifests_emit_routes_and_manifest_evidence() {
         DocumentKind::Manifest,
     );
     assert_routes(&app, &["/about", "/dashboard", "/blog/[slug]"]);
-    assert_evidence(&app, "/dashboard", EvidenceKind::Route, Extractor::Manifest);
+    assert_evidence(&app, "/dashboard", EvidenceKind::Route, Provenance::channel(Channel::Manifest));
 }
 
 #[test]
@@ -613,15 +613,15 @@ fn evidence_keeps_distinct_extractors() {
         &result,
         "/dashboard",
         EvidenceKind::Route,
-        Extractor::Literal,
+        Provenance::literal(),
     );
     assert_evidence(
         &result,
         "/dashboard",
         EvidenceKind::Route,
-        Extractor::Flight,
+        Provenance::channel(Channel::Flight),
     );
-    assert_evidence(&result, "/", EvidenceKind::Api, Extractor::ServerAction);
+    assert_evidence(&result, "/", EvidenceKind::Api, Provenance::channel(Channel::ServerAction));
 }
 
 #[test]
@@ -722,14 +722,14 @@ fn assert_routes(result: &DocumentScan, routes: &[&str]) {
     }
 }
 
-fn assert_evidence(result: &DocumentScan, url: &str, kind: EvidenceKind, extractor: Extractor) {
+fn assert_evidence(result: &DocumentScan, url: &str, kind: EvidenceKind, provenance: Provenance) {
     assert!(
         result
             .findings
             .evidence
             .iter()
-            .any(|e| e.url == url && e.kind == kind && e.extractor == extractor),
-        "missing {kind:?}/{extractor:?} evidence for {url}"
+            .any(|e| e.url == url && e.kind == kind && e.provenance == provenance),
+        "missing {kind:?}/{provenance:?} evidence for {url}"
     );
 }
 

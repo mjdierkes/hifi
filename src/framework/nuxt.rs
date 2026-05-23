@@ -2,7 +2,9 @@
 
 use crate::discover::{AssetKind, AssetRef, AssetSource};
 use crate::hash::FxHashSet;
-use crate::scan::{Extractor, Shape};
+use crate::framework::FrameworkId;
+use crate::scan::findings::{Channel, FindingsBuilder, Provenance};
+use crate::scan::Shape;
 use crate::source::{self, TemplateMode};
 use crate::url::Url;
 
@@ -70,7 +72,7 @@ pub fn route_from_payload(base: &Url) -> Option<String> {
 
 pub fn record_routes(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
     for route in parse_routes(bytes) {
-        findings.record_route(route, Extractor::NuxtPayload);
+        findings.record_route(route, Provenance::framework(Channel::Manifest, FrameworkId::Nuxt));
     }
 }
 
@@ -81,7 +83,7 @@ pub fn record_page_route(bytes: &[u8], findings: &mut crate::scan::FindingsBuild
         };
         let path = route.split(['?', '#']).next().unwrap_or(&route);
         if crate::scan::classify::is_client_route(path) {
-            findings.record_route(path.to_owned(), Extractor::NuxtPayload);
+            findings.record_route(path.to_owned(), Provenance::framework(Channel::Manifest, FrameworkId::Nuxt));
             return;
         }
     }
@@ -92,7 +94,7 @@ pub fn record_endpoint_maps(bytes: &[u8], findings: &mut crate::scan::FindingsBu
         findings.record_api(
             endpoint,
             Shape::inferred(None, false),
-            Extractor::NuxtPayload,
+            Provenance::framework(Channel::Literal, FrameworkId::Nuxt),
         );
     }
 }

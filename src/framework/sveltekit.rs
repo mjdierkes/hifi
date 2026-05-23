@@ -2,7 +2,9 @@
 
 use crate::discover::{AssetKind, AssetRef, AssetSource};
 use crate::hash::FxHashSet;
-use crate::scan::{Extractor, Shape};
+use crate::framework::FrameworkId;
+use crate::scan::findings::{Channel, FindingsBuilder, Provenance};
+use crate::scan::Shape;
 use crate::source;
 use crate::source::TemplateMode;
 use crate::url::Url;
@@ -177,7 +179,7 @@ pub fn routes(bytes: &[u8]) -> Vec<String> {
 pub fn record_routes(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) -> Vec<String> {
     let routes = routes(bytes);
     for route in &routes {
-        findings.record_route(route.clone(), Extractor::SvelteKitData);
+        findings.record_route(route.clone(), Provenance::framework(Channel::Manifest, FrameworkId::SvelteKit));
     }
     routes
 }
@@ -190,7 +192,7 @@ pub fn record_form_actions(bytes: &[u8], base: &Url, findings: &mut crate::scan:
             findings.record_api(
                 route,
                 Shape::inferred(Some("POST"), true),
-                Extractor::SvelteKitData,
+                Provenance::framework(Channel::Literal, FrameworkId::SvelteKit),
             );
         }
     }
@@ -526,7 +528,7 @@ fn record_action(raw: &str, base: &Url, findings: &mut crate::scan::FindingsBuil
     findings.record_api(
         route,
         Shape::inferred(Some("POST"), true),
-        Extractor::SvelteKitData,
+        Provenance::framework(Channel::Literal, FrameworkId::SvelteKit),
     );
 }
 
@@ -539,7 +541,7 @@ fn record_dependency_url(raw: &str, findings: &mut crate::scan::FindingsBuilder)
     findings.record_api(
         crate::scan::classify::normalize_api_url(raw),
         shape,
-        Extractor::SvelteKitData,
+        Provenance::framework(Channel::Literal, FrameworkId::SvelteKit),
     );
 }
 

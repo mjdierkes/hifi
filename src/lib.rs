@@ -9,13 +9,12 @@ mod runtime;
 mod scan;
 mod source;
 pub mod url;
+mod util;
 
-pub use discover::{
-    scan_document, scan_document_with_config, AssetKind, AssetRef, AssetSource, DocumentKind,
-    DocumentScan,
-};
-pub use scan::next::NextConfig;
+pub use discover::{scan_document, scan_document_with_config, DocumentKind, DocumentScan};
+pub use framework::{next::NextConfig, DetectedSite, FrameworkId};
 pub use scan::{
-    scan_endpoints, Confidence, Evidence, EvidenceKind, Extractor, FindingsBuilder, ScanResult,
+    scan_endpoints, Confidence, Evidence, EvidenceKind, FindingsBuilder, Provenance, ScanResult,
     Shape,
 };
+pub use scan::findings::Channel;

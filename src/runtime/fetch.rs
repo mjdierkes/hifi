@@ -8,7 +8,7 @@
 //! data across builds, so the processed asset cache is scoped by cache key.
 
 use crate::discover::{self, AssetRef, AssetSource, DocumentScan};
-use crate::framework::{self, FrameworkConfig};
+use crate::framework::{self, DetectedSite};
 use crate::scan::FindingsBuilder;
 
 use super::cache::{self, AssetData};
@@ -62,7 +62,7 @@ pub(super) struct ScanEnv {
     pub use_cache: bool,
     pub cache_key: Option<String>,
     pub allow_private: bool,
-    pub framework_config: FrameworkConfig,
+    pub site: DetectedSite,
 }
 
 pub async fn scan_assets(
@@ -97,7 +97,7 @@ pub async fn scan_assets(
                 env.use_cache,
                 env.cache_key.as_deref(),
                 env.allow_private,
-                env.framework_config.clone(),
+                env.site.clone(),
             ));
         }
 
@@ -226,49 +226,89 @@ fn prewarm_key(url: &Url) -> Option<String> {
     Some(format!("{}://{host}:{port}", url.scheme()))
 }
 
+enum CacheResolution {
+    Fresh(Arc<AssetData>),
+    StaleRevalidate {
+        data: Arc<AssetData>,
+        validators: cache::AssetValidators,
+        content_hash: String,
+    },
+    Conditional(cache::CachedAsset),
+    Miss,
+}
+
+fn resolve_cache(
+    asset: &AssetRef,
+    use_cache: bool,
+    cache_key: Option<&str>,
+) -> CacheResolution {
+    if !use_cache {
+        return CacheResolution::Miss;
+    }
+    let chunk_cache = cache::ChunkCache::new();
+    if asset.kind == discover::AssetKind::Script {
+        if let Some(chunk) = chunk_cache.read_fresh_url(&asset.url) {
+            return CacheResolution::Fresh(chunk.data);
+        }
+        if let Some(chunk) = chunk_cache.read_stale_url(&asset.url) {
+            return CacheResolution::StaleRevalidate {
+                data: chunk.data,
+                validators: chunk.validators,
+                content_hash: chunk.content_hash,
+            };
+        }
+    }
+    if let Some(cached) = cache::read_asset_cached(&asset.url, cache_key) {
+        if cached.age_secs < cache::CACHE_FRESH_SECS {
+            return CacheResolution::Fresh(Arc::new(cached.data));
+        }
+        return CacheResolution::Conditional(cached);
+    }
+    CacheResolution::Miss
+}
+
+fn persist_fetched(
+    url: &Url,
+    cache_key: Option<&str>,
+    data: Arc<AssetData>,
+    validators: &cache::AssetValidators,
+    content_hash: Option<&str>,
+) {
+    cache::write_asset_with_validators_deferred(url, data.clone(), cache_key, validators);
+    if let Some(hash) = content_hash {
+    cache::ChunkCache::new().write_deferred(url, hash, data, validators);
+    }
+}
+
 async fn fetch_scan(
     client: Client,
     asset: AssetRef,
     use_cache: bool,
     cache_key: Option<&str>,
     allow_private: bool,
-    framework_config: FrameworkConfig,
+    site: DetectedSite,
 ) -> Result<Arc<AssetData>, FetchFailure> {
-    let mut cached = None;
-    if use_cache {
-        let chunk_cache = cache::ChunkCache::new();
-        if asset.kind == discover::AssetKind::Script {
-            if let Some(chunk) = chunk_cache.read_fresh_url(&asset.url) {
-                return Ok(chunk.data);
-            }
+    let cached = match resolve_cache(&asset, use_cache, cache_key) {
+        CacheResolution::Fresh(data) => return Ok(data),
+        CacheResolution::StaleRevalidate {
+            data,
+            validators,
+            content_hash,
+        } => {
+            spawn_revalidate_chunk(
+                client.clone(),
+                asset.clone(),
+                validators,
+                content_hash,
+                cache_key.map(str::to_owned),
+                site.clone(),
+                allow_private,
+            );
+            return Ok(data);
         }
-        if asset.kind == discover::AssetKind::Script {
-            if let Some(chunk) = chunk_cache.read_stale_url(&asset.url) {
-                // Stale-while-revalidate: hand the user cached findings now,
-                // refresh the bytes off the critical path.
-                spawn_revalidate_chunk(
-                    client.clone(),
-                    asset.clone(),
-                    chunk.validators.clone(),
-                    chunk.content_hash.clone(),
-                    cache_key.map(str::to_owned),
-                    framework_config.clone(),
-                    allow_private,
-                );
-                return Ok(chunk.data);
-            }
-        }
-        if cached.is_none() {
-            cached = cache::read_asset_cached(&asset.url, cache_key);
-        }
-        if let Some(asset_data) = cached.take() {
-            if asset_data.age_secs < cache::CACHE_FRESH_SECS {
-                let asset_data = Arc::new(asset_data.data);
-                return Ok(asset_data);
-            }
-            cached = Some(asset_data);
-        }
-    }
+        CacheResolution::Conditional(c) => Some(c),
+        CacheResolution::Miss => None,
+    };
 
     let validators = cached.as_ref().map(|asset_data| &asset_data.validators);
     match fetch_asset_body(
@@ -276,7 +316,7 @@ async fn fetch_scan(
         asset.clone(),
         allow_private,
         validators,
-        framework_config,
+        site,
         use_cache,
     )
     .await?
@@ -284,31 +324,25 @@ async fn fetch_scan(
         FetchedBody::NotModified => {
             let cached = cached.ok_or(FetchFailure::Other)?;
             let asset_data = Arc::new(cached.data);
-            cache::write_asset_with_validators_deferred(
+            persist_fetched(
                 &asset.url,
-                asset_data.clone(),
                 cache_key,
+                asset_data.clone(),
                 &cached.validators,
+                None,
             );
             Ok(asset_data)
         }
         FetchedBody::Body(scan, validators, content_hash) => {
             let asset_data = Arc::new(*scan);
             if use_cache {
-                cache::write_asset_with_validators_deferred(
+                persist_fetched(
                     &asset.url,
-                    asset_data.clone(),
                     cache_key,
+                    asset_data.clone(),
                     &validators,
+                    content_hash.as_deref(),
                 );
-                if let Some(content_hash) = content_hash.as_deref() {
-                    cache::ChunkCache::new().write_deferred(
-                        &asset.url,
-                        content_hash,
-                        asset_data.clone(),
-                        &validators,
-                    );
-                }
             }
             Ok(asset_data)
         }
@@ -320,52 +354,25 @@ async fn fetch_asset_body(
     asset: AssetRef,
     allow_private: bool,
     validators: Option<&cache::AssetValidators>,
-    framework_config: FrameworkConfig,
+    site: DetectedSite,
     use_hash_cache: bool,
 ) -> Result<FetchedBody, FetchFailure> {
-    let mut current_url = asset.url.clone();
-    let mut redirects = 0;
     let _bp_guard = client.backpressure().enter();
-    let response = loop {
-        net::validate_request_url(&current_url, allow_private)
-            .await
-            .map_err(|_| FetchFailure::Other)?;
-        let mut request = client.get(current_url.clone());
-        for (name, value) in framework::request_headers(&current_url) {
-            request = request.header(*name, *value);
-        }
-        if let Some(validators) = validators {
-            if let Some(etag) = &validators.etag {
-                request = request.header("if-none-match", etag);
-            }
-            if let Some(last_modified) = &validators.last_modified {
-                request = request.header("if-modified-since", last_modified);
-            }
-        }
-
-        let response = request.send().await.map_err(|err| {
-            trace_asset_error(&current_url, &err);
-            FetchFailure::Other
-        })?;
-        if response.is_redirection() {
-            if redirects >= net::MAX_REDIRECTS {
-                return Err(FetchFailure::Other);
-            }
-            let Some(next) = net::redirect_target(&response) else {
-                break response;
-            };
-            if current_url == next {
-                return Err(FetchFailure::Other);
-            }
-            redirects += 1;
-            current_url = next;
-            continue;
-        }
-        break response;
-    };
+    let headers = framework::request_headers(&asset.url);
+    let response = net::fetch(
+        client,
+        asset.url.clone(),
+        net::FetchOptions::asset(allow_private, validators, headers),
+    )
+    .await
+    .map_err(|err| {
+        trace_net_error(&asset.url, &err);
+        FetchFailure::Other
+    })?;
     if !FIRST_ASSET_RESPONSE_TRACED.swap(true, Ordering::Relaxed) {
-        net::trace_response_version("asset", &current_url, &response);
+        net::trace_response_version("asset", response.url(), &response);
     }
+    let current_url = response.url().clone();
     let status = response.status();
     if status == 304 {
         // The cached scan result is still valid; callers refresh the validator
@@ -410,7 +417,7 @@ async fn fetch_asset_body(
             &body,
             &scan_url,
             kind,
-            framework_config.as_next(),
+            site.next.as_ref(),
             cached_findings,
         )
     })
@@ -424,7 +431,7 @@ async fn fetch_asset_body(
     Ok(FetchedBody::Body(Box::new(scan), validators, content_hash))
 }
 
-fn trace_asset_error(url: &Url, err: &super::http::Error) {
+fn trace_asset_error(url: &Url, err: &net::NetError) {
     if std::env::var_os("HIFI_TRACE_HTTP").is_some() {
         eprintln!("hifi: trace: asset error {} {err}", url.as_str());
     }
@@ -449,7 +456,7 @@ fn spawn_revalidate_chunk(
     cached_validators: cache::AssetValidators,
     cached_content_hash: String,
     cache_key: Option<String>,
-    framework_config: FrameworkConfig,
+    site: DetectedSite,
     allow_private: bool,
 ) {
     let sem = revalidation_semaphore().clone();
@@ -467,7 +474,7 @@ fn spawn_revalidate_chunk(
             asset.clone(),
             allow_private,
             validators,
-            framework_config,
+            site,
             true,
         )
         .await
@@ -488,21 +495,13 @@ fn spawn_revalidate_chunk(
                 }
             }
             FetchedBody::Body(scan, new_validators, content_hash) => {
-                let asset_data = Arc::new(*scan);
-                cache::write_asset_with_validators_deferred(
+                persist_fetched(
                     &asset.url,
-                    asset_data.clone(),
                     cache_key.as_deref(),
+                    Arc::new(*scan),
                     &new_validators,
+                    content_hash.as_deref(),
                 );
-                if let Some(hash) = content_hash.as_deref() {
-                    cache::ChunkCache::new().write_deferred(
-                        &asset.url,
-                        hash,
-                        asset_data.clone(),
-                        &new_validators,
-                    );
-                }
             }
         }
     });
@@ -552,7 +551,7 @@ mod tests {
                 use_cache: false,
                 cache_key: None,
                 allow_private: true,
-                framework_config: FrameworkConfig::default(),
+                site: DetectedSite::default(),
             },
             [initial],
             &mut found,

@@ -346,14 +346,34 @@ pub fn walk(bytes: &[u8], mut visit: impl FnMut(Visit<'_>)) {
     }
 }
 
-/// Read top-level keys of the root object. Returns `None` if the document
-/// isn't a JSON object.
-pub fn top_level_keys(bytes: &[u8]) -> Option<Vec<String>> {
+/// Collect object keys at the JSON root, or under a top-level `parent_key`.
+pub fn object_keys(bytes: &[u8], parent_key: Option<&str>) -> Option<Vec<String>> {
     let mut p = Parser::new(bytes);
-    match p.next()? {
-        Event::BeginObject => {}
-        _ => return None,
+    if !matches!(p.next()?, Event::BeginObject) {
+        return None;
     }
+    if let Some(parent) = parent_key {
+        loop {
+            match p.next()? {
+                Event::EndObject => return None,
+                Event::Key(k) => {
+                    if k.as_str() == parent {
+                        if !matches!(p.next()?, Event::BeginObject) {
+                            return None;
+                        }
+                        return read_object_keys(&mut p);
+                    }
+                    p.skip_value()?;
+                }
+                _ => return None,
+            }
+        }
+    } else {
+        read_object_keys(&mut p)
+    }
+}
+
+fn read_object_keys(p: &mut Parser<'_>) -> Option<Vec<String>> {
     let mut keys = Vec::new();
     loop {
         match p.next()? {
@@ -367,57 +387,21 @@ pub fn top_level_keys(bytes: &[u8]) -> Option<Vec<String>> {
     }
 }
 
-/// Find the object value under `target_key` at the root and return its
-/// top-level keys. Returns `None` if `target_key` is missing or not an object.
-pub fn keys_under(bytes: &[u8], target_key: &str) -> Option<Vec<String>> {
-    let mut p = Parser::new(bytes);
-    match p.next()? {
-        Event::BeginObject => {}
-        _ => return None,
-    }
-    loop {
-        match p.next()? {
-            Event::EndObject => return None,
-            Event::Key(k) => {
-                if k.as_str() == target_key {
-                    match p.next()? {
-                        Event::BeginObject => {}
-                        _ => return None,
-                    }
-                    let mut keys = Vec::new();
-                    loop {
-                        match p.next()? {
-                            Event::EndObject => return Some(keys),
-                            Event::Key(k) => {
-                                keys.push(k.as_str().to_owned());
-                                p.skip_value()?;
-                            }
-                            _ => return None,
-                        }
-                    }
-                }
-                p.skip_value()?;
-            }
-            _ => return None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn top_level_keys_works() {
+    fn object_keys_at_root() {
         let bytes = br#"{"a":1,"b":[1,2,3],"c":{"x":1}}"#;
-        let keys = top_level_keys(bytes).unwrap();
+        let keys = object_keys(bytes, None).unwrap();
         assert_eq!(keys, vec!["a", "b", "c"]);
     }
 
     #[test]
-    fn keys_under_named_object() {
+    fn object_keys_under_named_object() {
         let bytes = br#"{"pages":{"/foo":[],"/bar":[]},"other":"x"}"#;
-        let keys = keys_under(bytes, "pages").unwrap();
+        let keys = object_keys(bytes, Some("pages")).unwrap();
         assert_eq!(keys, vec!["/foo", "/bar"]);
     }
 

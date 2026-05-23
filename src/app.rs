@@ -7,7 +7,6 @@ mod client;
 mod render;
 
 use self::client::runtime_client;
-pub use self::render::escape_terminal;
 use self::render::{render_processed, render_warnings};
 use crate::grep;
 use crate::runtime::config::RuntimeConfig;
@@ -202,17 +201,7 @@ async fn run_scan(args: ScanArgs, client: Client, config: RuntimeConfig) -> Resu
     Ok(0)
 }
 
-pub fn normalize_url(url: &str) -> Result<String, AppError> {
-    if url.contains("://") {
-        let parsed = crate::url::Url::parse(url)?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return Err(format!("unsupported URL scheme '{}'", parsed.scheme()).into());
-        }
-        Ok(parsed.to_string())
-    } else {
-        Ok(crate::url::Url::parse(&format!("https://{url}"))?.to_string())
-    }
-}
+use crate::util::normalize_url;
 
 #[cfg(test)]
 mod tests {

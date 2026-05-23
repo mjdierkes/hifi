@@ -10,10 +10,11 @@
 use super::cache_writer;
 use crate::{
     discover::{AssetKind, AssetRef, AssetSource, DocumentScan},
-    framework::FrameworkConfig,
+    framework::{DetectedSite, FrameworkId},
     hash::FxHashMap,
-    scan::next::NextConfig,
-    scan::{Confidence, Evidence, EvidenceKind, Extractor, FindingsBuilder, Shape},
+    framework::next::NextConfig,
+    scan::findings::{Channel, Evidence, EvidenceKind, FindingsBuilder, Provenance},
+    scan::Shape,
     url::Url,
 };
 use std::{
@@ -92,19 +93,6 @@ impl ChunkCache {
         let findings = read_chunk_findings(content_hash)?;
         content_memory_put(content_hash, &findings);
         Some(findings)
-    }
-
-    #[allow(dead_code)]
-    pub fn write(
-        &self,
-        url: &Url,
-        content_hash: &str,
-        asset: &AssetData,
-        validators: &AssetValidators,
-    ) {
-        let asset = Arc::new(asset.clone());
-        self.remember(url, content_hash, asset.clone(), validators);
-        write_chunk(url, content_hash, &asset, validators);
     }
 
     pub fn write_deferred(
@@ -273,9 +261,7 @@ pub struct CachedChunk {
     pub content_hash: String,
 }
 
-const ASSET_MAGIC: &[u8; 8] = b"HIFICA1\0";
-const CHUNK_INDEX_MAGIC: &[u8; 8] = b"HIFICI1\0";
-const FINDINGS_MAGIC: &[u8; 8] = b"HIFICF1\0";
+const HIFI3_MAGIC: &[u8; 8] = b"HIFI3\0\0\0";
 
 fn encode_cached_scan(
     magic: &[u8; 8],
@@ -287,7 +273,7 @@ fn encode_cached_scan(
     out.extend_from_slice(magic);
     put_validators(&mut out, validators);
     if let Some(content_hash) = content_hash {
-        super::wire::put_string(&mut out, content_hash);
+        super::codec::wire::put_string(&mut out, content_hash);
     }
     put_document_scan(&mut out, data);
     out
@@ -298,7 +284,7 @@ fn decode_cached_scan(
     magic: &[u8; 8],
     has_content_hash: bool,
 ) -> Option<(AssetValidators, Option<String>, AssetData)> {
-    let mut r = super::wire::Reader::new(bytes);
+    let mut r = super::codec::wire::Reader::new(bytes);
     (r.take_exact(magic.len())? == magic).then_some(())?;
     let validators = read_validators(&mut r)?;
     let content_hash = if has_content_hash {
@@ -313,14 +299,14 @@ fn decode_cached_scan(
 
 fn encode_findings(findings: &FindingsBuilder) -> Vec<u8> {
     let mut out = Vec::with_capacity(findings.evidence.len() * 48 + 16);
-    out.extend_from_slice(FINDINGS_MAGIC);
+    out.extend_from_slice(HIFI3_MAGIC);
     put_evidence_vec(&mut out, &findings.evidence);
     out
 }
 
 fn decode_findings(bytes: &[u8]) -> Option<FindingsBuilder> {
-    let mut r = super::wire::Reader::new(bytes);
-    (r.take_exact(FINDINGS_MAGIC.len())? == FINDINGS_MAGIC).then_some(())?;
+    let mut r = super::codec::wire::Reader::new(bytes);
+    (r.take_exact(HIFI3_MAGIC.len())? == HIFI3_MAGIC).then_some(())?;
     let findings = FindingsBuilder {
         evidence: read_evidence_vec(&mut r)?,
     };
@@ -329,11 +315,11 @@ fn decode_findings(bytes: &[u8]) -> Option<FindingsBuilder> {
 }
 
 fn put_validators(out: &mut Vec<u8>, validators: &AssetValidators) {
-    super::wire::put_opt_string(out, validators.etag.as_deref());
-    super::wire::put_opt_string(out, validators.last_modified.as_deref());
+    super::codec::wire::put_opt_string(out, validators.etag.as_deref());
+    super::codec::wire::put_opt_string(out, validators.last_modified.as_deref());
 }
 
-fn read_validators(r: &mut super::wire::Reader<'_>) -> Option<AssetValidators> {
+fn read_validators(r: &mut super::codec::wire::Reader<'_>) -> Option<AssetValidators> {
     Some(AssetValidators {
         etag: r.opt_string()?,
         last_modified: r.opt_string()?,
@@ -342,20 +328,20 @@ fn read_validators(r: &mut super::wire::Reader<'_>) -> Option<AssetValidators> {
 
 fn put_document_scan(out: &mut Vec<u8>, data: &DocumentScan) {
     put_evidence_vec(out, &data.findings.evidence);
-    super::wire::put_opt_string(out, data.revision.as_deref());
-    put_framework(out, &data.framework_config);
-    super::wire::put_u32(out, data.assets.len());
+    super::codec::wire::put_opt_string(out, data.revision.as_deref());
+    put_site(out, &data.site);
+    super::codec::wire::put_u32(out, data.assets.len());
     for asset in &data.assets {
-        super::wire::put_string(out, asset.url.as_str());
+        super::codec::wire::put_string(out, asset.url.as_str());
         out.push(asset_kind_to_u8(asset.kind));
         out.push(asset_source_to_u8(asset.source));
     }
 }
 
-fn read_document_scan(r: &mut super::wire::Reader<'_>) -> Option<DocumentScan> {
+fn read_document_scan(r: &mut super::codec::wire::Reader<'_>) -> Option<DocumentScan> {
     let evidence = read_evidence_vec(r)?;
     let revision = r.opt_string()?;
-    let framework_config = read_framework(r)?;
+    let site = read_site(r)?;
     let asset_len = r.u32()? as usize;
     let mut assets = Vec::with_capacity(asset_len);
     for _ in 0..asset_len {
@@ -369,73 +355,60 @@ fn read_document_scan(r: &mut super::wire::Reader<'_>) -> Option<DocumentScan> {
         findings: FindingsBuilder { evidence },
         assets,
         revision,
-        framework_config,
+        site,
     })
 }
 
 fn put_evidence_vec(out: &mut Vec<u8>, evidence: &[Evidence]) {
-    super::wire::put_u32(out, evidence.len());
+    super::codec::wire::put_u32(out, evidence.len());
     for item in evidence {
-        super::wire::put_string(out, &item.url);
+        super::codec::wire::put_string(out, &item.url);
         out.push(evidence_kind_to_u8(item.kind));
-        out.push(extractor_to_u8(item.extractor));
-        out.push(confidence_to_u8(item.confidence));
+        out.push(item.provenance.channel as u8);
+        out.push(
+            item.provenance
+                .framework
+                .map(|id: FrameworkId| id.index() as u8 + 1)
+                .unwrap_or(0),
+        );
         match &item.shape {
             Some(shape) => {
                 out.push(1);
-                put_shape(out, shape);
+                super::codec::document::put_shape(out, shape);
             }
             None => out.push(0),
         }
     }
 }
 
-fn read_evidence_vec(r: &mut super::wire::Reader<'_>) -> Option<Vec<Evidence>> {
+fn read_evidence_vec(r: &mut super::codec::wire::Reader<'_>) -> Option<Vec<Evidence>> {
     let len = r.u32()? as usize;
     let mut evidence = Vec::with_capacity(len);
     for _ in 0..len {
         let url = r.string()?;
         let kind = evidence_kind_from_u8(r.u8()?)?;
-        let extractor = extractor_from_u8(r.u8()?)?;
-        let confidence = confidence_from_u8(r.u8()?)?;
+        let channel = Channel::from_u8(r.u8()?)?;
+        let framework = match r.u8()? {
+            0 => None,
+            n => Some(*FrameworkId::ALL.get((n - 1) as usize)?),
+        };
+        let provenance = Provenance {
+            channel,
+            framework,
+        };
         let shape = match r.u8()? {
             0 => None,
-            1 => Some(read_shape(r)?),
+            1 => Some(super::codec::document::read_shape(r)?),
             _ => return None,
         };
         evidence.push(Evidence {
             url,
             kind,
-            extractor,
-            confidence,
+            provenance,
             shape,
         });
     }
     Some(evidence)
-}
-
-fn put_shape(out: &mut Vec<u8>, shape: &Shape) {
-    let (methods, has_body, has_headers, content_types, auth, next_server_action, query_params) =
-        shape.binary_parts();
-    out.push(methods);
-    out.push(has_body as u8);
-    out.push(has_headers as u8);
-    out.push(content_types);
-    out.push(auth as u8);
-    out.push(next_server_action as u8);
-    super::wire::put_string_vec(out, query_params);
-}
-
-fn read_shape(r: &mut super::wire::Reader<'_>) -> Option<Shape> {
-    Some(Shape::from_binary_parts(
-        r.u8()?,
-        r.bool()?,
-        r.bool()?,
-        r.u8()?,
-        r.bool()?,
-        r.bool()?,
-        r.string_vec()?,
-    ))
 }
 
 macro_rules! u8_codec {
@@ -455,30 +428,34 @@ macro_rules! u8_codec {
     };
 }
 
-fn put_framework(out: &mut Vec<u8>, framework: &FrameworkConfig) {
-    match framework {
-        FrameworkConfig::None => out.push(0),
-        FrameworkConfig::Next(config) => {
+fn put_site(out: &mut Vec<u8>, site: &DetectedSite) {
+    out.extend_from_slice(&site.active.map(|v| v as u8));
+    out.push(site.primary.index() as u8);
+    match &site.next {
+        None => out.push(0),
+        Some(config) => {
             out.push(1);
-            super::wire::put_opt_string(out, config.build_id.as_deref());
-            super::wire::put_opt_string(out, config.asset_prefix.as_deref());
-            super::wire::put_opt_string(out, config.base_path.as_deref());
-            super::wire::put_string_vec(out, &config.locales);
-            super::wire::put_opt_string(out, config.default_locale.as_deref());
-            super::wire::put_opt_string(out, config.locale.as_deref());
-            super::wire::put_opt_string(out, config.page.as_deref());
+            super::codec::wire::put_opt_string(out, config.build_id.as_deref());
+            super::codec::wire::put_opt_string(out, config.asset_prefix.as_deref());
+            super::codec::wire::put_opt_string(out, config.base_path.as_deref());
+            super::codec::wire::put_string_vec(out, &config.locales);
+            super::codec::wire::put_opt_string(out, config.default_locale.as_deref());
+            super::codec::wire::put_opt_string(out, config.locale.as_deref());
+            super::codec::wire::put_opt_string(out, config.page.as_deref());
         }
-        FrameworkConfig::Nuxt => out.push(2),
-        FrameworkConfig::SvelteKit => out.push(3),
-        FrameworkConfig::Astro => out.push(4),
-        FrameworkConfig::Remix => out.push(5),
     }
+    super::codec::wire::put_opt_string(out, site.sveltekit_immutable_root.as_deref());
 }
 
-fn read_framework(r: &mut super::wire::Reader<'_>) -> Option<FrameworkConfig> {
-    match r.u8()? {
-        0 => Some(FrameworkConfig::None),
-        1 => Some(FrameworkConfig::Next(NextConfig {
+fn read_site(r: &mut super::codec::wire::Reader<'_>) -> Option<DetectedSite> {
+    let mut active = [false; 5];
+    for slot in &mut active {
+        *slot = r.u8()? != 0;
+    }
+    let primary = FrameworkId::ALL.get(r.u8()? as usize).copied()?;
+    let next = match r.u8()? {
+        0 => None,
+        1 => Some(NextConfig {
             build_id: r.opt_string()?,
             asset_prefix: r.opt_string()?,
             base_path: r.opt_string()?,
@@ -486,40 +463,21 @@ fn read_framework(r: &mut super::wire::Reader<'_>) -> Option<FrameworkConfig> {
             default_locale: r.opt_string()?,
             locale: r.opt_string()?,
             page: r.opt_string()?,
-        })),
-        2 => Some(FrameworkConfig::Nuxt),
-        3 => Some(FrameworkConfig::SvelteKit),
-        4 => Some(FrameworkConfig::Astro),
-        5 => Some(FrameworkConfig::Remix),
-        _ => None,
-    }
+        }),
+        _ => return None,
+    };
+    Some(DetectedSite {
+        active,
+        primary,
+        next,
+        sveltekit_immutable_root: r.opt_string()?,
+    })
 }
 
 u8_codec!(evidence_kind_to_u8, evidence_kind_from_u8, EvidenceKind, {
     EvidenceKind::Api => 0,
     EvidenceKind::Route => 1,
     EvidenceKind::Candidate => 2,
-});
-
-u8_codec!(extractor_to_u8, extractor_from_u8, Extractor, {
-    Extractor::Literal => 0,
-    Extractor::Manifest => 1,
-    Extractor::Flight => 2,
-    Extractor::ApiCall => 3,
-    Extractor::RouteCall => 4,
-    Extractor::ServerAction => 5,
-    Extractor::NuxtPayload => 6,
-    Extractor::SvelteKitData => 7,
-    Extractor::RemixManifest => 8,
-    Extractor::AstroIsland => 9,
-    Extractor::ApiClient => 10,
-});
-
-u8_codec!(confidence_to_u8, confidence_from_u8, Confidence, {
-    Confidence::Observed => 0,
-    Confidence::Parsed => 1,
-    Confidence::Inferred => 2,
-    Confidence::Candidate => 3,
 });
 
 u8_codec!(asset_kind_to_u8, asset_kind_from_u8, AssetKind, {
@@ -541,7 +499,7 @@ u8_codec!(asset_source_to_u8, asset_source_from_u8, AssetSource, {
 pub fn read_asset_cached(url: &Url, cache_key: Option<&str>) -> Option<CachedAsset> {
     let path = asset_path_for(url, cache_key);
     let (bytes, age_secs) = read_fresh(&path, CACHE_STALE_SECS)?;
-    let (validators, _, data) = decode_cached_scan(&bytes, ASSET_MAGIC, false)?;
+    let (validators, _, data) = decode_cached_scan(&bytes, HIFI3_MAGIC, false)?;
     Some(CachedAsset {
         data,
         age_secs,
@@ -549,8 +507,7 @@ pub fn read_asset_cached(url: &Url, cache_key: Option<&str>) -> Option<CachedAss
     })
 }
 
-#[allow(dead_code)]
-pub fn write_asset_with_validators(
+pub(crate) fn write_asset_with_validators(
     url: &Url,
     asset: &AssetData,
     cache_key: Option<&str>,
@@ -559,7 +516,7 @@ pub fn write_asset_with_validators(
     let path = asset_path_for(url, cache_key);
     write_bytes(
         &path,
-        &encode_cached_scan(ASSET_MAGIC, validators, None, asset),
+        &encode_cached_scan(HIFI3_MAGIC, validators, None, asset),
     );
 }
 
@@ -574,7 +531,7 @@ pub fn write_asset_with_validators_deferred(
     spawn_cache_write(move || {
         write_bytes(
             &path,
-            &encode_cached_scan(ASSET_MAGIC, &validators, None, &asset),
+            &encode_cached_scan(HIFI3_MAGIC, &validators, None, &asset),
         );
     });
 }
@@ -591,7 +548,7 @@ fn write_chunk(url: &Url, content_hash: &str, asset: &AssetData, validators: &As
     );
     write_bytes(
         &chunk_index_path_for(url),
-        &encode_cached_scan(CHUNK_INDEX_MAGIC, validators, Some(content_hash), asset),
+        &encode_cached_scan(HIFI3_MAGIC, validators, Some(content_hash), asset),
     );
 }
 
@@ -601,7 +558,7 @@ fn asset_path_for(url: &Url, cache_key: Option<&str>) -> PathBuf {
 
 fn read_chunk_url(url: &Url, max_age_secs: u64) -> Option<(CachedChunk, u64)> {
     let (bytes, age_secs) = read_fresh(&chunk_index_path_for(url), max_age_secs)?;
-    let (validators, content_hash, data) = decode_cached_scan(&bytes, CHUNK_INDEX_MAGIC, true)?;
+    let (validators, content_hash, data) = decode_cached_scan(&bytes, HIFI3_MAGIC, true)?;
     Some((
         CachedChunk {
             data: Arc::new(data),
@@ -813,7 +770,7 @@ mod tests {
             crate::hash::hash128_hex(br#"fetch("/api/shared");"static/chunks/child.js""#);
 
         let chunks = ChunkCache::new();
-        chunks.write(&url, &content_hash, &scan, &validators);
+        chunks.write_deferred(&url, &content_hash, Arc::new(scan), &validators);
         let cached = chunks.read_fresh_url(&url).unwrap();
 
         assert_eq!(cached.validators.etag.as_deref(), Some(r#""framework-v1""#));
