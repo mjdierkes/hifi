@@ -393,7 +393,7 @@ async fn fetch_asset_body(
     }
 
     let kind = asset.document_kind();
-    let validators = asset_validators(response.headers());
+    let validators = asset_validators(&response);
     let body = net::read_limited(response).await.map_err(|err| {
         trace_net_error(&current_url, &err);
         FetchFailure::Other
@@ -507,18 +507,11 @@ fn spawn_revalidate_chunk(
     });
 }
 
-fn asset_validators(headers: &[(String, String)]) -> cache::AssetValidators {
+fn asset_validators(response: &crate::runtime::http::Response) -> cache::AssetValidators {
     cache::AssetValidators {
-        etag: header_value(headers, "etag"),
-        last_modified: header_value(headers, "last-modified"),
+        etag: response.header("etag").map(str::to_owned),
+        last_modified: response.header("last-modified").map(str::to_owned),
     }
-}
-
-fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
-    headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.clone())
 }
 
 #[cfg(test)]

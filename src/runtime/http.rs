@@ -25,9 +25,10 @@ use tokio_rustls::{client::TlsStream, TlsConnector};
 
 mod headers;
 mod hpack;
+mod http1;
 mod origin;
 
-use headers::{http1_content_length, reserve_body};
+pub use headers::Headers;
 use hpack::{encode_headers, HpackDecoder};
 use origin::{connect_tcp, Origin};
 
@@ -50,6 +51,7 @@ struct ClientInner {
     tls_h2: TlsConnector,
     default_headers: Vec<(String, String)>,
     h2: Mutex<FxHashMap<Origin, Arc<H2Session>>>,
+    http1_pool: http1::Pool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,7 +64,7 @@ pub struct Response {
     status: u16,
     version: Version,
     url: Url,
-    headers: Vec<(String, String)>,
+    headers: Headers,
     body: HiBytes,
 }
 
@@ -143,9 +145,20 @@ impl Client {
     async fn execute(&self, url: Url, headers: Vec<(String, String)>) -> Result<Response, Error> {
         match url.scheme() {
             "https" => self.execute_https(url, headers).await,
-            "http" => http1_request(url, headers, &self.inner.default_headers).await,
+            "http" => self.execute_http1(url, headers).await,
             other => Err(Error::BadScheme(other.to_string())),
         }
+    }
+
+    async fn execute_http1(
+        &self,
+        url: Url,
+        headers: Vec<(String, String)>,
+    ) -> Result<Response, Error> {
+        self.inner
+            .http1_pool
+            .execute(url, headers, &self.inner.default_headers)
+            .await
     }
 
     async fn execute_https(
@@ -210,6 +223,7 @@ impl ClientBuilder {
                 tls_h2: TlsConnector::from(Arc::new(h2_config)),
                 default_headers: self.default_headers,
                 h2: Mutex::new(FxHashMap::default()),
+                http1_pool: http1::Pool::default(),
             }),
         }
     }
@@ -247,12 +261,8 @@ impl Response {
         &self.url
     }
 
-    pub fn headers(&self) -> &[(String, String)] {
-        &self.headers
-    }
-
     pub fn header(&self, name: &str) -> Option<&str> {
-        headers::value(&self.headers, name)
+        self.headers.get(name)
     }
 
     pub fn content_length(&self) -> Option<u64> {
@@ -347,7 +357,7 @@ impl H2Session {
         }
 
         let mut status = None;
-        let mut response_headers = Vec::new();
+        let mut response_headers = Headers::builder();
         let mut body = HiBuf::new();
         while let Some(message) = rx.recv().await {
             match message {
@@ -359,10 +369,14 @@ impl H2Session {
                         if name == ":status" {
                             status = value.parse::<u16>().ok();
                         } else {
-                            response_headers.push((name, value));
+                            if body.capacity() == 0 && name.eq_ignore_ascii_case("content-length") {
+                                if let Ok(len) = value.trim().parse::<usize>() {
+                                    body.reserve(len);
+                                }
+                            }
+                            response_headers.push(&name, &value);
                         }
                     }
-                    reserve_body(&response_headers, &mut body);
                     if end_stream {
                         break;
                     }
@@ -385,7 +399,7 @@ impl H2Session {
             status: status.ok_or(Error::H2("response had no :status"))?,
             version: Version::Http2,
             url,
-            headers: response_headers,
+            headers: response_headers.finish(),
             body: body.freeze(),
         })
     }
@@ -733,36 +747,6 @@ fn encode_frame(header: FrameHeader, payload: &[u8]) -> HiBytes {
     out.freeze()
 }
 
-async fn read_http1_bytes<S: AsyncRead + Unpin>(stream: &mut S) -> Result<HiBytes, Error> {
-    let mut bytes = HiBuf::with_capacity(16 * 1024);
-    let mut buf = [0u8; 16 * 1024];
-    let mut reserved_body = false;
-    loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                bytes.extend_from_slice(&buf[..n]);
-                if !reserved_body {
-                    if let Some(split) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                        if let Ok(head) = std::str::from_utf8(&bytes[..split]) {
-                            if let Some(len) = http1_content_length(head) {
-                                let target = split + 4 + len;
-                                if target > bytes.capacity() {
-                                    bytes.reserve(target - bytes.len());
-                                }
-                            }
-                        }
-                        reserved_body = true;
-                    }
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(bytes.freeze())
-}
-
 fn header_block_payload(frame: &Frame) -> Option<&[u8]> {
     let mut start = 0usize;
     let mut end = frame.payload.len();
@@ -799,121 +783,6 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn http1_request(
-    url: Url,
-    headers: Vec<(String, String)>,
-    defaults: &[(String, String)],
-) -> Result<Response, Error> {
-    let origin = Origin::for_url(&url)?;
-    let stream = connect_tcp(&origin).await?;
-    http1_exchange(stream, url, origin, headers, defaults, Version::Http11).await
-}
-
-async fn http1_exchange<S: AsyncRead + AsyncWrite + Unpin>(
-    mut stream: S,
-    url: Url,
-    origin: Origin,
-    extra: Vec<(String, String)>,
-    defaults: &[(String, String)],
-    version: Version,
-) -> Result<Response, Error> {
-    let path = match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => {
-            let path = url.path();
-            if path.is_empty() {
-                "/".to_string()
-            } else {
-                path.to_string()
-            }
-        }
-    };
-    let mut req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
-        origin.authority()
-    );
-    for (k, v) in defaults {
-        req.push_str(k);
-        req.push_str(": ");
-        req.push_str(v);
-        req.push_str("\r\n");
-    }
-    for (k, v) in extra {
-        req.push_str(&k);
-        req.push_str(": ");
-        req.push_str(&v);
-        req.push_str("\r\n");
-    }
-    req.push_str("\r\n");
-    stream.write_all(req.as_bytes()).await?;
-
-    let bytes = read_http1_bytes(&mut stream).await?;
-    parse_http1(url, version, bytes)
-}
-
-fn parse_http1(url: Url, version: Version, bytes: HiBytes) -> Result<Response, Error> {
-    let split = bytes
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or(Error::BadHttp1)?;
-    let head = std::str::from_utf8(&bytes[..split]).map_err(|_| Error::BadHttp1)?;
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next().ok_or(Error::BadHttp1)?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or(Error::BadHttp1)?;
-    let mut headers = Vec::new();
-    let mut chunked = false;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim().to_string();
-        if name.eq_ignore_ascii_case("transfer-encoding") && value.eq_ignore_ascii_case("chunked") {
-            chunked = true;
-        }
-        headers.push((name.to_ascii_lowercase(), value));
-    }
-    let body = bytes.slice(split + 4..);
-    let body = if chunked { decode_chunks(&body)? } else { body };
-    Ok(Response {
-        status,
-        version,
-        url,
-        headers,
-        body,
-    })
-}
-
-fn decode_chunks(bytes: &[u8]) -> Result<HiBytes, Error> {
-    let mut pos = 0;
-    let mut out = HiBuf::new();
-    loop {
-        let line_end = find_crlf(bytes, pos).ok_or(Error::BadHttp1)?;
-        let size_text = std::str::from_utf8(&bytes[pos..line_end]).map_err(|_| Error::BadHttp1)?;
-        let size = usize::from_str_radix(size_text.split(';').next().unwrap_or(""), 16)
-            .map_err(|_| Error::BadHttp1)?;
-        pos = line_end + 2;
-        if size == 0 {
-            break;
-        }
-        let end = pos.checked_add(size).ok_or(Error::BadHttp1)?;
-        out.extend_from_slice(bytes.get(pos..end).ok_or(Error::BadHttp1)?);
-        pos = end + 2;
-    }
-    Ok(out.freeze())
-}
-
-fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
-    bytes
-        .get(start..)?
-        .windows(2)
-        .position(|w| w == b"\r\n")
-        .map(|idx| start + idx)
-}
-
 impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client").finish_non_exhaustive()
@@ -947,11 +816,5 @@ mod tests {
             payload: HiBytes::from_static(&[1, b'x', b'y', b'z', 0]),
         };
         assert_eq!(data_payload(&frame).unwrap(), HiBytes::from_static(b"xyz"));
-    }
-
-    #[test]
-    fn http1_chunked_body_is_decoded() {
-        let body = decode_chunks(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n").unwrap();
-        assert_eq!(body, HiBytes::from_static(b"Wikipedia"));
     }
 }

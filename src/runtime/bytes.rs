@@ -9,6 +9,15 @@ pub(crate) struct HiBytes {
     range: Range<usize>,
 }
 
+impl Default for HiBytes {
+    fn default() -> Self {
+        Self {
+            data: Arc::from(Vec::new()),
+            range: 0..0,
+        }
+    }
+}
+
 impl HiBytes {
     pub(crate) fn from_vec(bytes: Vec<u8>) -> Self {
         let len = bytes.len();
