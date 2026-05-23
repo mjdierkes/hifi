@@ -25,23 +25,152 @@ pub fn render_warnings(out: &Output) {
     eprint!("{}", warning_text(out));
 }
 
+fn stats_line(out: &Output) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(us) = out.elapsed_us {
+        parts.push(format_duration_us(us));
+    }
+    let cache = match out.cache {
+        crate::runtime::processor::CacheStatus::Fresh => "fresh",
+        crate::runtime::processor::CacheStatus::RevisionHit => "revision-hit",
+        crate::runtime::processor::CacheStatus::Stored => "stored",
+        crate::runtime::processor::CacheStatus::Miss => "miss",
+    };
+    if let Some(age) = out.cache_age_secs {
+        parts.push(format!("cache={cache}({age}s)"));
+    } else {
+        parts.push(format!("cache={cache}"));
+    }
+    parts.push(format!("apis={}", out.apis.len()));
+    parts.join("  ")
+}
+
+fn format_duration_us(us: u128) -> String {
+    if us < 1_000 {
+        format!("{us}µs")
+    } else if us < 1_000_000 {
+        format!("{:.1}ms", us as f64 / 1_000.0)
+    } else {
+        format!("{:.2}s", us as f64 / 1_000_000.0)
+    }
+}
+
 fn render_api_text<W: Write>(out: &Output, writer: &mut W) -> io::Result<()> {
-    for api in &out.apis {
-        let methods = api.shape.methods_csv();
-        let flags = api.shape.flags_csv();
-        if flags.is_empty() {
-            writeln!(writer, "{}\t{}", methods, escape_terminal(&api.path))?;
-        } else {
-            writeln!(
-                writer,
-                "{}\t{}\t{}",
-                methods,
-                escape_terminal(&api.path),
-                flags
-            )?;
+    writeln!(writer, "# {}", stats_line(out))?;
+
+    let groups = group_apis(&out.apis);
+    for (gi, group) in groups.iter().enumerate() {
+        if gi > 0 {
+            writeln!(writer)?;
+        }
+        let label_width = group
+            .rows
+            .iter()
+            .map(|r| r.label.chars().count())
+            .max()
+            .unwrap_or(0);
+        let method_width = group
+            .rows
+            .iter()
+            .map(|r| r.methods.chars().count())
+            .max()
+            .unwrap_or(0);
+        for row in &group.rows {
+            write!(writer, "{}", row.label)?;
+            if !row.methods.is_empty() || !row.flags.is_empty() {
+                let pad = label_width.saturating_sub(row.label.chars().count());
+                write!(writer, "{}  {}", " ".repeat(pad), row.methods)?;
+            }
+            if !row.flags.is_empty() {
+                let mpad = method_width.saturating_sub(row.methods.chars().count());
+                write!(writer, "{}  · {}", " ".repeat(mpad), row.flags)?;
+            }
+            writeln!(writer)?;
         }
     }
     Ok(())
+}
+
+struct Group {
+    rows: Vec<Row>,
+}
+
+struct Row {
+    label: String,
+    methods: String,
+    flags: String,
+}
+
+fn group_apis(apis: &[crate::runtime::processor::Api]) -> Vec<Group> {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<String, Vec<&crate::runtime::processor::Api>> = BTreeMap::new();
+    for api in apis {
+        let prefix = first_segment(&api.path);
+        groups.entry(prefix).or_default().push(api);
+    }
+    groups
+        .into_iter()
+        .map(|(prefix, mut items)| {
+            items.sort_by(|a, b| a.path.cmp(&b.path));
+            let mut rows = Vec::with_capacity(items.len());
+            let root_idx = items.iter().position(|api| api.path == prefix);
+            let header_methods = root_idx
+                .map(|i| short_methods(&items[i].shape.methods_csv()))
+                .unwrap_or_default();
+            let header_flags = root_idx
+                .map(|i| pretty_flags(&items[i].shape.flags_csv()))
+                .unwrap_or_default();
+            rows.push(Row {
+                label: escape_terminal(&prefix),
+                methods: header_methods,
+                flags: header_flags,
+            });
+            for (i, api) in items.iter().enumerate() {
+                if Some(i) == root_idx {
+                    continue;
+                }
+                let suffix = api.path.strip_prefix(&prefix).unwrap_or(&api.path);
+                rows.push(Row {
+                    label: format!("  {}", escape_terminal(suffix)),
+                    methods: short_methods(&api.shape.methods_csv()),
+                    flags: pretty_flags(&api.shape.flags_csv()),
+                });
+            }
+            Group { rows }
+        })
+        .collect()
+}
+
+fn first_segment(path: &str) -> String {
+    let rest = path.strip_prefix('/').unwrap_or(path);
+    match rest.find('/') {
+        Some(idx) => format!("/{}", &rest[..idx]),
+        None => format!("/{rest}"),
+    }
+}
+
+fn short_methods(csv: &str) -> String {
+    csv.split(',')
+        .filter(|s| !s.is_empty())
+        .map(abbreviate_method)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn abbreviate_method(method: &str) -> &str {
+    match method {
+        "DELETE" => "DEL",
+        "PATCH" => "PAT",
+        "OPTIONS" => "OPT",
+        other => other,
+    }
+}
+
+fn pretty_flags(csv: &str) -> String {
+    csv.split(',')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn render_api_json<W: Write>(out: &Output, writer: &mut W) -> io::Result<()> {
@@ -114,7 +243,7 @@ mod tests {
         let rendered = String::from_utf8(rendered).unwrap();
         assert_eq!(
             rendered,
-            "GET\t/api/users\tquery\nPOST\t/v1/login\tbody,headers,json\n"
+            "# cache=miss  apis=2\n/api\n  /users  GET  · query\n\n/v1\n  /login  POST  · body headers json\n"
         );
     }
 
