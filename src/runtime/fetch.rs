@@ -399,7 +399,7 @@ async fn fetch_asset_body(
         FetchFailure::Other
     })?;
     let content_hash = (use_hash_cache && kind == discover::DocumentKind::Script)
-        .then(|| blake3::hash(&body).to_hex().to_string());
+        .then(|| crate::hash::hash128_hex(&body));
     let cached_findings = content_hash
         .as_deref()
         .and_then(|hash| cache::ChunkCache::new().read_content_findings(hash));

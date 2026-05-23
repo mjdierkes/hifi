@@ -806,9 +806,8 @@ mod tests {
             etag: Some(r#""framework-v1""#.to_string()),
             last_modified: None,
         };
-        let content_hash = blake3::hash(br#"fetch("/api/shared");"static/chunks/child.js""#)
-            .to_hex()
-            .to_string();
+        let content_hash =
+            crate::hash::hash128_hex(br#"fetch("/api/shared");"static/chunks/child.js""#);
 
         let chunks = ChunkCache::new();
         chunks.write(&url, &content_hash, &scan, &validators);
