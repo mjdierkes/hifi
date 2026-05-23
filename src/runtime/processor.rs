@@ -18,6 +18,7 @@ pub use fetch::MAX_TOTAL_ASSETS;
 pub struct Output {
     pub apis: Vec<Api>,
     pub revision: Option<String>,
+    pub framework: Option<String>,
     pub cache: CacheStatus,
     pub cache_age_secs: Option<u64>,
     pub elapsed_us: Option<u128>,
@@ -83,6 +84,16 @@ pub async fn scan_site(
     let mut found = root_scan.findings;
     let mut initial_assets = root_scan.assets;
     let revision = root_scan.revision.clone();
+    let framework = {
+        let primary = root_scan.site.primary;
+        root_scan
+            .site
+            .active
+            .get(primary.index())
+            .copied()
+            .unwrap_or(false)
+            .then(|| primary.name().to_string())
+    };
 
     if let (true, Some(revision)) = (use_cache, revision.as_deref()) {
         if let Some(bytes) = cache_store.read_stale_binary() {
@@ -112,6 +123,7 @@ pub async fn scan_site(
     let output = Output {
         apis: collect_apis(&found.evidence),
         revision,
+        framework,
         cache: CacheStatus::Miss,
         cache_age_secs: None,
         elapsed_us: Some(t0.elapsed().as_micros()),
@@ -190,12 +202,13 @@ fn prettify_path(path: &str) -> String {
     path.replace("{dynamic}", ":id")
 }
 
-const OUTPUT_BINARY_MAGIC: &[u8; 8] = b"HIFI3\0\0\0";
+const OUTPUT_BINARY_MAGIC: &[u8; 8] = b"HIFI4\0\0\0";
 
 pub(crate) fn encode_output_binary(out: &Output) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(out.apis.len().saturating_mul(48) + 128);
     bytes.extend_from_slice(OUTPUT_BINARY_MAGIC);
     put_opt_string(&mut bytes, out.revision.as_deref());
+    put_opt_string(&mut bytes, out.framework.as_deref());
     put_u32(&mut bytes, out.apis.len());
     for api in &out.apis {
         put_string(&mut bytes, &api.path);
@@ -214,6 +227,7 @@ pub(crate) fn decode_output_binary(bytes: &[u8]) -> Option<Output> {
         .take_exact(OUTPUT_BINARY_MAGIC.len())
         .filter(|magic| *magic == OUTPUT_BINARY_MAGIC)?;
     let revision = reader.opt_string()?;
+    let framework = reader.opt_string()?;
     let api_len = reader.u32()? as usize;
     let mut apis = Vec::with_capacity(api_len);
     for _ in 0..api_len {
@@ -231,6 +245,7 @@ pub(crate) fn decode_output_binary(bytes: &[u8]) -> Option<Output> {
     Some(Output {
         apis,
         revision,
+        framework,
         cache: CacheStatus::Stored,
         cache_age_secs: None,
         elapsed_us: None,

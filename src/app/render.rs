@@ -41,6 +41,9 @@ fn stats_line(out: &Output) -> String {
     } else {
         parts.push(format!("cache={cache}"));
     }
+    if let Some(fw) = &out.framework {
+        parts.push(format!("framework={fw}"));
+    }
     parts.push(format!("apis={}", out.apis.len()));
     parts.join("  ")
 }
@@ -272,6 +275,7 @@ mod tests {
                 }),
             ],
             revision: None,
+            framework: None,
             cache: CacheStatus::Miss,
             cache_age_secs: None,
             elapsed_us: None,
