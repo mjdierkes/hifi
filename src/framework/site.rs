@@ -3,7 +3,7 @@ use crate::generated::{ASTRO_IS_CONTEXT_MARKERS, REMIX_IS_CONTEXT_MARKERS};
 use crate::source;
 use crate::url::Url;
 
-use super::{next, nuxt, sveltekit};
+use super::{angular, next, nuxt, sveltekit};
 
 pub(crate) fn is_astro_context(bytes: &[u8], base: &Url) -> bool {
     base.path().contains("/_astro/")
@@ -24,15 +24,17 @@ pub enum FrameworkId {
     SvelteKit,
     Astro,
     Remix,
+    Angular,
 }
 
 impl FrameworkId {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Next,
         Self::Nuxt,
         Self::SvelteKit,
         Self::Astro,
         Self::Remix,
+        Self::Angular,
     ];
 
     pub fn index(self) -> usize {
@@ -42,6 +44,7 @@ impl FrameworkId {
             Self::SvelteKit => 2,
             Self::Astro => 3,
             Self::Remix => 4,
+            Self::Angular => 5,
         }
     }
 
@@ -52,13 +55,14 @@ impl FrameworkId {
             Self::SvelteKit => "SvelteKit",
             Self::Astro => "Astro",
             Self::Remix => "Remix",
+            Self::Angular => "Angular",
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct DetectedSite {
-    pub active: [bool; 5],
+    pub active: [bool; 6],
     pub primary: FrameworkId,
     pub next: Option<NextConfig>,
     pub sveltekit_immutable_root: Option<String>,
@@ -67,7 +71,7 @@ pub struct DetectedSite {
 impl Default for DetectedSite {
     fn default() -> Self {
         Self {
-            active: [false; 5],
+            active: [false; 6],
             primary: FrameworkId::Next,
             next: None,
             sveltekit_immutable_root: None,
@@ -82,7 +86,8 @@ impl DetectedSite {
         let sveltekit = sveltekit::is_context(bytes, base);
         let astro = is_astro_context(bytes, base);
         let remix = is_remix_context(bytes, base);
-        let active = [next_active, nuxt, sveltekit, astro, remix];
+        let angular = angular::is_context(bytes, base);
+        let active = [next_active, nuxt, sveltekit, astro, remix, angular];
         let primary = if next_active {
             FrameworkId::Next
         } else if nuxt {
@@ -93,6 +98,8 @@ impl DetectedSite {
             FrameworkId::Astro
         } else if remix {
             FrameworkId::Remix
+        } else if angular {
+            FrameworkId::Angular
         } else {
             FrameworkId::Next
         };

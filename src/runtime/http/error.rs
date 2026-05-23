@@ -10,6 +10,7 @@ pub enum Error {
     H2Closed,
     BadHttp1,
     Io(io::Error),
+    Status { code: u16, url: String },
 }
 
 impl fmt::Display for Error {
@@ -23,7 +24,31 @@ impl fmt::Display for Error {
             Self::H2Closed => f.write_str("HTTP/2 connection closed"),
             Self::BadHttp1 => f.write_str("HTTP/1.1 response parse error"),
             Self::Io(err) => err.fmt(f),
+            Self::Status { code, url } => {
+                let reason = status_reason(*code);
+                write!(f, "HTTP {code} {reason} from {url}")?;
+                if matches!(*code, 401 | 403 | 429) {
+                    write!(f, " (likely bot protection or auth required)")?;
+                }
+                Ok(())
+            }
         }
+    }
+}
+
+fn status_reason(code: u16) -> &'static str {
+    match code {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "",
     }
 }
 

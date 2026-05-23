@@ -172,7 +172,7 @@ fn parse_routes(bytes: &[u8]) -> Vec<String> {
     out
 }
 
-fn endpoint_map_urls(bytes: &[u8]) -> Vec<String> {
+pub(super) fn endpoint_map_urls(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let bases = runtime_api_bases(bytes);
     collect_endpoint_json(bytes, &mut out);

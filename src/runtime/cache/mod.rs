@@ -450,7 +450,7 @@ fn put_site(out: &mut Vec<u8>, site: &DetectedSite) {
 }
 
 fn read_site(r: &mut Reader<'_>) -> Option<DetectedSite> {
-    let mut active = [false; 5];
+    let mut active = [false; 6];
     for slot in &mut active {
         *slot = r.u8()? != 0;
     }

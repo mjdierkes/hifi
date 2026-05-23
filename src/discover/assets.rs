@@ -45,6 +45,9 @@ pub(crate) fn scan_html_assets(
     seen: &mut FxHashSet<Url>,
     out: &mut Vec<AssetRef>,
 ) {
+    let effective_base = resolve_base_tag(bytes, base);
+    let base = effective_base.as_ref().unwrap_or(base);
+
     scan_tags(bytes, b"<script", |tag| {
         let Some(src) = attr_value(tag, b"src") else {
             return;
@@ -73,6 +76,25 @@ pub(crate) fn scan_html_assets(
             push_asset(base, raw, contexts, AssetSource::HtmlPreload, seen, out);
         }
     });
+}
+
+// Per HTML spec, the first <base href> in the document overrides the document
+// URL when resolving relative URLs. SPAs mounted at a subpath (e.g. sam.gov's
+// /search/) rely on this — without honoring it we fetch siblings of the page
+// instead of the bundle directory and 404.
+fn resolve_base_tag(bytes: &[u8], document_url: &Url) -> Option<Url> {
+    let mut resolved = None;
+    scan_tags(bytes, b"<base", |tag| {
+        if resolved.is_some() {
+            return;
+        }
+        if let Some(href) = attr_value(tag, b"href") {
+            if let Ok(url) = document_url.join(href) {
+                resolved = Some(url);
+            }
+        }
+    });
+    resolved
 }
 
 pub(crate) fn scan_literal_assets(

@@ -9,6 +9,7 @@ use crate::framework::next::NextConfig;
 use crate::source;
 use crate::url::Url;
 
+pub mod angular;
 pub mod next;
 pub mod nuxt;
 pub mod sveltekit;
@@ -67,6 +68,14 @@ const POLICIES: &[FrameworkPolicy] = &[
         is_manifest: |_| false,
         is_payload: |raw, path| raw.contains("/_actions/") || path.contains("/_server-islands/"),
         resolve: |base, raw, _| resolve::resolve_prefixed(base, raw, "_astro/"),
+    },
+    FrameworkPolicy {
+        id: FrameworkId::Angular,
+        detect: |bytes, base, _| angular::is_context(bytes, base),
+        should_skip: angular::should_skip,
+        is_manifest: angular::is_manifest,
+        is_payload: angular::is_payload,
+        resolve: |base, raw, site| angular::resolve(base, raw, site.has(FrameworkId::Angular)),
     },
     FrameworkPolicy {
         id: FrameworkId::Remix,
@@ -262,6 +271,10 @@ pub fn scan_data_findings(
         scan_common_data_findings(bytes, base, kind, FrameworkId::Astro, findings);
         scan_astro_actions(bytes, findings);
     }
+    if site.has(FrameworkId::Angular) {
+        scan_common_data_findings(bytes, base, kind, FrameworkId::Angular, findings);
+        angular::record_endpoint_maps(bytes, findings);
+    }
 }
 
 fn scan_common_data_findings(
@@ -369,7 +382,7 @@ fn record_payload_route(
             .strip_suffix(".json")
             .filter(|route| crate::scan::classify::is_client_route(route))
             .map(str::to_owned),
-        FrameworkId::Next => None,
+        FrameworkId::Next | FrameworkId::Angular => None,
     };
     if let Some(route) = route {
         findings.record_route(route, Provenance::framework(Channel::Manifest, framework));

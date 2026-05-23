@@ -60,9 +60,10 @@ pub async fn fetch(client: &Client, url: Url, opts: FetchOptions<'_>) -> Result<
         if (opts.accept_status)(response.status()) {
             return Ok(response);
         }
-        return Err(NetError::Http(crate::runtime::http::Error::H2(
-            "HTTP status was not successful",
-        )));
+        return Err(NetError::Http(crate::runtime::http::Error::Status {
+            code: response.status(),
+            url: current.to_string(),
+        }));
     }
     Err(NetError::TooManyRedirects(current.to_string()))
 }
