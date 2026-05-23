@@ -16,11 +16,10 @@ use crate::{
     scan::{Confidence, Evidence, EvidenceKind, Extractor, FindingsBuilder, Shape},
     url::Url,
 };
-use parking_lot::RwLock;
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, RwLock},
     time::SystemTime,
 };
 
@@ -161,13 +160,15 @@ fn url_index_memory() -> &'static RwLock<BoundedMemory<UrlIndexEntry>> {
 }
 
 fn url_index_memory_get(url: &Url, max_age_secs: u64) -> Option<CachedChunk> {
-    let mut map = url_index_memory().write();
+    let mut map = url_index_memory().write().ok()?;
     let entry = map.get(url.as_str())?.clone();
     (cache_age_secs(entry.inserted_at) < max_age_secs).then_some(entry.cached)
 }
 
 fn url_index_memory_put(url: &Url, cached: &CachedChunk, age_secs: u64) {
-    let mut map = url_index_memory().write();
+    let Ok(mut map) = url_index_memory().write() else {
+        return;
+    };
     map.put(
         url.as_str().to_owned(),
         UrlIndexEntry {
@@ -197,11 +198,13 @@ fn content_memory() -> &'static RwLock<BoundedMemory<Arc<FindingsBuilder>>> {
 }
 
 fn content_memory_get(content_hash: &str) -> Option<Arc<FindingsBuilder>> {
-    content_memory().write().get(content_hash)
+    content_memory().write().ok()?.get(content_hash)
 }
 
 fn content_memory_put(content_hash: &str, findings: &FindingsBuilder) {
-    let mut map = content_memory().write();
+    let Ok(mut map) = content_memory().write() else {
+        return;
+    };
     map.put(content_hash.to_owned(), Arc::new(findings.clone()));
 }
 

@@ -7,7 +7,6 @@ edition = "2021"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "sync"] }
 memchr = "2"
 mimalloc = { version = "0.1", default-features = false }
-parking_lot = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
