@@ -1,27 +1,18 @@
 //! SvelteKit discovery policy.
 
 use crate::discover::{AssetKind, AssetRef, AssetSource};
+use crate::generated::{
+    API_PATH_PREFIXES, SVELTEKIT_CONTEXT_PREFIXES, SVELTEKIT_IMMUTABLE_CHILDREN,
+    SVELTEKIT_SKIP_FRAGMENTS,
+};
 use crate::hash::FxHashSet;
 use crate::framework::FrameworkId;
-use crate::scan::findings::{Channel, FindingsBuilder, Provenance};
+use crate::scan::findings::{Channel, Provenance};
 use crate::scan::Shape;
 use crate::source;
 use crate::source::TemplateMode;
 use crate::url::Url;
 
-const SKIP_FRAGMENTS: &[&str] = &[
-    "/_app/immutable/chunks/scheduler.",
-    "/_app/immutable/chunks/index.",
-    "/_app/immutable/chunks/runtime.",
-    "/_app/immutable/chunks/vendor",
-];
-const CONTEXT_PREFIXES: &[&str] = &["nodes/", "chunks/", "entry/", "assets/"];
-const IMMUTABLE_CHILD_PATHS: &[&str] = &[
-    "/immutable/entry/",
-    "/immutable/nodes/",
-    "/immutable/chunks/",
-    "/immutable/assets/",
-];
 const MANIFEST_ENDS_WITH: &[&str] = &["/_app/version.json"];
 const MANIFEST_GATED: &[(&str, &str)] = &[("/immutable/", "/version.json")];
 
@@ -43,7 +34,7 @@ pub fn is_context(bytes: &[u8], base: &Url) -> bool {
 }
 
 pub fn should_skip(url: &Url) -> bool {
-    super::resolve::should_skip_fragments(url, "/immutable/", SKIP_FRAGMENTS)
+    super::resolve::should_skip_fragments(url, "/immutable/", SVELTEKIT_SKIP_FRAGMENTS)
 }
 
 pub fn is_manifest(path: &str) -> bool {
@@ -65,7 +56,7 @@ pub fn resolve(
             .map(str::to_owned)
             .or_else(|| observed_immutable_root(base))
             .unwrap_or_else(|| "/_app/immutable/".to_owned());
-        super::resolve::resolve_under(base, raw, context, CONTEXT_PREFIXES, &root)
+        super::resolve::resolve_under(base, raw, context, SVELTEKIT_CONTEXT_PREFIXES, &root)
     })
 }
 
@@ -237,8 +228,8 @@ fn app_root_from_immutable(root: &str) -> Option<String> {
 }
 
 fn collect_literal_immutable_roots(bytes: &[u8], out: &mut Vec<String>) {
-    for child in IMMUTABLE_CHILD_PATHS {
-        super::scan_string_tokens(bytes, &[child.as_bytes()], TemplateMode::Preserve, |raw| {
+    for child in SVELTEKIT_IMMUTABLE_CHILDREN {
+        super::scan_quoted_after_markers(bytes, &[child], TemplateMode::Preserve, |raw| {
             if let Some(root) = root_before_immutable_child(raw) {
                 out.push(root);
             }
@@ -247,7 +238,7 @@ fn collect_literal_immutable_roots(bytes: &[u8], out: &mut Vec<String>) {
 }
 
 fn root_before_immutable_child(raw: &str) -> Option<String> {
-    IMMUTABLE_CHILD_PATHS.iter().find_map(|child| {
+    SVELTEKIT_IMMUTABLE_CHILDREN.iter().find_map(|child| {
         raw.find(child)
             .map(|pos| raw[..pos + "/immutable/".len()].to_owned())
     })
@@ -278,12 +269,9 @@ fn collect_keyed_literal_routes(bytes: &[u8], out: &mut Vec<String>) {
 }
 
 fn collect_route_id_literals(bytes: &[u8], out: &mut Vec<String>) {
-    super::scan_string_tokens(
-        bytes,
-        &[b"/[".as_slice(), b"/(".as_slice()],
-        TemplateMode::Preserve,
-        |route| push_route(out, route),
-    );
+    super::scan_quoted_after_markers(bytes, &["/[", "/("], TemplateMode::Preserve, |route| {
+        push_route(out, route);
+    });
 }
 
 fn collect_pattern_routes(bytes: &[u8], out: &mut Vec<String>) {
@@ -410,13 +398,9 @@ fn collect_literal_dependency_values(bytes: &[u8], findings: &mut crate::scan::F
 }
 
 fn scan_dependency_window(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
-    super::scan_string_tokens(
+    super::scan_quoted_after_markers(
         bytes,
-        &[
-            b"/api".as_slice(),
-            b"/graphql".as_slice(),
-            b"/trpc".as_slice(),
-        ],
+        API_PATH_PREFIXES,
         TemplateMode::Preserve,
         |raw| record_dependency_url(raw, findings),
     );
@@ -446,9 +430,9 @@ fn scan_action_attrs(bytes: &[u8], base: &Url, findings: &mut crate::scan::Findi
 }
 
 fn scan_action_literals(bytes: &[u8], base: &Url, findings: &mut crate::scan::FindingsBuilder) {
-    super::scan_string_tokens(
+    super::scan_quoted_after_markers(
         bytes,
-        &[b"?/".as_slice(), b"/__data.json?/".as_slice()],
+        &["?/", "/__data.json?/"],
         TemplateMode::Preserve,
         |raw| record_action(raw, base, findings),
     );

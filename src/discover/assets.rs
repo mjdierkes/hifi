@@ -2,10 +2,9 @@
 
 use super::{push_asset, push_candidate, AssetRef, AssetSource, DocumentKind};
 use crate::framework::DetectedSite;
-use crate::generated::{ASSET_LITERALS, DATA_MARKERS};
+use crate::generated::{ASSET_LITERALS, CONTEXT_MARKERS, DATA_MARKERS};
 use crate::hash::FxHashSet;
 use crate::literal::LiteralSet;
-use crate::scan::anchors::{anchor_bytes_is_match, scan_anchor_bytes, scan_anchors};
 use crate::scan::findings::FindingsBuilder;
 use crate::source::{self, TemplateMode};
 use crate::url::Url;
@@ -19,22 +18,14 @@ static DATA_MARKER_BYTES: LazyLock<Vec<&'static [u8]>> = LazyLock::new(|| {
     DATA_MARKERS.iter().map(|marker| marker.as_bytes()).collect()
 });
 
-/// Enumerate static assets in document bytes without running endpoint scan.
-pub fn scan_assets(
-    bytes: &[u8],
-    base: &Url,
-    kind: DocumentKind,
-    site: &DetectedSite,
-) -> Vec<AssetRef> {
-    let mut seen = FxHashSet::default();
-    let mut out = Vec::new();
-    if kind == DocumentKind::Html {
-        scan_html_assets(bytes, base, site, &mut seen, &mut out);
-    }
-    let mut findings = FindingsBuilder::default();
-    scan_literal_assets(bytes, base, site, &mut findings, &mut seen, &mut out);
-    scan_dynamic_assets(bytes, base, site, &mut seen, &mut out);
-    out
+static CONTEXT_MARKER_BYTES: LazyLock<Vec<&'static [u8]>> = LazyLock::new(|| {
+    CONTEXT_MARKERS.iter().map(|marker| marker.as_bytes()).collect()
+});
+
+fn bytes_contain_any(bytes: &[u8], needles: &[&[u8]]) -> bool {
+    needles
+        .iter()
+        .any(|needle| memchr::memmem::find(bytes, needle).is_some())
 }
 
 pub(crate) fn is_empty_script(bytes: &[u8], kind: DocumentKind) -> bool {
@@ -43,15 +34,8 @@ pub(crate) fn is_empty_script(bytes: &[u8], kind: DocumentKind) -> bool {
         && !ASSET_LITERALS_SET.is_match(bytes)
         && !source::contains(bytes, b"import(")
         && !source::contains(bytes, b"new URL(")
-        && !anchor_bytes_is_match(bytes, &DATA_MARKER_BYTES)
-        && !source::contains(bytes, b"__next_f.push")
-        && !source::contains(bytes, b"Next-Action")
-        && !source::contains(bytes, b"next-action")
-        && !source::contains(bytes, b"$ACTION_")
-        && !source::contains(bytes, b"__NUXT_DATA__")
-        && !source::contains(bytes, b"__sveltekit_")
-        && !source::contains(bytes, b"astro-island")
-        && !source::contains(bytes, b"__remixContext")
+        && !bytes_contain_any(bytes, &DATA_MARKER_BYTES)
+        && !bytes_contain_any(bytes, &CONTEXT_MARKER_BYTES)
 }
 
 pub(crate) fn scan_html_assets(
@@ -99,19 +83,19 @@ pub(crate) fn scan_literal_assets(
     seen: &mut FxHashSet<Url>,
     out: &mut Vec<AssetRef>,
 ) {
-    scan_anchors(bytes, &ASSET_LITERALS_SET, |m| {
+    for m in ASSET_LITERALS_SET.find_iter(bytes) {
         let start = source::walk_token_start(bytes, m.start());
         if !source::is_string_literal_start(bytes, start) {
-            return;
+            continue;
         }
         let Some(raw) = asset_token_string(bytes, start) else {
-            return;
+            continue;
         };
         if raw.starts_with("/_next/data/") {
             push_candidate(findings, &raw);
         }
         push_asset(base, &raw, contexts, AssetSource::Literal, seen, out);
-    });
+    }
 }
 
 pub(crate) fn scan_dynamic_assets(
@@ -134,15 +118,17 @@ pub(crate) fn scan_dynamic_assets(
 }
 
 pub(crate) fn scan_framework_markers(bytes: &[u8], findings: &mut FindingsBuilder) {
-    scan_anchor_bytes(bytes, &DATA_MARKER_BYTES, |pos, _| {
-        let start = source::walk_token_start(bytes, pos);
-        if !source::is_string_literal_start(bytes, start) {
-            return;
+    for &needle in DATA_MARKER_BYTES.iter() {
+        for pos in memchr::memmem::find_iter(bytes, needle) {
+            let start = source::walk_token_start(bytes, pos);
+            if !source::is_string_literal_start(bytes, start) {
+                continue;
+            }
+            if let Some(raw) = asset_token_string(bytes, start) {
+                super::push_candidate(findings, &raw);
+            }
         }
-        if let Some(raw) = asset_token_string(bytes, start) {
-            super::push_candidate(findings, &raw);
-        }
-    });
+    }
 }
 
 fn scan_tags(bytes: &[u8], needle: &[u8], mut f: impl FnMut(&[u8])) {

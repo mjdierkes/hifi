@@ -105,12 +105,6 @@ pub struct Evidence {
     pub shape: Option<Shape>,
 }
 
-impl Evidence {
-    pub fn confidence(&self) -> Confidence {
-        self.provenance.confidence()
-    }
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct FindingsBuilder {
     pub evidence: Vec<Evidence>,

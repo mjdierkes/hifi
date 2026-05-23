@@ -6,15 +6,8 @@
 
 use crate::app::AppError;
 use crate::util::{escape_terminal, normalize_url};
-use crate::discover::{self, scan_assets, AssetRef, DocumentKind};
-use crate::framework::DetectedSite;
-use crate::runtime::concurrent;
-use crate::runtime::config::RuntimeConfig;
-use crate::runtime::engine::MAX_TOTAL_ASSETS;
-use crate::runtime::fetch_root;
-use crate::runtime::http::Client;
-use crate::runtime::net;
-use crate::url::Url;
+use crate::discover::{self, AssetRef, DocumentKind};
+use crate::runtime::{concurrent, config::RuntimeConfig, fetch_root, http::Client, net, MAX_TOTAL_ASSETS};
 use std::sync::Arc;
 
 const DEFAULT_MAX_HITS: usize = 50;
@@ -100,8 +93,8 @@ pub async fn run(args: &[String], client: Client, config: RuntimeConfig) -> Resu
     let doc = fetch_root::fetch_root_document(&client, &url, config.allow_private).await?;
     let final_base = doc.url;
     let html = doc.body;
-    let site = DetectedSite::detect(&html, &final_base, None);
-    let mut assets = scan_assets(&html, &final_base, DocumentKind::Html, &site);
+    let scan = discover::scan_document(&html, &final_base, DocumentKind::Html);
+    let mut assets = scan.assets;
     let assets_capped = assets.len() > MAX_TOTAL_ASSETS;
     if assets_capped {
         assets.truncate(MAX_TOTAL_ASSETS);

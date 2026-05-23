@@ -1,7 +1,5 @@
 mod assets;
 
-pub use assets::scan_assets;
-
 use crate::framework::{self, DetectedSite, FrameworkId};
 use crate::framework::next::NextConfig;
 use crate::hash::FxHashSet;
@@ -113,7 +111,8 @@ pub(crate) fn scan_document_with_config_and_findings(
         bytes,
         base,
         kind,
-        parent_config,
+        &site,
+        next_config.as_ref(),
         &mut out.findings,
         &mut out.assets,
         &mut seen,
@@ -158,15 +157,7 @@ pub(crate) fn push_asset(
 
 pub(crate) fn push_candidate(findings: &mut FindingsBuilder, raw: &str) {
     framework::next::push_framework_candidate(findings, raw);
-    let path = raw.split(['?', '#']).next().unwrap_or(raw);
-    if framework::nuxt::is_payload(raw, path)
-        || framework::sveltekit::is_payload(raw, path)
-        || raw.contains("/_actions/")
-        || path.contains("/_server-islands/")
-        || raw.contains("?_data=")
-        || raw.contains("&_data=")
-        || path.contains("/_data/")
-    {
+    if framework::is_payload_candidate(raw) {
         findings.try_record_candidate(raw, Provenance::literal());
     }
 }

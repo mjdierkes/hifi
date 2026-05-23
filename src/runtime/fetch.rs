@@ -270,26 +270,26 @@ async fn fetch_scan(
         FetchedBody::NotModified => {
             let cached = cached.ok_or(FetchFailure::Other)?;
             let asset_data = Arc::new(cached.data);
-            cache::persist_asset(
+            persist_fetched(
                 &asset.url,
                 cache_key,
                 asset_data.clone(),
                 &cached.validators,
                 None,
+                true,
             );
             Ok(asset_data)
         }
         FetchedBody::Body(scan, validators, content_hash) => {
             let asset_data = Arc::new(*scan);
-            if use_cache {
-                cache::persist_asset(
-                    &asset.url,
-                    cache_key,
-                    asset_data.clone(),
-                    &validators,
-                    content_hash.as_deref(),
-                );
-            }
+            persist_fetched(
+                &asset.url,
+                cache_key,
+                asset_data.clone(),
+                &validators,
+                content_hash.as_deref(),
+                use_cache,
+            );
             Ok(asset_data)
         }
     }
@@ -441,12 +441,13 @@ fn spawn_revalidate_chunk(
                 }
             }
             FetchedBody::Body(scan, new_validators, content_hash) => {
-                cache::persist_asset(
+                persist_fetched(
                     &asset.url,
                     cache_key.as_deref(),
                     Arc::new(*scan),
                     &new_validators,
                     content_hash.as_deref(),
+                    true,
                 );
             }
         }
@@ -457,6 +458,19 @@ fn asset_validators(response: &crate::runtime::http::Response) -> cache::AssetVa
     cache::AssetValidators {
         etag: response.header("etag").map(str::to_owned),
         last_modified: response.header("last-modified").map(str::to_owned),
+    }
+}
+
+fn persist_fetched(
+    url: &Url,
+    cache_key: Option<&str>,
+    data: Arc<cache::AssetData>,
+    validators: &cache::AssetValidators,
+    content_hash: Option<&str>,
+    use_cache: bool,
+) {
+    if use_cache {
+        cache::persist_asset(url, cache_key, data, validators, content_hash);
     }
 }
 

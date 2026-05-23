@@ -24,6 +24,54 @@ fragments = ["/_astro/hoisted.", "/_astro/polyfills", "/_astro/client."]
 [remix.skip]
 fragments = ["/build/_shared/", "/build/manifest-", "/assets/manifest-", "/entry.client-"]
 
+[nuxt.skip]
+fragments = [
+  "/_nuxt/error-",
+  "/_nuxt/entry.",
+  "/_nuxt/node_modules/",
+  "/_nuxt/@vite/",
+  "/_nuxt/vendors",
+  "/_nuxt/vendor",
+  "/_nuxt/polyfills",
+]
+
+[sveltekit.skip]
+fragments = [
+  "/_app/immutable/chunks/scheduler.",
+  "/_app/immutable/chunks/index.",
+  "/_app/immutable/chunks/runtime.",
+  "/_app/immutable/chunks/vendor",
+]
+
+[scan.api_paths]
+prefixes = ["/api", "/graphql", "/trpc"]
+
+[discover.context_markers]
+literals = [
+  "__next_f.push",
+  "Next-Action",
+  "next-action",
+  "$ACTION_",
+  "__NUXT_DATA__",
+  "__sveltekit_",
+  "astro-island",
+  "__remixContext",
+]
+
+[nuxt.context_prefixes]
+prefixes = ["chunks/", "entry/", "pages/", "components/", "composables/", "plugins/"]
+
+[sveltekit.context_prefixes]
+prefixes = ["nodes/", "chunks/", "entry/", "assets/"]
+
+[sveltekit.immutable_children]
+paths = [
+  "/immutable/entry/",
+  "/immutable/nodes/",
+  "/immutable/chunks/",
+  "/immutable/assets/",
+]
+
 [scan.api_call]
 literals = [
   "fetch(",
@@ -112,6 +160,10 @@ mode = "object"
 [[scan.clients.fixed]]
 anchor = "axios.request("
 mode = "object"
+
+[scan.clients.method_templates]
+patterns = ["$api.${method}(", "$api.{method}(", "$axios.${method}(", ".{method}("]
+modes = ["first_arg", "first_arg", "first_arg", "generic_method"]
 
 [discover.assets]
 literals = [

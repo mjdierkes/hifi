@@ -10,7 +10,7 @@ use self::client::runtime_client;
 use self::render::{render_processed, render_warnings};
 use crate::grep;
 use crate::runtime::config::RuntimeConfig;
-use crate::runtime::engine;
+use crate::runtime::processor;
 use crate::runtime::http::Client;
 use crate::runtime::net;
 use std::{fmt, io};
@@ -45,7 +45,7 @@ pub enum AppError {
     Io(io::Error),
     Net(net::NetError),
     Http(crate::runtime::http::Error),
-    Runtime(crate::runtime::engine::RuntimeError),
+    Runtime(crate::runtime::processor::RuntimeError),
     Url(crate::url::ParseError),
 }
 
@@ -105,8 +105,8 @@ impl From<crate::runtime::http::Error> for AppError {
     }
 }
 
-impl From<crate::runtime::engine::RuntimeError> for AppError {
-    fn from(err: crate::runtime::engine::RuntimeError) -> Self {
+impl From<crate::runtime::processor::RuntimeError> for AppError {
+    fn from(err: crate::runtime::processor::RuntimeError) -> Self {
         Self::Runtime(err)
     }
 }
@@ -187,7 +187,7 @@ fn parse_scan_args(raw: &[String]) -> Result<ScanArgs, AppError> {
 }
 
 async fn run_scan(args: ScanArgs, client: Client, config: RuntimeConfig) -> Result<i32, AppError> {
-    let out = engine::scan_site(
+    let out = processor::scan_site(
         &client,
         &args.url,
         config.chunk_concurrency,

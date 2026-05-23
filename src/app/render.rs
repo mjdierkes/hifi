@@ -1,5 +1,5 @@
 use super::{AppError, OutputMode};
-use crate::runtime::engine::Output;
+use crate::runtime::processor::Output;
 use crate::util::escape_terminal;
 use std::fmt::Write as _;
 use std::io::{self, Write};
@@ -101,7 +101,7 @@ fn push_json_string(out: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::engine::{Api, CacheStatus, Output};
+    use crate::runtime::processor::{Api, CacheStatus, Output};
     use crate::scan::Shape;
 
     #[test]

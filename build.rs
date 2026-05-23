@@ -55,8 +55,33 @@ fn emit_policies(table: &toml::Table) -> String {
     );
     emit_str_array(
         &mut out,
-        "CLIENT_METHODS",
-        str_list(table, &["scan", "clients", "methods", "verbs"]),
+        "CONTEXT_MARKERS",
+        str_list(table, &["discover", "context_markers", "literals"]),
+    );
+    emit_str_array(
+        &mut out,
+        "API_PATH_PREFIXES",
+        str_list(table, &["scan", "api_paths", "prefixes"]),
+    );
+    emit_framework_skip(&mut out, "NEXT_SKIP_FRAGMENTS", table, "next");
+    emit_framework_skip(&mut out, "NUXT_SKIP_FRAGMENTS", table, "nuxt");
+    emit_framework_skip(&mut out, "SVELTEKIT_SKIP_FRAGMENTS", table, "sveltekit");
+    emit_framework_skip(&mut out, "ASTRO_SKIP_FRAGMENTS", table, "astro");
+    emit_framework_skip(&mut out, "REMIX_SKIP_FRAGMENTS", table, "remix");
+    emit_str_array(
+        &mut out,
+        "NUXT_CONTEXT_PREFIXES",
+        str_list(table, &["nuxt", "context_prefixes", "prefixes"]),
+    );
+    emit_str_array(
+        &mut out,
+        "SVELTEKIT_CONTEXT_PREFIXES",
+        str_list(table, &["sveltekit", "context_prefixes", "prefixes"]),
+    );
+    emit_str_array(
+        &mut out,
+        "SVELTEKIT_IMMUTABLE_CHILDREN",
+        str_list(table, &["sveltekit", "immutable_children", "paths"]),
     );
 
     let mut document = Vec::new();
@@ -102,8 +127,47 @@ fn emit_policies(table: &toml::Table) -> String {
             "    FixedClientPattern {{ anchor: {anchor:?}.as_bytes(), method: {method}, mode: {mode} }},\n"
         ));
     }
+    emit_client_method_patterns(&mut out, table);
     out.push_str("];\n");
     out
+}
+
+fn emit_framework_skip(out: &mut String, name: &str, table: &toml::Table, framework: &str) {
+    emit_str_array(out, name, str_list(table, &[framework, "skip", "fragments"]));
+}
+
+fn emit_client_method_patterns(out: &mut String, table: &toml::Table) {
+    let methods = str_list(table, &["scan", "clients", "methods", "verbs"]);
+    let templates = str_list(table, &["scan", "clients", "method_templates", "patterns"]);
+    let modes = table
+        .get("scan")
+        .and_then(|v| v.get("clients"))
+        .and_then(|v| v.get("method_templates"))
+        .and_then(|v| v.get("modes"))
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for method in methods {
+        let lower = method.to_ascii_lowercase();
+        for (idx, template) in templates.iter().enumerate() {
+            let anchor = template
+                .replace("{method}", &lower)
+                .replace("${method}", &lower);
+            let mode = modes
+                .get(idx)
+                .map(|name| client_mode(name))
+                .unwrap_or(0);
+            let method_ref = format!("Some({method:?})");
+            out.push_str(&format!(
+                "    FixedClientPattern {{ anchor: {anchor:?}.as_bytes(), method: {method_ref}, mode: {mode} }},\n"
+            ));
+        }
+    }
 }
 
 fn client_mode(name: &str) -> u8 {

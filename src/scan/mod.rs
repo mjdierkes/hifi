@@ -1,11 +1,9 @@
 //! Endpoint and client-route scanner.
 
 use crate::source;
-use anchors::scan_anchors;
 use patterns::{PatternKind, DOCUMENT_LITERALS};
 
 pub mod classify;
-pub(crate) mod anchors;
 mod clients;
 mod extract;
 pub mod findings;
@@ -20,7 +18,7 @@ pub use shape::Shape;
 
 pub fn scan_endpoints(bytes: &[u8]) -> FindingsBuilder {
     let mut out = FindingsBuilder::default();
-    scan_anchors(bytes, &DOCUMENT_LITERALS, |m| {
+    for m in DOCUMENT_LITERALS.find_iter(bytes) {
         let pattern = m.value;
         match pattern.kind {
             PatternKind::ApiCall => {
@@ -33,7 +31,7 @@ pub fn scan_endpoints(bytes: &[u8]) -> FindingsBuilder {
             PatternKind::RouteValue => on_route_value(bytes, m.start(), m.end(), &mut out),
             PatternKind::RouteStart => on_route_start(bytes, m.end(), &mut out),
         }
-    });
+    }
     clients::scan(bytes, &mut out);
     out
 }

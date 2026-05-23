@@ -13,20 +13,6 @@ use crate::scan::Shape;
 use crate::source::{self, TemplateMode};
 use crate::url::Url;
 
-const NEXT_SKIP_FRAGMENTS: &[&str] = &[
-    "framework-",
-    "polyfills-",
-    "webpack-",
-    "main-app-",
-    "_next/static/chunks/_turbopack_",
-    "[turbopack]_runtime",
-    "[next]_internal_",
-    "react-refresh",
-    "next/dist/",
-    "instrumentation-",
-    "app-pages-internals-",
-    "app-client-internals-",
-];
 const NEXT_ARTIFACTS: &[NextArtifact] = &[
     NextArtifact {
         name: "_buildManifest.js",
@@ -162,10 +148,6 @@ pub fn resolve_asset(base: &Url, raw: &str, context: bool) -> Option<Url> {
         return super::resolve::resolve_under(base, raw, true, &["static/"], "/_next/");
     }
     None
-}
-
-pub fn should_skip(url: &Url) -> bool {
-    super::resolve::should_skip_fragments(url, "/_next/", NEXT_SKIP_FRAGMENTS)
 }
 
 pub fn is_manifest(path: &str) -> bool {

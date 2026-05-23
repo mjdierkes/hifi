@@ -1,30 +1,14 @@
 //! Nuxt discovery policy and runtime hooks.
 
 use crate::discover::{AssetKind, AssetRef, AssetSource};
+use crate::generated::{NUXT_CONTEXT_PREFIXES, NUXT_SKIP_FRAGMENTS};
 use crate::hash::FxHashSet;
 use crate::framework::FrameworkId;
-use crate::scan::findings::{Channel, FindingsBuilder, Provenance};
+use crate::scan::findings::{Channel, Provenance};
 use crate::scan::Shape;
 use crate::source::{self, TemplateMode};
 use crate::url::Url;
 
-const SKIP_FRAGMENTS: &[&str] = &[
-    "/_nuxt/error-",
-    "/_nuxt/entry.",
-    "/_nuxt/node_modules/",
-    "/_nuxt/@vite/",
-    "/_nuxt/vendors",
-    "/_nuxt/vendor",
-    "/_nuxt/polyfills",
-];
-const CONTEXT_PREFIXES: &[&str] = &[
-    "chunks/",
-    "entry/",
-    "pages/",
-    "components/",
-    "composables/",
-    "plugins/",
-];
 const MANIFEST_ENDS_WITH: &[&str] = &["/_nuxt/manifest.json", "/_nuxt/prerendered.json"];
 const MANIFEST_GATED: &[(&str, &str)] = &[("/_nuxt/builds/", ".json")];
 
@@ -37,7 +21,7 @@ pub fn is_context(bytes: &[u8], base: &Url) -> bool {
 }
 
 pub fn should_skip(url: &Url) -> bool {
-    super::resolve::should_skip_fragments(url, "/_nuxt/", SKIP_FRAGMENTS)
+    super::resolve::should_skip_fragments(url, "/_nuxt/", NUXT_SKIP_FRAGMENTS)
 }
 
 pub fn is_payload(raw: &str, path: &str) -> bool {
@@ -56,7 +40,7 @@ pub fn resolve(base: &Url, raw: &str, context: bool) -> Option<Url> {
         raw,
         context,
         "_nuxt/",
-        CONTEXT_PREFIXES,
+        NUXT_CONTEXT_PREFIXES,
         "/_nuxt/",
     )
 }
@@ -159,12 +143,12 @@ fn manifest_roots(bytes: &[u8], base: &Url) -> Vec<Url> {
 }
 
 fn collect_literal_manifest_candidates(bytes: &[u8], out: &mut Vec<String>) {
-    super::scan_string_tokens(
+    super::scan_quoted_after_markers(
         bytes,
         &[
-            b"/_nuxt/builds/".as_slice(),
-            b"_nuxt/builds/".as_slice(),
-            b"/_nuxt/prerendered.json".as_slice(),
+            "/_nuxt/builds/",
+            "_nuxt/builds/",
+            "/_nuxt/prerendered.json",
         ],
         TemplateMode::Preserve,
         |raw| {
@@ -310,14 +294,9 @@ fn push_endpoint(out: &mut Vec<String>, raw: &str) {
 
 fn push_runtime_api_base(out: &mut Vec<String>, raw: &str) {
     let base = raw.trim_end_matches('/');
-    if base == "/api"
+    if crate::scan::classify::is_api_candidate(base)
+        || base == "/api"
         || base.starts_with("/api/")
-        || base.starts_with("/graphql")
-        || base.starts_with("/trpc")
-        || ((base.starts_with("http://") || base.starts_with("https://"))
-            && ["/api", "/graphql", "/trpc"]
-                .iter()
-                .any(|needle| base.contains(needle)))
     {
         out.push(base.to_owned());
     }

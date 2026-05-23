@@ -1,17 +1,20 @@
-use crate::generated::{BAD_EXTS, ROUTE_BAD_EXTS};
+use crate::generated::{API_PATH_PREFIXES, BAD_EXTS, ROUTE_BAD_EXTS};
+
+fn starts_with_api_prefix(s: &str) -> bool {
+    API_PATH_PREFIXES.iter().any(|prefix| s.starts_with(prefix))
+}
+
+fn contains_api_prefix(s: &str) -> bool {
+    API_PATH_PREFIXES.iter().any(|prefix| s.contains(prefix))
+}
 
 // API candidates are values that look useful but were not observed as a call
 // target. They stay separate from confirmed APIs so output can preserve
 // evidence quality instead of merging every URL-shaped string together.
 pub fn is_api_candidate(s: &str) -> bool {
     is_url_like(s)
-        && (s.starts_with("/api")
-            || s.starts_with("/graphql")
-            || s.starts_with("/trpc")
-            || ((s.starts_with("http://") || s.starts_with("https://"))
-                && ["/api/", "/graphql", "/trpc"]
-                    .iter()
-                    .any(|needle| s.contains(needle))))
+        && (starts_with_api_prefix(s)
+            || ((s.starts_with("http://") || s.starts_with("https://")) && contains_api_prefix(s)))
 }
 
 // Client routes are navigation targets, not HTTP endpoints. Keeping them in a
@@ -23,9 +26,7 @@ pub fn is_client_route(s: &str) -> bool {
         return true;
     }
     is_route_like(s)
-        && !s.starts_with("/api")
-        && !s.starts_with("/graphql")
-        && !s.starts_with("/trpc")
+        && !starts_with_api_prefix(s)
         && !s.starts_with("/_next")
         && !s.starts_with("/_nuxt")
         && !s.starts_with("/_app")

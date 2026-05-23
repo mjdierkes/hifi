@@ -1,4 +1,7 @@
 use crate::discover::{AssetKind, AssetRef, AssetSource, DocumentKind};
+use crate::generated::{
+    API_PATH_PREFIXES, ASTRO_SKIP_FRAGMENTS, NEXT_SKIP_FRAGMENTS, REMIX_SKIP_FRAGMENTS,
+};
 use crate::hash::FxHashSet;
 use crate::scan::findings::{Channel, FindingsBuilder, Provenance};
 use crate::scan::Shape;
@@ -27,7 +30,7 @@ const POLICIES: &[FrameworkPolicy] = &[
     FrameworkPolicy {
         id: FrameworkId::Next,
         detect: |bytes, base, cfg| next::is_context(bytes, base, cfg),
-        should_skip: next::should_skip,
+        should_skip: |url| resolve::should_skip_fragments(url, "/_next/", NEXT_SKIP_FRAGMENTS),
         is_manifest: next::is_manifest,
         is_payload: next::is_payload,
         resolve: |base, raw, site| next::resolve_asset(base, raw, site.has(FrameworkId::Next)),
@@ -59,11 +62,7 @@ const POLICIES: &[FrameworkPolicy] = &[
         id: FrameworkId::Astro,
         detect: |bytes, base, _| site::is_astro_context(bytes, base),
         should_skip: |url| {
-            resolve::should_skip_fragments(
-                url,
-                "/_astro/",
-                &["/_astro/hoisted.", "/_astro/polyfills", "/_astro/client."],
-            )
+            resolve::should_skip_fragments(url, "/_astro/", ASTRO_SKIP_FRAGMENTS)
         },
         is_manifest: |_| false,
         is_payload: |raw, path| raw.contains("/_actions/") || path.contains("/_server-islands/"),
@@ -72,22 +71,12 @@ const POLICIES: &[FrameworkPolicy] = &[
     FrameworkPolicy {
         id: FrameworkId::Remix,
         detect: |bytes, base, _| site::is_remix_context(bytes, base),
-        should_skip: |url| {
-            resolve::path_contains_any(
-                url.path(),
-                &[
-                    "/build/_shared/",
-                    "/build/manifest-",
-                    "/assets/manifest-",
-                    "/entry.client-",
-                ],
-            )
-        },
+        should_skip: |url| resolve::path_contains_any(url.path(), REMIX_SKIP_FRAGMENTS),
         is_manifest: |path| {
             resolve::manifest_matches(
                 path,
                 &["/manifest.js", "/manifest.json"],
-                &["/manifest-"],
+                &[],
                 &[],
             )
         },
@@ -127,14 +116,14 @@ pub(crate) fn json_slice(bytes: &[u8]) -> &[u8] {
     }
 }
 
-fn scan_string_tokens(
+pub(crate) fn scan_quoted_after_markers(
     bytes: &[u8],
-    markers: &[&[u8]],
+    markers: &[&str],
     mode: source::TemplateMode,
     mut visit: impl FnMut(&str),
 ) {
     for marker in markers {
-        for pos in memchr::memmem::find_iter(bytes, marker) {
+        for pos in memchr::memmem::find_iter(bytes, marker.as_bytes()) {
             let start = source::walk_token_start(bytes, pos);
             if !source::is_string_literal_start(bytes, start) {
                 continue;
@@ -192,11 +181,16 @@ pub fn request_headers(url: &Url) -> &'static [(&'static str, &'static str)] {
     }
 }
 
+pub fn is_payload_candidate(raw: &str) -> bool {
+    let path = raw.split(['?', '#']).next().unwrap_or(raw);
+    POLICIES.iter().any(|p| (p.is_payload)(raw, path))
+}
+
 pub fn classify_asset(raw: &str) -> Option<AssetKind> {
     let path = raw.split(['?', '#']).next().unwrap_or(raw);
     if POLICIES.iter().any(|p| (p.is_manifest)(path)) {
         Some(AssetKind::Manifest)
-    } else if POLICIES.iter().any(|p| (p.is_payload)(raw, path)) {
+    } else if is_payload_candidate(raw) {
         Some(AssetKind::Payload)
     } else if source::ends_with_ascii_ignore_case(path, ".js")
         || source::ends_with_ascii_ignore_case(path, ".mjs")
@@ -278,17 +272,12 @@ pub fn scan_document(
     bytes: &[u8],
     base: &Url,
     kind: DocumentKind,
-    parent_config: Option<&NextConfig>,
+    site: &DetectedSite,
+    next_config: Option<&NextConfig>,
     findings: &mut FindingsBuilder,
     assets: &mut Vec<AssetRef>,
     seen: &mut FxHashSet<Url>,
 ) {
-    let mut next_config = next::parse_page_config(bytes, kind);
-    if next_config.is_none() {
-        next_config = parent_config.cloned();
-    }
-    let site = DetectedSite::detect(bytes, base, next_config.as_ref());
-
     if let Some(routes) = next::parse_manifest_routes(bytes, base, kind) {
         for route in routes {
             if !crate::scan::classify::is_client_route(&route) {
@@ -298,9 +287,9 @@ pub fn scan_document(
         }
     }
 
-    scan_data_findings(bytes, base, kind, &site, findings);
+    scan_data_findings(bytes, base, kind, site, findings);
     next::scan_flight(bytes, findings);
-    next::scan_server_action(bytes, base, kind, next_config.as_ref(), findings);
+    next::scan_server_action(bytes, base, kind, next_config, findings);
     if site.has(FrameworkId::SvelteKit) {
         let routes = sveltekit::record_routes(bytes, findings);
         sveltekit::push_data_assets_for_routes(
@@ -312,12 +301,12 @@ pub fn scan_document(
         );
     }
     if kind == DocumentKind::Html {
-        if let Some(revision) = next::revision(bytes, site.has(FrameworkId::Next), next_config.as_ref()) {
+        if let Some(revision) = next::revision(bytes, site.has(FrameworkId::Next), next_config) {
             next::push_manifests(
                 bytes,
                 base,
                 &revision,
-                next_config.as_ref(),
+                next_config,
                 site.has(FrameworkId::Next),
                 seen,
                 assets,
@@ -381,29 +370,20 @@ fn record_payload_route(
 }
 
 fn scan_api_tokens(bytes: &[u8], framework: FrameworkId, findings: &mut FindingsBuilder) {
-    scan_string_tokens(
-        bytes,
-        &[
-            b"/api/".as_slice(),
-            b"/graphql".as_slice(),
-            b"/trpc".as_slice(),
-        ],
-        source::TemplateMode::Preserve,
-        |raw| {
-            if crate::scan::classify::is_api_candidate(raw) {
-                findings.record_candidate(
-                    crate::scan::classify::normalize_api_url(raw),
-                    Provenance::framework(Channel::Literal, framework),
-                );
-            }
-        },
-    );
+    scan_quoted_after_markers(bytes, API_PATH_PREFIXES, source::TemplateMode::Preserve, |raw| {
+        if crate::scan::classify::is_api_candidate(raw) {
+            findings.record_candidate(
+                crate::scan::classify::normalize_api_url(raw),
+                Provenance::framework(Channel::Literal, framework),
+            );
+        }
+    });
 }
 
 fn scan_astro_actions(bytes: &[u8], findings: &mut FindingsBuilder) {
-    scan_string_tokens(
+    scan_quoted_after_markers(
         bytes,
-        &[b"/_actions/".as_slice()],
+        &["/_actions/"],
         source::TemplateMode::Preserve,
         |raw| {
             findings.record_api(
@@ -416,9 +396,9 @@ fn scan_astro_actions(bytes: &[u8], findings: &mut FindingsBuilder) {
 }
 
 fn scan_nuxt_islands(bytes: &[u8], findings: &mut FindingsBuilder) {
-    scan_string_tokens(
+    scan_quoted_after_markers(
         bytes,
-        &[b"/__nuxt_island/".as_slice()],
+        &["/__nuxt_island/"],
         source::TemplateMode::Preserve,
         |raw| {
             findings.record_api(

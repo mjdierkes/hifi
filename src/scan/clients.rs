@@ -1,7 +1,7 @@
 //! HTTP client call-site analyzer ($fetch, axios, ky, etc.).
 
-use super::{anchors::scan_anchor_bytes, extract, findings::Channel, shape, FindingsBuilder, Provenance};
-use crate::generated::{CLIENT_METHODS, FIXED_CLIENT_PATTERNS};
+use super::{extract, findings::Channel, shape, FindingsBuilder, Provenance};
+use crate::generated::FIXED_CLIENT_PATTERNS;
 use crate::hash::FxHashMap;
 use crate::source;
 
@@ -17,16 +17,6 @@ pub(super) fn scan(bytes: &[u8], out: &mut FindingsBuilder) {
             out,
         );
     }
-    for m in CLIENT_METHODS {
-        let dollar = format!("$api.${}(", m.to_lowercase());
-        scan_pattern(bytes, dollar.as_bytes(), Some(*m), ClientMode::FirstArg, &bindings, out);
-        let dot = format!("$api.{}(", m.to_lowercase());
-        scan_pattern(bytes, dot.as_bytes(), Some(*m), ClientMode::FirstArg, &bindings, out);
-        let axios = format!("$axios.${}(", m.to_lowercase());
-        scan_pattern(bytes, axios.as_bytes(), Some(*m), ClientMode::FirstArg, &bindings, out);
-        let generic = format!(".{}(", m.to_lowercase());
-        scan_pattern(bytes, generic.as_bytes(), Some(*m), ClientMode::GenericMethod, &bindings, out);
-    }
 }
 
 fn scan_pattern(
@@ -37,8 +27,8 @@ fn scan_pattern(
     bindings: &FxHashMap<String, String>,
     out: &mut FindingsBuilder,
 ) {
-    scan_anchor_bytes(bytes, &[anchor], |pos, needle| {
-        let after = pos + needle.len();
+    for pos in memchr::memmem::find_iter(bytes, anchor) {
+        let after = pos + anchor.len();
         match mode {
             ClientMode::FirstArg => record_first_arg_client_with_method(
                 bytes,
@@ -53,7 +43,7 @@ fn scan_pattern(
             }
             ClientMode::GenericMethod => {}
         }
-    });
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -267,12 +257,7 @@ fn template_with_bindings(
 }
 
 fn useful_binding(value: &str) -> bool {
-    super::classify::is_url_like(value)
-        || value == "/api"
-        || value.starts_with("/api/")
-        || value.starts_with("/graphql")
-        || value.starts_with("/trpc")
-        || value.contains("/api/")
+    super::classify::is_url_like(value) || super::classify::is_api_candidate(value)
 }
 
 fn apiish_receiver_context(bytes: &[u8], dot: usize) -> bool {
