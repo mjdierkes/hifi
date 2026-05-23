@@ -6,10 +6,12 @@
 #[cfg(not(test))]
 use std::{
     sync::{
+        atomic::{AtomicUsize, Ordering},
         mpsc::{sync_channel, SyncSender, TrySendError},
         OnceLock,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 #[cfg(not(test))]
@@ -18,16 +20,42 @@ const CACHE_WRITE_QUEUE: usize = 1024;
 #[cfg(not(test))]
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+#[cfg(not(test))]
+static PENDING: AtomicUsize = AtomicUsize::new(0);
+
 pub fn defer(write: impl FnOnce() + Send + 'static) {
     #[cfg(test)]
     {
         write();
     }
     #[cfg(not(test))]
-    match worker().try_send(Box::new(write)) {
-        Ok(()) => {}
-        Err(TrySendError::Full(job)) => defer_overflow(job),
-        Err(TrySendError::Disconnected(job)) => job(),
+    {
+        PENDING.fetch_add(1, Ordering::SeqCst);
+        let job: Job = Box::new(move || {
+            write();
+            PENDING.fetch_sub(1, Ordering::SeqCst);
+        });
+        match worker().try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(job)) => defer_overflow(job),
+            Err(TrySendError::Disconnected(job)) => {
+                job();
+            }
+        }
+    }
+}
+
+pub fn flush(timeout: std::time::Duration) {
+    #[cfg(test)]
+    {
+        let _ = timeout;
+    }
+    #[cfg(not(test))]
+    {
+        let deadline = Instant::now() + timeout;
+        while PENDING.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 

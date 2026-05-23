@@ -192,6 +192,7 @@ async fn run_scan(args: ScanArgs, client: Client, config: RuntimeConfig) -> Resu
     .await?;
     render_processed(&out, args.mode)?;
     render_warnings(&out);
+    crate::runtime::cache_writer::flush(std::time::Duration::from_secs(2));
     Ok(0)
 }
 

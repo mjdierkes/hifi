@@ -1,7 +1,7 @@
 pub(crate) mod bytes;
 mod error;
 pub mod cache;
-mod cache_writer;
+pub(crate) mod cache_writer;
 pub(crate) mod codec;
 pub(crate) mod concurrent;
 pub mod config;

@@ -19,16 +19,6 @@ fn main() {
     hash_str(&mut hash, env!("CARGO_PKG_VERSION"));
     if let Ok(rev) = std::env::var("HIFI_BUILD_REV") {
         hash_str(&mut hash, &rev);
-    } else {
-        hash_git_head(&mut hash);
-    }
-
-    for path in build_inputs() {
-        println!("cargo:rerun-if-changed={}", path.display());
-        hash_str(&mut hash, &path.display().to_string());
-        if let Ok(bytes) = fs::read(&path) {
-            hash_bytes(&mut hash, &bytes);
-        }
     }
     hash_str(&mut hash, &raw);
 
@@ -294,48 +284,6 @@ fn str_list(table: &toml::Table, path: &[&str]) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn build_inputs() -> Vec<PathBuf> {
-    let mut paths = vec![
-        PathBuf::from("Cargo.toml"),
-        PathBuf::from("Cargo.lock"),
-        PathBuf::from("build.rs"),
-        PathBuf::from(POLICIES),
-    ];
-    collect_rs_files(Path::new("src"), &mut paths);
-    paths.sort();
-    paths
-}
-
-fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_rs_files(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
-}
-
-fn hash_git_head(hash: &mut u64) {
-    let head_path = Path::new(".git/HEAD");
-    println!("cargo:rerun-if-changed={}", head_path.display());
-    let Ok(head) = fs::read_to_string(head_path) else {
-        return;
-    };
-    hash_str(hash, head.trim());
-    if let Some(reference) = head.trim().strip_prefix("ref: ") {
-        let ref_path = Path::new(".git").join(reference);
-        println!("cargo:rerun-if-changed={}", ref_path.display());
-        if let Ok(value) = fs::read_to_string(ref_path) {
-            hash_str(hash, value.trim());
-        }
-    }
 }
 
 fn hash_str(hash: &mut u64, value: &str) {

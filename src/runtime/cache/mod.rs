@@ -245,6 +245,7 @@ fn cache_age_secs(inserted_at: SystemTime) -> u64 {
 
 struct BoundedMemory<V> {
     map: FxHashMap<String, V>,
+    order: std::collections::VecDeque<String>,
     cap: usize,
 }
 
@@ -252,6 +253,7 @@ impl<V: Clone> BoundedMemory<V> {
     fn new(cap: usize) -> Self {
         Self {
             map: FxHashMap::default(),
+            order: std::collections::VecDeque::with_capacity(cap),
             cap,
         }
     }
@@ -261,10 +263,72 @@ impl<V: Clone> BoundedMemory<V> {
     }
 
     fn put(&mut self, key: String, value: V) {
-        if !self.map.contains_key(&key) && self.map.len() >= self.cap {
-            self.map.clear();
+        if self.map.contains_key(&key) {
+            self.map.insert(key, value);
+            return;
         }
+        while self.map.len() >= self.cap {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.map.remove(&oldest);
+        }
+        self.order.push_back(key.clone());
         self.map.insert(key, value);
+    }
+}
+
+fn normalize_for_cache(url: &Url) -> String {
+    let scheme = url.scheme();
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    let port = url
+        .port()
+        .filter(|p| Some(*p) != default_port_for(scheme));
+    let mut path = url.path().to_string();
+    if path.len() > 1 && path.ends_with('/') {
+        path.pop();
+    }
+    if path.is_empty() {
+        path.push('/');
+    }
+    let mut out = String::with_capacity(scheme.len() + host.len() + path.len() + 16);
+    out.push_str(scheme);
+    out.push_str("://");
+    out.push_str(&host);
+    if let Some(p) = port {
+        out.push(':');
+        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{p}"));
+    }
+    out.push_str(&path);
+    if let Some(query) = url.query() {
+        let mut pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        if pairs.is_empty() {
+            out.push('?');
+            out.push_str(query);
+        } else {
+            pairs.sort();
+            out.push('?');
+            for (i, (k, v)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push('&');
+                }
+                out.push_str(k);
+                out.push('=');
+                out.push_str(v);
+            }
+        }
+    }
+    out
+}
+
+fn default_port_for(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
     }
 }
 
@@ -597,10 +661,11 @@ fn prefixed_path(kind: &str, name: &str, ext: &str) -> PathBuf {
 }
 
 fn scanner_hashed_path(kind: &str, url: &Url, cache_key: Option<&str>, ext: &str) -> PathBuf {
+    let normalized = normalize_for_cache(url);
     let hash = hash_parts(
         std::iter::once(SCANNER_CACHE_VERSION)
             .chain(cache_key)
-            .chain(std::iter::once(url.as_str())),
+            .chain(std::iter::once(normalized.as_str())),
     );
     use std::fmt::Write;
     let base = dir();
