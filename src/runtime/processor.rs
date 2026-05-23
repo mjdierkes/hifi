@@ -1,61 +1,18 @@
 //! Site scan orchestration and scan output encoding.
 
 use super::codec::{document, put_opt_string, put_string, put_u32, Reader as BinaryReader};
-use super::{cache, fetch, fetch_root, http::Client, net};
+use super::{cache, fetch, fetch_root, http::Client};
 use crate::discover::{self, DocumentKind};
 use crate::scan::{Evidence, EvidenceKind, Shape};
 use crate::url::Url;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::{fmt, time::Instant};
+use std::{time::Instant};
+
+use super::error::RuntimeError;
 
 type Result<T, E = RuntimeError> = std::result::Result<T, E>;
 pub use fetch::MAX_TOTAL_ASSETS;
-
-#[derive(Debug)]
-pub enum RuntimeError {
-    Net(net::NetError),
-    Url(crate::url::ParseError),
-    Join(tokio::task::JoinError),
-}
-
-impl fmt::Display for RuntimeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Net(err) => err.fmt(f),
-            Self::Url(err) => err.fmt(f),
-            Self::Join(err) => err.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for RuntimeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Net(err) => Some(err),
-            Self::Url(err) => Some(err),
-            Self::Join(err) => Some(err),
-        }
-    }
-}
-
-impl From<net::NetError> for RuntimeError {
-    fn from(err: net::NetError) -> Self {
-        Self::Net(err)
-    }
-}
-
-impl From<crate::url::ParseError> for RuntimeError {
-    fn from(err: crate::url::ParseError) -> Self {
-        Self::Url(err)
-    }
-}
-
-impl From<tokio::task::JoinError> for RuntimeError {
-    fn from(err: tokio::task::JoinError) -> Self {
-        Self::Join(err)
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct Output {

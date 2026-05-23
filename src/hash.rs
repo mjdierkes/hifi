@@ -17,25 +17,8 @@ pub struct FxHasher {
 
 impl Hasher for FxHasher {
     #[inline]
-    fn write(&mut self, mut bytes: &[u8]) {
-        while bytes.len() >= 8 {
-            let v = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
-            self.h = (self.h.rotate_left(ROTATE) ^ v).wrapping_mul(SEED);
-            bytes = &bytes[8..];
-        }
-        if bytes.len() >= 4 {
-            let v = u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64;
-            self.h = (self.h.rotate_left(ROTATE) ^ v).wrapping_mul(SEED);
-            bytes = &bytes[4..];
-        }
-        if bytes.len() >= 2 {
-            let v = u16::from_ne_bytes(bytes[..2].try_into().unwrap()) as u64;
-            self.h = (self.h.rotate_left(ROTATE) ^ v).wrapping_mul(SEED);
-            bytes = &bytes[2..];
-        }
-        if let Some(&b) = bytes.first() {
-            self.h = (self.h.rotate_left(ROTATE) ^ b as u64).wrapping_mul(SEED);
-        }
+    fn write(&mut self, bytes: &[u8]) {
+        self.h = mix_bytes(self.h, bytes);
     }
 
     #[inline]
@@ -69,8 +52,13 @@ pub(crate) fn hash128_hex(bytes: &[u8]) -> String {
     format!("{a:016x}{b:016x}")
 }
 
-fn hash64(mut bytes: &[u8], seed: u64) -> u64 {
-    let mut h = seed ^ ((bytes.len() as u64).wrapping_mul(SEED2));
+fn hash64(bytes: &[u8], seed: u64) -> u64 {
+    let h = seed ^ ((bytes.len() as u64).wrapping_mul(SEED2));
+    avalanche(mix_bytes(h, bytes))
+}
+
+#[inline]
+fn mix_bytes(mut h: u64, mut bytes: &[u8]) -> u64 {
     while bytes.len() >= 8 {
         let v = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
         h = mix(h, v);
@@ -89,7 +77,7 @@ fn hash64(mut bytes: &[u8], seed: u64) -> u64 {
     if let Some(&b) = bytes.first() {
         h = mix(h, b as u64);
     }
-    avalanche(h)
+    h
 }
 
 #[inline]

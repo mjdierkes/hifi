@@ -14,7 +14,7 @@ pub fn render_processed(out: &Output, mode: OutputMode) -> Result<(), AppError> 
     Ok(())
 }
 
-pub fn warning_text(out: &Output) -> String {
+fn warning_text(out: &Output) -> String {
     out.warnings
         .iter()
         .map(|w| format!("hifi: warning: {w}\n"))

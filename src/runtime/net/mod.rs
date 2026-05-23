@@ -3,7 +3,7 @@
 mod fetch;
 
 pub use fetch::{
-    fetch, fetch_bytes, get_bytes_limited, get_limited, read_limited, FetchOptions,
+    fetch, fetch_bytes, get_bytes_limited, read_limited, FetchOptions,
 };
 
 use crate::runtime::http::Response;

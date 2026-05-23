@@ -312,7 +312,7 @@ async fn fetch_asset_body(
     )
     .await
     .map_err(|err| {
-        trace_net_error(&asset.url, &err);
+        trace_asset("asset read error", &asset.url, &err);
         FetchFailure::Other
     })?;
     if !FIRST_ASSET_RESPONSE_TRACED.swap(true, Ordering::Relaxed) {
@@ -339,7 +339,7 @@ async fn fetch_asset_body(
                 None,
             ));
         }
-        trace_asset_status(&current_url, status);
+        trace_asset("asset status", &current_url, status);
         return Err(match status {
             401 | 403 => FetchFailure::Unauthorized,
             _ => FetchFailure::Other,
@@ -349,7 +349,7 @@ async fn fetch_asset_body(
     let kind = asset.document_kind();
     let validators = asset_validators(&response);
     let body = net::read_limited(response).await.map_err(|err| {
-        trace_net_error(&current_url, &err);
+        trace_asset("asset read error", &current_url, &err);
         FetchFailure::Other
     })?;
     let content_hash = (use_hash_cache && kind == discover::DocumentKind::Script)
@@ -377,21 +377,9 @@ async fn fetch_asset_body(
     Ok(FetchedBody::Body(Box::new(scan), validators, content_hash))
 }
 
-fn trace_asset_error(url: &Url, err: &net::NetError) {
+fn trace_asset(label: &str, url: &Url, detail: impl std::fmt::Display) {
     if std::env::var_os("HIFI_TRACE_HTTP").is_some() {
-        eprintln!("hifi: trace: asset error {} {err}", url.as_str());
-    }
-}
-
-fn trace_net_error(url: &Url, err: &net::NetError) {
-    if std::env::var_os("HIFI_TRACE_HTTP").is_some() {
-        eprintln!("hifi: trace: asset read error {} {err}", url.as_str());
-    }
-}
-
-fn trace_asset_status(url: &Url, status: u16) {
-    if std::env::var_os("HIFI_TRACE_HTTP").is_some() {
-        eprintln!("hifi: trace: asset status {} {status}", url.as_str());
+        eprintln!("hifi: trace: {label} {} {detail}", url.as_str());
     }
 }
 

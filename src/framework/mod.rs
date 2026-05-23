@@ -417,7 +417,7 @@ fn scan_nuxt_islands(bytes: &[u8], findings: &mut FindingsBuilder) {
     );
 }
 
-pub(crate) fn push_asset(
+pub(crate) fn insert_asset(
     url: Url,
     kind: AssetKind,
     source: AssetSource,

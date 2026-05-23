@@ -10,14 +10,10 @@ const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7
 
 pub fn runtime_client() -> Result<(RuntimeConfig, Client), AppError> {
     let config = RuntimeConfig::from_env();
-    let client = make_client(config)?;
-    Ok((config, client))
-}
-
-fn make_client(_config: RuntimeConfig) -> Result<Client, crate::runtime::http::Error> {
-    Ok(Client::builder()
+    let client = Client::builder()
         .default_headers(browser_default_headers())
-        .build())
+        .build();
+    Ok((config, client))
 }
 
 // Cloudflare bot-management 403s any request that looks programmatic; UA alone

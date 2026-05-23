@@ -88,7 +88,7 @@ pub fn push_manifests(
         let Ok(url) = base.join(&format!("{app_root}version.json")) else {
             continue;
         };
-        super::push_asset(
+        super::insert_asset(
             url,
             AssetKind::Manifest,
             AssetSource::FrameworkManifest,
@@ -112,7 +112,7 @@ pub fn push_data_assets_for_routes(
         let Ok(url) = base.join(&path) else {
             continue;
         };
-        super::push_asset(
+        super::insert_asset(
             url,
             AssetKind::Payload,
             AssetSource::FrameworkManifest,
@@ -134,13 +134,13 @@ pub fn primary_immutable_root(bytes: &[u8], base: &Url) -> Option<String> {
 }
 
 pub fn base_path(bytes: &[u8]) -> Option<String> {
-    super::resolve::keyed_string(bytes, b"base", b":=", false)
-        .or_else(|| super::resolve::keyed_string(bytes, b"baseUrl", b":=", false))
-        .or_else(|| super::resolve::keyed_string(bytes, b"paths.base", b":=", false))
+    source::field_string(bytes, b"base", b":=", false)
+        .or_else(|| source::field_string(bytes, b"baseUrl", b":=", false))
+        .or_else(|| source::field_string(bytes, b"paths.base", b":=", false))
         .filter(|value| value.starts_with('/') && !value.starts_with("//"))
 }
 
-pub fn routes(bytes: &[u8]) -> Vec<String> {
+fn routes(bytes: &[u8]) -> Vec<String> {
     let mut routes = parse_routes(bytes);
     routes.sort();
     routes.dedup();
@@ -238,8 +238,8 @@ fn root_before_immutable_child(raw: &str) -> Option<String> {
 }
 
 fn app_dir(bytes: &[u8]) -> Option<String> {
-    super::resolve::keyed_string(bytes, b"appDir", b":=", false)
-        .or_else(|| super::resolve::keyed_string(bytes, b"app_dir", b":=", false))
+    source::field_string(bytes, b"appDir", b":=", false)
+        .or_else(|| source::field_string(bytes, b"app_dir", b":=", false))
         .filter(|value| {
             !value.is_empty()
                 && !value.contains("..")

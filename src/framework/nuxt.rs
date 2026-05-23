@@ -51,7 +51,7 @@ pub fn record_routes(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) 
 
 pub fn record_page_route(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
     for key in [b"routePath".as_slice(), b"path".as_slice()] {
-        let Some(route) = super::resolve::keyed_string(bytes, key, b":", true) else {
+        let Some(route) = source::field_string(bytes, key, b":", true) else {
             continue;
         };
         let path = route.split(['?', '#']).next().unwrap_or(&route);
@@ -84,7 +84,7 @@ pub fn push_manifests(
         else {
             continue;
         };
-        super::push_asset(
+        super::insert_asset(
             url,
             AssetKind::Manifest,
             AssetSource::FrameworkManifest,
@@ -103,7 +103,7 @@ pub fn push_manifests(
             let Ok(url) = root.join(&name) else {
                 continue;
             };
-            super::push_asset(
+            super::insert_asset(
                 url,
                 AssetKind::Manifest,
                 AssetSource::FrameworkManifest,
@@ -204,7 +204,7 @@ fn collect_endpoint_literals(bytes: &[u8], out: &mut Vec<String>) {
         ],
         0,
         |pos, key, _| {
-            if let Some(endpoint) = super::resolve::keyed_string(&bytes[pos..], key, b":", true) {
+            if let Some(endpoint) = source::field_string(&bytes[pos..], key, b":", true) {
                 push_endpoint(out, &endpoint);
             }
         },
@@ -256,7 +256,7 @@ fn runtime_api_bases(bytes: &[u8]) -> Vec<String> {
         ],
         0,
         |pos, key, _| {
-            if let Some(value) = super::resolve::keyed_string(&bytes[pos..], key, b":", true) {
+            if let Some(value) = source::field_string(&bytes[pos..], key, b":", true) {
                 push_runtime_api_base(&mut out, &value);
             }
         },
@@ -343,7 +343,7 @@ fn collect_literal_routes(bytes: &[u8], out: &mut Vec<String>) {
         let mut offset = 0;
         while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
             let pos = offset + rel;
-            if let Some(route) = super::resolve::keyed_string(&bytes[pos..], key, b":", true) {
+            if let Some(route) = source::field_string(&bytes[pos..], key, b":", true) {
                 push_route(out, &route);
             }
             collect_route_strings(&bytes[pos..bytes.len().min(pos + 2048)], out);
@@ -372,8 +372,8 @@ fn push_route(out: &mut Vec<String>, raw: &str) {
     }
 }
 
-pub fn build_id(bytes: &[u8]) -> Option<String> {
-    super::resolve::keyed_string(bytes, b"buildId", b":", true).filter(|value| {
+fn build_id(bytes: &[u8]) -> Option<String> {
+    source::field_string(bytes, b"buildId", b":", true).filter(|value| {
         (4..=128).contains(&value.len())
             && value
                 .bytes()
@@ -381,16 +381,16 @@ pub fn build_id(bytes: &[u8]) -> Option<String> {
     })
 }
 
-pub fn app_base_url(bytes: &[u8]) -> Option<String> {
-    super::resolve::keyed_string(bytes, b"baseURL", b":", true).filter(|value| value.starts_with('/'))
+fn app_base_url(bytes: &[u8]) -> Option<String> {
+    source::field_string(bytes, b"baseURL", b":", true).filter(|value| value.starts_with('/'))
 }
 
-pub fn app_cdn_url(bytes: &[u8]) -> Option<String> {
-    super::resolve::keyed_string(bytes, b"cdnURL", b":", true)
+fn app_cdn_url(bytes: &[u8]) -> Option<String> {
+    source::field_string(bytes, b"cdnURL", b":", true)
         .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
 }
 
-pub fn build_assets_dir(bytes: &[u8]) -> Option<String> {
-    super::resolve::keyed_string(bytes, b"buildAssetsDir", b":", true)
+fn build_assets_dir(bytes: &[u8]) -> Option<String> {
+    source::field_string(bytes, b"buildAssetsDir", b":", true)
         .filter(|value| value.contains("_nuxt"))
 }

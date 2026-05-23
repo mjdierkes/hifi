@@ -1,4 +1,5 @@
 pub(crate) mod bytes;
+mod error;
 pub mod cache;
 mod cache_writer;
 pub(crate) mod codec;
@@ -9,4 +10,5 @@ pub(crate) mod fetch_root;
 pub mod http;
 pub mod net;
 pub mod processor;
-pub use processor::{scan_site, Api, CacheStatus, Output, RuntimeError, MAX_TOTAL_ASSETS};
+pub use error::RuntimeError;
+pub use processor::{scan_site, Api, CacheStatus, Output, MAX_TOTAL_ASSETS};

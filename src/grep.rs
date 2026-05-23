@@ -223,9 +223,6 @@ async fn grep_one(
 
 fn grep_bytes(url: &str, bytes: &[u8], pat_bytes: &[u8], options: &GrepOptions) -> GrepResult {
     let mut result = GrepResult::default();
-    if pat_bytes.is_empty() {
-        return result;
-    }
     let max_hits = options.max_hits.unwrap_or(usize::MAX);
     let mut file_omitted = false;
 

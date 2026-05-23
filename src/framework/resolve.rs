@@ -71,5 +71,3 @@ pub(crate) fn manifest_matches(
             path.contains(needle) && source::ends_with_ascii_ignore_case(path, suffix)
         })
 }
-
-pub(crate) use source::field_string as keyed_string;

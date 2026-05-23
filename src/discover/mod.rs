@@ -150,9 +150,7 @@ pub(crate) fn push_asset(
     if framework::should_skip(&url) {
         return;
     }
-    if seen.insert(url.clone()) {
-        out.push(AssetRef { url, kind, source });
-    }
+    framework::insert_asset(url, kind, source, seen, out);
 }
 
 pub(crate) fn push_candidate(findings: &mut FindingsBuilder, raw: &str) {

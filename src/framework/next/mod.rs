@@ -119,7 +119,7 @@ pub fn push_manifests(
         let Ok(url) = root.join(artifact.name) else {
             continue;
         };
-        super::push_asset(
+        super::insert_asset(
             url,
             AssetKind::Manifest,
             AssetSource::NextManifest,

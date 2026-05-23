@@ -105,11 +105,3 @@ pub async fn get_bytes_limited(
 ) -> Result<HiBytes, NetError> {
     fetch_bytes(client, url, FetchOptions::page(allow_private)).await
 }
-
-pub async fn get_limited(
-    client: &Client,
-    url: Url,
-    allow_private: bool,
-) -> Result<Response, NetError> {
-    fetch(client, url, FetchOptions::page(allow_private)).await
-}
