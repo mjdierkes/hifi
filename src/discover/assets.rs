@@ -6,7 +6,7 @@ use crate::generated::{ASSET_LITERALS, CONTEXT_MARKERS, DATA_MARKERS};
 use crate::hash::FxHashSet;
 use crate::literal::LiteralSet;
 use crate::scan::findings::FindingsBuilder;
-use crate::source::{self, TemplateMode};
+use crate::source;
 use crate::url::Url;
 use std::sync::LazyLock;
 
@@ -25,7 +25,7 @@ static CONTEXT_MARKER_BYTES: LazyLock<Vec<&'static [u8]>> = LazyLock::new(|| {
 fn bytes_contain_any(bytes: &[u8], needles: &[&[u8]]) -> bool {
     needles
         .iter()
-        .any(|needle| memchr::memmem::find(bytes, needle).is_some())
+        .any(|needle| source::contains(bytes, needle))
 }
 
 pub(crate) fn is_empty_script(bytes: &[u8], kind: DocumentKind) -> bool {
@@ -88,7 +88,7 @@ pub(crate) fn scan_literal_assets(
         if !source::is_string_literal_start(bytes, start) {
             continue;
         }
-        let Some(raw) = asset_token_string(bytes, start) else {
+        let Some(raw) = source::asset_token_string(bytes, start) else {
             continue;
         };
         if raw.starts_with("/_next/data/") {
@@ -124,7 +124,7 @@ pub(crate) fn scan_framework_markers(bytes: &[u8], findings: &mut FindingsBuilde
             if !source::is_string_literal_start(bytes, start) {
                 continue;
             }
-            if let Some(raw) = asset_token_string(bytes, start) {
+            if let Some(raw) = source::asset_token_string(bytes, start) {
                 super::push_candidate(findings, &raw);
             }
         }
@@ -141,19 +141,6 @@ fn scan_tags(bytes: &[u8], needle: &[u8], mut f: impl FnMut(&[u8])) {
         f(&bytes[start..start + end_rel + 1]);
         offset = start + 1;
     }
-}
-
-fn asset_token_string(bytes: &[u8], start: usize) -> Option<String> {
-    let raw = source::token_string(bytes, start, TemplateMode::Preserve)?;
-    if !raw.contains('?') && !raw.contains('&') {
-        return Some(raw);
-    }
-
-    let end =
-        start + source::find_token_delim(&bytes[start..], false).unwrap_or(bytes.len() - start);
-    std::str::from_utf8(&bytes[start..end])
-        .ok()
-        .map(|s| s.trim_matches('\\').to_string())
 }
 
 fn attr_value<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a str> {

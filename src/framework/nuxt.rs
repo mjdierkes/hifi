@@ -1,7 +1,7 @@
 //! Nuxt discovery policy and runtime hooks.
 
 use crate::discover::{AssetKind, AssetRef, AssetSource};
-use crate::generated::{NUXT_CONTEXT_PREFIXES, NUXT_SKIP_FRAGMENTS};
+use crate::generated::{NUXT_CONTEXT_PREFIXES, NUXT_IS_CONTEXT_MARKERS, NUXT_SKIP_FRAGMENTS};
 use crate::hash::FxHashSet;
 use crate::framework::FrameworkId;
 use crate::scan::findings::{Channel, Provenance};
@@ -15,9 +15,7 @@ const MANIFEST_GATED: &[(&str, &str)] = &[("/_nuxt/builds/", ".json")];
 pub fn is_context(bytes: &[u8], base: &Url) -> bool {
     base.path().contains("/_nuxt/")
         || base.path().ends_with("_payload.json")
-        || source::contains(bytes, b"/_nuxt/")
-        || source::contains(bytes, b"__NUXT_DATA__")
-        || source::contains(bytes, b"_payload.json")
+        || source::bytes_contain_any_str(bytes, NUXT_IS_CONTEXT_MARKERS)
 }
 
 pub fn should_skip(url: &Url) -> bool {

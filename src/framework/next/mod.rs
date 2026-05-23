@@ -1,6 +1,7 @@
 //! Next.js discovery policy and runtime hooks.
 
 use crate::discover::{AssetKind, AssetRef, AssetSource, DocumentKind};
+use crate::generated::NEXT_IS_CONTEXT_MARKERS;
 use crate::hash::FxHashSet;
 mod parser;
 
@@ -10,7 +11,7 @@ pub use parser::{
 };
 use crate::scan::findings::{Channel, FindingsBuilder, Provenance};
 use crate::scan::Shape;
-use crate::source::{self, TemplateMode};
+use crate::source;
 use crate::url::Url;
 
 const NEXT_ARTIFACTS: &[NextArtifact] = &[
@@ -41,7 +42,6 @@ const NEXT_ARTIFACTS: &[NextArtifact] = &[
     },
 ];
 const NEXT_ACTION_MARKERS: &[&[u8]] = &[b"Next-Action", b"next-action", b"$ACTION_"];
-const NEXT_FLIGHT_MARKER: &[u8] = b"self.__next_f.push";
 
 #[derive(Clone, Copy)]
 struct NextArtifact {
@@ -67,9 +67,7 @@ pub fn parse_page_config(bytes: &[u8], kind: DocumentKind) -> Option<NextConfig>
 pub fn is_context(bytes: &[u8], base: &Url, config: Option<&NextConfig>) -> bool {
     config.is_some()
         || base.path().contains("/_next/")
-        || source::contains(bytes, b"/_next/")
-        || source::contains(bytes, b"__NEXT_DATA__")
-        || source::contains(bytes, NEXT_FLIGHT_MARKER)
+        || source::bytes_contain_any_str(bytes, NEXT_IS_CONTEXT_MARKERS)
 }
 
 pub fn revision(bytes: &[u8], context: bool, config: Option<&NextConfig>) -> Option<String> {
@@ -237,7 +235,7 @@ fn static_mount(bytes: &[u8], base: &Url, context: bool) -> Option<Url> {
     let marker = b"/_next/static/";
     for pos in memchr::memmem::find_iter(bytes, marker) {
         let start = source::walk_token_start(bytes, pos);
-        let Some(raw) = asset_token_string(bytes, start) else {
+        let Some(raw) = source::asset_token_string(bytes, start) else {
             continue;
         };
         let Some(url) = resolve_asset(base, &raw, context) else {
@@ -334,19 +332,4 @@ fn route_from_payload(base: &Url, config: Option<&NextConfig>) -> Option<String>
     }
     path = parser::normalize_app_route(&path);
     Some(path)
-}
-
-fn asset_token_string(bytes: &[u8], start: usize) -> Option<String> {
-    let raw = source::token_string(bytes, start, TemplateMode::Preserve)?;
-    if !raw.contains('?') && !raw.contains('&') {
-        return Some(raw);
-    }
-
-    let mut end = start;
-    while end < bytes.len() && !source::is_token_delim(bytes[end], false) {
-        end += 1;
-    }
-    std::str::from_utf8(&bytes[start..end])
-        .ok()
-        .map(|s| s.trim_matches('\\').to_string())
 }

@@ -26,6 +26,24 @@ pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     memchr::memmem::find(haystack, needle).is_some()
 }
 
+pub(crate) fn bytes_contain_any_str(bytes: &[u8], markers: &[&str]) -> bool {
+    markers
+        .iter()
+        .any(|marker| contains(bytes, marker.as_bytes()))
+}
+
+pub(crate) fn asset_token_string(bytes: &[u8], start: usize) -> Option<String> {
+    let raw = token_string(bytes, start, TemplateMode::Preserve)?;
+    if !raw.contains('?') && !raw.contains('&') {
+        return Some(raw);
+    }
+
+    let end = start + find_token_delim(&bytes[start..], false).unwrap_or(bytes.len() - start);
+    std::str::from_utf8(&bytes[start..end])
+        .ok()
+        .map(|s| s.trim_matches('\\').to_string())
+}
+
 pub fn find_ascii_ignore_case(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);

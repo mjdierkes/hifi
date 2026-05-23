@@ -241,8 +241,7 @@ pub fn scan_data_findings(
     findings: &mut FindingsBuilder,
 ) {
     if site.has(FrameworkId::Nuxt) {
-        record_payload_route(base, kind, FrameworkId::Nuxt, findings);
-        scan_api_tokens(bytes, FrameworkId::Nuxt, findings);
+        scan_common_data_findings(bytes, base, kind, FrameworkId::Nuxt, findings);
         nuxt::record_endpoint_maps(bytes, findings);
         if matches!(kind, DocumentKind::Manifest | DocumentKind::Payload) {
             nuxt::record_routes(bytes, findings);
@@ -252,20 +251,28 @@ pub fn scan_data_findings(
         scan_nuxt_islands(bytes, findings);
     }
     if site.has(FrameworkId::SvelteKit) {
-        record_payload_route(base, kind, FrameworkId::SvelteKit, findings);
-        scan_api_tokens(bytes, FrameworkId::SvelteKit, findings);
+        scan_common_data_findings(bytes, base, kind, FrameworkId::SvelteKit, findings);
         sveltekit::record_form_actions(bytes, base, findings);
         sveltekit::record_data_dependencies(bytes, findings);
     }
     if site.has(FrameworkId::Remix) {
-        record_payload_route(base, kind, FrameworkId::Remix, findings);
-        scan_api_tokens(bytes, FrameworkId::Remix, findings);
+        scan_common_data_findings(bytes, base, kind, FrameworkId::Remix, findings);
     }
     if site.has(FrameworkId::Astro) {
-        record_payload_route(base, kind, FrameworkId::Astro, findings);
-        scan_api_tokens(bytes, FrameworkId::Astro, findings);
+        scan_common_data_findings(bytes, base, kind, FrameworkId::Astro, findings);
         scan_astro_actions(bytes, findings);
     }
+}
+
+fn scan_common_data_findings(
+    bytes: &[u8],
+    base: &Url,
+    kind: DocumentKind,
+    framework: FrameworkId,
+    findings: &mut FindingsBuilder,
+) {
+    record_payload_route(base, kind, framework, findings);
+    scan_api_tokens(bytes, framework, findings);
 }
 
 pub fn scan_document(

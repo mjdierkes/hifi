@@ -3,7 +3,7 @@
 use crate::discover::{AssetKind, AssetRef, AssetSource};
 use crate::generated::{
     API_PATH_PREFIXES, SVELTEKIT_CONTEXT_PREFIXES, SVELTEKIT_IMMUTABLE_CHILDREN,
-    SVELTEKIT_SKIP_FRAGMENTS,
+    SVELTEKIT_IS_CONTEXT_MARKERS, SVELTEKIT_SKIP_FRAGMENTS,
 };
 use crate::hash::FxHashSet;
 use crate::framework::FrameworkId;
@@ -20,17 +20,10 @@ pub fn is_context(bytes: &[u8], base: &Url) -> bool {
     base.path().contains("/_app/immutable/")
         || base.path().contains("/immutable/")
         || base.path().ends_with("/__data.json")
-        || source::contains(bytes, b"/_app/immutable/")
-        || source::contains(bytes, b"/immutable/entry/")
-        || source::contains(bytes, b"/immutable/nodes/")
-        || source::contains(bytes, b"/immutable/chunks/")
-        || source::contains(bytes, b"/_app/version.json")
-        || source::contains(bytes, b"__sveltekit_")
-        || source::contains(bytes, b"__SVELTEKIT")
-        || source::contains(bytes, b"data-sveltekit")
-        || source::contains(bytes, b"x-sveltekit-action")
-        || source::contains(bytes, b"x-sveltekit-invalidated")
-        || source::contains(bytes, b"/__data.json")
+        || source::bytes_contain_any_str(bytes, SVELTEKIT_IS_CONTEXT_MARKERS)
+        || SVELTEKIT_IMMUTABLE_CHILDREN
+            .iter()
+            .any(|path| source::contains(bytes, path.as_bytes()))
 }
 
 pub fn should_skip(url: &Url) -> bool {

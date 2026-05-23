@@ -58,6 +58,36 @@ literals = [
   "__remixContext",
 ]
 
+[next.is_context]
+extra = ["/_next/", "__NEXT_DATA__", "self.__next_f.push"]
+
+[nuxt.is_context]
+context = ["__NUXT_DATA__"]
+data = ["_payload.json"]
+extra = ["/_nuxt/"]
+
+[sveltekit.is_context]
+context = ["__sveltekit_"]
+data = ["/__data.json"]
+extra = [
+  "/_app/immutable/",
+  "/immutable/",
+  "/_app/version.json",
+  "__SVELTEKIT",
+  "data-sveltekit",
+  "x-sveltekit-action",
+  "x-sveltekit-invalidated",
+]
+
+[astro.is_context]
+context = ["astro-island"]
+data = ["/_actions/"]
+extra = ["/_astro/", "astro:actions", "_actions/"]
+
+[remix.is_context]
+context = ["__remixContext"]
+extra = ["__remixManifest", "remix-route", "/build/routes/"]
+
 [nuxt.context_prefixes]
 prefixes = ["chunks/", "entry/", "pages/", "components/", "composables/", "plugins/"]
 

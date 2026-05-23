@@ -1,4 +1,5 @@
 use crate::framework::next::NextConfig;
+use crate::generated::{ASTRO_IS_CONTEXT_MARKERS, REMIX_IS_CONTEXT_MARKERS};
 use crate::source;
 use crate::url::Url;
 
@@ -7,19 +8,13 @@ use super::{next, nuxt, sveltekit};
 pub(crate) fn is_astro_context(bytes: &[u8], base: &Url) -> bool {
     base.path().contains("/_astro/")
         || base.path().contains("/_actions/")
-        || source::contains(bytes, b"/_astro/")
-        || source::contains(bytes, b"astro-island")
-        || source::contains(bytes, b"astro:actions")
-        || source::contains(bytes, b"_actions/")
+        || source::bytes_contain_any_str(bytes, ASTRO_IS_CONTEXT_MARKERS)
 }
 
 pub(crate) fn is_remix_context(bytes: &[u8], base: &Url) -> bool {
     base.path().contains("/build/")
         || base.query().is_some_and(|q| q.contains("_data="))
-        || source::contains(bytes, b"window.__remixContext")
-        || source::contains(bytes, b"__remixManifest")
-        || source::contains(bytes, b"remix-route")
-        || source::contains(bytes, b"/build/routes/")
+        || source::bytes_contain_any_str(bytes, REMIX_IS_CONTEXT_MARKERS)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]

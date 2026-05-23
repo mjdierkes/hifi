@@ -58,6 +58,41 @@ fn emit_policies(table: &toml::Table) -> String {
         "CONTEXT_MARKERS",
         str_list(table, &["discover", "context_markers", "literals"]),
     );
+    let context_markers = str_list(table, &["discover", "context_markers", "literals"]);
+    let data_markers = str_list(table, &["discover", "data_markers", "literals"]);
+    emit_is_context_markers(&mut out, table, "next", "NEXT_IS_CONTEXT_MARKERS", &[], &[]);
+    emit_is_context_markers(
+        &mut out,
+        table,
+        "nuxt",
+        "NUXT_IS_CONTEXT_MARKERS",
+        &context_markers,
+        &data_markers,
+    );
+    emit_is_context_markers(
+        &mut out,
+        table,
+        "sveltekit",
+        "SVELTEKIT_IS_CONTEXT_MARKERS",
+        &context_markers,
+        &data_markers,
+    );
+    emit_is_context_markers(
+        &mut out,
+        table,
+        "astro",
+        "ASTRO_IS_CONTEXT_MARKERS",
+        &context_markers,
+        &data_markers,
+    );
+    emit_is_context_markers(
+        &mut out,
+        table,
+        "remix",
+        "REMIX_IS_CONTEXT_MARKERS",
+        &context_markers,
+        &data_markers,
+    );
     emit_str_array(
         &mut out,
         "API_PATH_PREFIXES",
@@ -134,6 +169,55 @@ fn emit_policies(table: &toml::Table) -> String {
 
 fn emit_framework_skip(out: &mut String, name: &str, table: &toml::Table, framework: &str) {
     emit_str_array(out, name, str_list(table, &[framework, "skip", "fragments"]));
+}
+
+fn emit_is_context_markers(
+    out: &mut String,
+    table: &toml::Table,
+    framework: &str,
+    name: &str,
+    context_markers: &[String],
+    data_markers: &[String],
+) {
+    let section = table.get(framework).and_then(|v| v.get("is_context"));
+    let mut items = Vec::new();
+    if let Some(section) = section.and_then(|v| v.as_table()) {
+        for literal in str_list_in(section, &["context"]) {
+            assert!(
+                context_markers.contains(&literal),
+                "{framework}.is_context.context literal {literal:?} missing from discover.context_markers"
+            );
+            items.push(literal);
+        }
+        for literal in str_list_in(section, &["data"]) {
+            assert!(
+                data_markers.contains(&literal),
+                "{framework}.is_context.data literal {literal:?} missing from discover.data_markers"
+            );
+            items.push(literal);
+        }
+        items.extend(str_list_in(section, &["extra"]));
+    }
+    emit_str_array(out, name, items);
+}
+
+fn str_list_in(table: &toml::Table, path: &[&str]) -> Vec<String> {
+    let mut value = toml::Value::Table(table.clone());
+    for key in path {
+        let Some(next) = value.get(*key) else {
+            return Vec::new();
+        };
+        value = next.clone();
+    }
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn emit_client_method_patterns(out: &mut String, table: &toml::Table) {
