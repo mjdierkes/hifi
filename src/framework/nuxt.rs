@@ -17,6 +17,16 @@ const SKIP_FRAGMENTS: &[&str] = &[
     "/_nuxt/vendor",
     "/_nuxt/polyfills",
 ];
+const CONTEXT_PREFIXES: &[&str] = &[
+    "chunks/",
+    "entry/",
+    "pages/",
+    "components/",
+    "composables/",
+    "plugins/",
+];
+const MANIFEST_ENDS_WITH: &[&str] = &["/_nuxt/manifest.json", "/_nuxt/prerendered.json"];
+const MANIFEST_GATED: &[(&str, &str)] = &[("/_nuxt/builds/", ".json")];
 
 pub fn is_context(bytes: &[u8], base: &Url) -> bool {
     base.path().contains("/_nuxt/")
@@ -27,8 +37,7 @@ pub fn is_context(bytes: &[u8], base: &Url) -> bool {
 }
 
 pub fn should_skip(url: &Url) -> bool {
-    let path = url.path();
-    path.contains("/_nuxt/") && super::path_contains_any(path, SKIP_FRAGMENTS)
+    super::resolve::should_skip_fragments(url, "/_nuxt/", SKIP_FRAGMENTS)
 }
 
 pub fn is_payload(raw: &str, path: &str) -> bool {
@@ -38,36 +47,18 @@ pub fn is_payload(raw: &str, path: &str) -> bool {
 }
 
 pub fn is_manifest(path: &str) -> bool {
-    path.contains("/_nuxt/builds/") && source::ends_with_ascii_ignore_case(path, ".json")
-        || source::ends_with_ascii_ignore_case(path, "/_nuxt/manifest.json")
-        || source::ends_with_ascii_ignore_case(path, "/_nuxt/prerendered.json")
+    super::resolve::manifest_matches(path, MANIFEST_ENDS_WITH, &[], MANIFEST_GATED)
 }
 
-pub fn resolve_asset(base: &Url, raw: &str) -> Option<Url> {
-    if raw.starts_with("_nuxt/") {
-        return base.join(&format!("/{raw}")).ok();
-    }
-    None
-}
-
-pub fn resolve_context_asset(base: &Url, raw: &str, context: bool) -> Option<Url> {
-    if !context {
-        return None;
-    }
-    if raw.starts_with("chunks/")
-        || raw.starts_with("entry/")
-        || raw.starts_with("pages/")
-        || raw.starts_with("components/")
-        || raw.starts_with("composables/")
-        || raw.starts_with("plugins/")
-    {
-        return base.join(&format!("/_nuxt/{raw}")).ok();
-    }
-    None
-}
-
-pub fn route_from_payload(base: &Url) -> Option<String> {
-    super::route_from_suffix(base, "/_payload.json")
+pub fn resolve(base: &Url, raw: &str, context: bool) -> Option<Url> {
+    super::resolve::resolve_prefixed_or_under(
+        base,
+        raw,
+        context,
+        "_nuxt/",
+        CONTEXT_PREFIXES,
+        "/_nuxt/",
+    )
 }
 
 pub fn record_routes(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
@@ -78,7 +69,7 @@ pub fn record_routes(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) 
 
 pub fn record_page_route(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
     for key in [b"routePath".as_slice(), b"path".as_slice()] {
-        let Some(route) = string_value_after_key(bytes, key) else {
+        let Some(route) = super::resolve::keyed_string(bytes, key, b":", true) else {
             continue;
         };
         let path = route.split(['?', '#']).next().unwrap_or(&route);
@@ -106,7 +97,9 @@ pub fn push_manifests(
     out: &mut Vec<AssetRef>,
 ) {
     for raw in manifest_candidates(bytes) {
-        let Some(url) = resolve_asset(base, &raw).or_else(|| base.join(&raw).ok()) else {
+        let Some(url) = super::resolve::resolve_prefixed(base, &raw, "_nuxt/")
+            .or_else(|| base.join(&raw).ok())
+        else {
             continue;
         };
         super::push_asset(
@@ -209,9 +202,11 @@ fn endpoint_map_urls(bytes: &[u8]) -> Vec<String> {
 }
 
 fn collect_endpoint_json(bytes: &[u8], out: &mut Vec<String>) {
-    crate::json::walk_strings(bytes, |key, value| {
-        if key.is_some_and(endpoint_key_context) {
-            push_endpoint(out, value);
+    crate::json::walk(bytes, |evt| {
+        if let crate::json::Visit::String(key, value) = evt {
+            if key.is_some_and(endpoint_key_context) {
+                push_endpoint(out, value);
+            }
         }
     });
 }
@@ -227,7 +222,7 @@ fn collect_endpoint_literals(bytes: &[u8], out: &mut Vec<String>) {
         ],
         0,
         |pos, key, _| {
-            if let Some(endpoint) = string_value_after_key(&bytes[pos..], key) {
+            if let Some(endpoint) = super::resolve::keyed_string(&bytes[pos..], key, b":", true) {
                 push_endpoint(out, &endpoint);
             }
         },
@@ -279,7 +274,7 @@ fn runtime_api_bases(bytes: &[u8]) -> Vec<String> {
         ],
         0,
         |pos, key, _| {
-            if let Some(value) = string_value_after_key(&bytes[pos..], key) {
+            if let Some(value) = super::resolve::keyed_string(&bytes[pos..], key, b":", true) {
                 push_runtime_api_base(&mut out, &value);
             }
         },
@@ -371,7 +366,7 @@ fn collect_literal_routes(bytes: &[u8], out: &mut Vec<String>) {
         let mut offset = 0;
         while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
             let pos = offset + rel;
-            if let Some(route) = string_value_after_key(&bytes[pos..], key) {
+            if let Some(route) = super::resolve::keyed_string(&bytes[pos..], key, b":", true) {
                 push_route(out, &route);
             }
             collect_route_strings(&bytes[pos..bytes.len().min(pos + 2048)], out);
@@ -401,7 +396,7 @@ fn push_route(out: &mut Vec<String>, raw: &str) {
 }
 
 pub fn build_id(bytes: &[u8]) -> Option<String> {
-    string_value_after_key(bytes, b"buildId").filter(|value| {
+    super::resolve::keyed_string(bytes, b"buildId", b":", true).filter(|value| {
         (4..=128).contains(&value.len())
             && value
                 .bytes()
@@ -410,18 +405,15 @@ pub fn build_id(bytes: &[u8]) -> Option<String> {
 }
 
 pub fn app_base_url(bytes: &[u8]) -> Option<String> {
-    string_value_after_key(bytes, b"baseURL").filter(|value| value.starts_with('/'))
+    super::resolve::keyed_string(bytes, b"baseURL", b":", true).filter(|value| value.starts_with('/'))
 }
 
 pub fn app_cdn_url(bytes: &[u8]) -> Option<String> {
-    string_value_after_key(bytes, b"cdnURL")
+    super::resolve::keyed_string(bytes, b"cdnURL", b":", true)
         .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
 }
 
 pub fn build_assets_dir(bytes: &[u8]) -> Option<String> {
-    string_value_after_key(bytes, b"buildAssetsDir").filter(|value| value.contains("_nuxt"))
-}
-
-fn string_value_after_key(bytes: &[u8], key: &[u8]) -> Option<String> {
-    source::keyed_string_value(bytes, key, b":", true)
+    super::resolve::keyed_string(bytes, b"buildAssetsDir", b":", true)
+        .filter(|value| value.contains("_nuxt"))
 }

@@ -1,9 +1,19 @@
-# Framework skip fragments and asset literal tables (reference; policy logic lives in framework/mod.rs).
+# Policy literals consumed by build.rs (scan anchors, asset tables, client needles).
 
 [next.skip]
 fragments = [
   "framework-",
   "polyfills-",
+  "webpack-",
+  "main-app-",
+  "_next/static/chunks/_turbopack_",
+  "[turbopack]_runtime",
+  "[next]_internal_",
+  "react-refresh",
+  "next/dist/",
+  "instrumentation-",
+  "app-pages-internals-",
+  "app-client-internals-",
   "/_astro/hoisted.",
   "/build/_shared/",
 ]
@@ -13,3 +23,142 @@ fragments = ["/_astro/hoisted.", "/_astro/polyfills", "/_astro/client."]
 
 [remix.skip]
 fragments = ["/build/_shared/", "/build/manifest-", "/assets/manifest-", "/entry.client-"]
+
+[scan.api_call]
+literals = [
+  "fetch(",
+  "fetch (",
+  "axios.get(",
+  "axios.post(",
+  "axios.put(",
+  "axios.delete(",
+  "axios.patch(",
+  "ky.get(",
+  "ky.post(",
+  "ky.put(",
+  "ky.delete(",
+  "ky.patch(",
+]
+
+[scan.api_candidate]
+literals = ["/api", "/graphql", "/trpc"]
+
+[scan.route_call]
+literals = [
+  "router.push(",
+  "router.replace(",
+  "router.prefetch(",
+  "navigate(",
+]
+
+[scan.route_value]
+literals = ["href", "pathname", "asPath", "action", "formAction"]
+
+[scan.route_start]
+literals = ["\"/", "'/", "`/", "\\\"/", "\\'/"]
+
+[scan.bad_ext]
+exts = [
+  ".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2",
+  ".ttf", ".ico", ".webp", ".avif", ".mp4", ".webm", ".map", ".wasm",
+]
+
+[scan.route_bad_ext]
+exts = [
+  ".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2",
+  ".ttf", ".ico", ".webp", ".avif", ".mp4", ".webm", ".map", ".json", ".txt", ".xml",
+  ".wasm",
+]
+
+[scan.clients.methods]
+verbs = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+
+[[scan.clients.fixed]]
+anchor = "$fetch("
+mode = "first_arg"
+
+[[scan.clients.fixed]]
+anchor = "useFetch("
+mode = "first_arg"
+
+[[scan.clients.fixed]]
+anchor = "useLazyFetch("
+mode = "first_arg"
+
+[[scan.clients.fixed]]
+anchor = "ofetch("
+mode = "first_arg"
+
+[[scan.clients.fixed]]
+anchor = "useRequestFetch()("
+mode = "first_arg"
+
+[[scan.clients.fixed]]
+anchor = "useNuxtApp().$fetch("
+mode = "first_arg"
+
+[[scan.clients.fixed]]
+anchor = "nuxtApp.$fetch("
+mode = "first_arg"
+
+[[scan.clients.fixed]]
+anchor = "ky("
+mode = "first_arg"
+
+[[scan.clients.fixed]]
+anchor = "axios("
+mode = "object"
+
+[[scan.clients.fixed]]
+anchor = "axios.request("
+mode = "object"
+
+[discover.assets]
+literals = [
+  "/_next/static/",
+  "/_nuxt/",
+  "_nuxt/",
+  "/__nuxt_island/",
+  "pages/",
+  "components/",
+  "composables/",
+  "plugins/",
+  "/_app/immutable/",
+  "_app/immutable/",
+  "nodes/",
+  "chunks/",
+  "entry/",
+  "/_astro/",
+  "_astro/",
+  "/_actions/",
+  "/build/routes/",
+  "build/routes/",
+  "routes/",
+  "/assets/routes/",
+  "/assets/",
+  "assets/",
+  "/static/js/",
+  "static/js/",
+  "/static/chunks/",
+  "static/chunks/",
+  "/_next/data/",
+  "?_rsc=",
+  "&_rsc=",
+  "?_data=",
+  "&_data=",
+  ".rsc",
+  "_payload.json",
+  "__data.json",
+]
+
+[discover.data_markers]
+literals = [
+  "/_next/data/",
+  "/_payload.json",
+  "_payload.json",
+  "/__data.json",
+  "__data.json",
+  "?_data=",
+  "&_data=",
+  "/_actions/",
+]

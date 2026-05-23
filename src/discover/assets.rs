@@ -2,63 +2,21 @@
 
 use super::{push_asset, push_candidate, AssetRef, AssetSource, DocumentKind};
 use crate::framework::DetectedSite;
+use crate::generated::{ASSET_LITERALS, DATA_MARKERS};
 use crate::hash::FxHashSet;
 use crate::literal::LiteralSet;
+use crate::scan::anchors::{anchor_bytes_is_match, scan_anchor_bytes, scan_anchors};
 use crate::scan::findings::FindingsBuilder;
 use crate::source::{self, TemplateMode};
 use crate::url::Url;
 use std::sync::LazyLock;
 
-pub(crate) const ASSET_LITERALS: &[&str] = &[
-    "/_next/static/",
-    "/_nuxt/",
-    "_nuxt/",
-    "/__nuxt_island/",
-    "pages/",
-    "components/",
-    "composables/",
-    "plugins/",
-    "/_app/immutable/",
-    "_app/immutable/",
-    "nodes/",
-    "chunks/",
-    "entry/",
-    "/_astro/",
-    "_astro/",
-    "/_actions/",
-    "/build/routes/",
-    "build/routes/",
-    "routes/",
-    "/assets/routes/",
-    "/assets/",
-    "assets/",
-    "/static/js/",
-    "static/js/",
-    "/static/chunks/",
-    "static/chunks/",
-    "/_next/data/",
-    "?_rsc=",
-    "&_rsc=",
-    "?_data=",
-    "&_data=",
-    ".rsc",
-    "_payload.json",
-    "__data.json",
-];
-
-pub(crate) const FRAMEWORK_DATA_MARKERS: &[&[u8]] = &[
-    b"/_next/data/",
-    b"/_payload.json",
-    b"_payload.json",
-    b"/__data.json",
-    b"__data.json",
-    b"?_data=",
-    b"&_data=",
-    b"/_actions/",
-];
-
-pub(crate) static ASSET_LITERALS_SET: LazyLock<LiteralSet<()>> = LazyLock::new(|| {
+static ASSET_LITERALS_SET: LazyLock<LiteralSet<()>> = LazyLock::new(|| {
     LiteralSet::from_strs(ASSET_LITERALS.iter().copied().map(|literal| (literal, ())))
+});
+
+static DATA_MARKER_BYTES: LazyLock<Vec<&'static [u8]>> = LazyLock::new(|| {
+    DATA_MARKERS.iter().map(|marker| marker.as_bytes()).collect()
 });
 
 /// Enumerate static assets in document bytes without running endpoint scan.
@@ -85,9 +43,7 @@ pub(crate) fn is_empty_script(bytes: &[u8], kind: DocumentKind) -> bool {
         && !ASSET_LITERALS_SET.is_match(bytes)
         && !source::contains(bytes, b"import(")
         && !source::contains(bytes, b"new URL(")
-        && !FRAMEWORK_DATA_MARKERS
-            .iter()
-            .any(|marker| source::contains(bytes, marker))
+        && !anchor_bytes_is_match(bytes, &DATA_MARKER_BYTES)
         && !source::contains(bytes, b"__next_f.push")
         && !source::contains(bytes, b"Next-Action")
         && !source::contains(bytes, b"next-action")
@@ -143,19 +99,19 @@ pub(crate) fn scan_literal_assets(
     seen: &mut FxHashSet<Url>,
     out: &mut Vec<AssetRef>,
 ) {
-    for m in ASSET_LITERALS_SET.find_iter(bytes) {
+    scan_anchors(bytes, &ASSET_LITERALS_SET, |m| {
         let start = source::walk_token_start(bytes, m.start());
         if !source::is_string_literal_start(bytes, start) {
-            continue;
+            return;
         }
         let Some(raw) = asset_token_string(bytes, start) else {
-            continue;
+            return;
         };
         if raw.starts_with("/_next/data/") {
             push_candidate(findings, &raw);
         }
         push_asset(base, &raw, contexts, AssetSource::Literal, seen, out);
-    }
+    });
 }
 
 pub(crate) fn scan_dynamic_assets(
@@ -178,17 +134,15 @@ pub(crate) fn scan_dynamic_assets(
 }
 
 pub(crate) fn scan_framework_markers(bytes: &[u8], findings: &mut FindingsBuilder) {
-    for marker in FRAMEWORK_DATA_MARKERS {
-        for pos in memchr::memmem::find_iter(bytes, marker) {
-            let start = source::walk_token_start(bytes, pos);
-            if !source::is_string_literal_start(bytes, start) {
-                continue;
-            }
-            if let Some(raw) = asset_token_string(bytes, start) {
-                super::push_candidate(findings, &raw);
-            }
+    scan_anchor_bytes(bytes, &DATA_MARKER_BYTES, |pos, _| {
+        let start = source::walk_token_start(bytes, pos);
+        if !source::is_string_literal_start(bytes, start) {
+            return;
         }
-    }
+        if let Some(raw) = asset_token_string(bytes, start) {
+            super::push_candidate(findings, &raw);
+        }
+    });
 }
 
 fn scan_tags(bytes: &[u8], needle: &[u8], mut f: impl FnMut(&[u8])) {

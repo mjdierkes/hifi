@@ -1,15 +1,23 @@
 //! HTTP client call-site analyzer ($fetch, axios, ky, etc.).
 
-use super::{classify, extract, findings::Channel, shape, FindingsBuilder, Provenance};
+use super::{anchors::scan_anchor_bytes, extract, findings::Channel, shape, FindingsBuilder, Provenance};
+use crate::generated::{CLIENT_METHODS, FIXED_CLIENT_PATTERNS};
 use crate::hash::FxHashMap;
 use crate::source;
 
 pub(super) fn scan(bytes: &[u8], out: &mut FindingsBuilder) {
     let bindings = collect_string_bindings(bytes);
-    for &(anchor, method, mode) in FIXED_PATTERNS {
-        scan_pattern(bytes, anchor, method, mode, &bindings, out);
+    for pattern in FIXED_CLIENT_PATTERNS {
+        scan_pattern(
+            bytes,
+            pattern.anchor,
+            pattern.method,
+            ClientMode::from_tag(pattern.mode),
+            &bindings,
+            out,
+        );
     }
-    for m in METHODS {
+    for m in CLIENT_METHODS {
         let dollar = format!("$api.${}(", m.to_lowercase());
         scan_pattern(bytes, dollar.as_bytes(), Some(*m), ClientMode::FirstArg, &bindings, out);
         let dot = format!("$api.{}(", m.to_lowercase());
@@ -29,8 +37,8 @@ fn scan_pattern(
     bindings: &FxHashMap<String, String>,
     out: &mut FindingsBuilder,
 ) {
-    for pos in memchr::memmem::find_iter(bytes, anchor) {
-        let after = pos + anchor.len();
+    scan_anchor_bytes(bytes, &[anchor], |pos, needle| {
+        let after = pos + needle.len();
         match mode {
             ClientMode::FirstArg => record_first_arg_client_with_method(
                 bytes,
@@ -45,7 +53,7 @@ fn scan_pattern(
             }
             ClientMode::GenericMethod => {}
         }
-    }
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -55,22 +63,15 @@ enum ClientMode {
     GenericMethod,
 }
 
-type ClientPattern = (&'static [u8], Option<&'static str>, ClientMode);
-
-const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
-
-const FIXED_PATTERNS: &[ClientPattern] = &[
-    (b"$fetch(", None, ClientMode::FirstArg),
-    (b"useFetch(", None, ClientMode::FirstArg),
-    (b"useLazyFetch(", None, ClientMode::FirstArg),
-    (b"ofetch(", None, ClientMode::FirstArg),
-    (b"useRequestFetch()(", None, ClientMode::FirstArg),
-    (b"useNuxtApp().$fetch(", None, ClientMode::FirstArg),
-    (b"nuxtApp.$fetch(", None, ClientMode::FirstArg),
-    (b"ky(", None, ClientMode::FirstArg),
-    (b"axios(", None, ClientMode::Object),
-    (b"axios.request(", None, ClientMode::Object),
-];
+impl ClientMode {
+    fn from_tag(tag: u8) -> Self {
+        match tag {
+            1 => Self::Object,
+            2 => Self::GenericMethod,
+            _ => Self::FirstArg,
+        }
+    }
+}
 
 fn record_first_arg_client_with_method(
     bytes: &[u8],
@@ -82,16 +83,8 @@ fn record_first_arg_client_with_method(
     let Some(url) = first_arg_url(bytes, after, bindings) else {
         return;
     };
-    if !classify::is_url_like(&url) {
-        return;
-    }
-    let mut shape = shape::Shape::inferred(method, false);
-    shape.apply_query_params(&url);
-    out.record_api(
-        classify::normalize_api_url(&url),
-        shape,
-        Provenance::channel(Channel::ApiClient),
-    );
+    let shape = shape::Shape::inferred(method, false);
+    out.try_record_api(url, shape, Provenance::channel(Channel::ApiClient));
 }
 
 fn record_object_client(
@@ -111,21 +104,13 @@ fn record_object_client(
     let Some(url) = object_url_value(obj, &[b"url", b"URL", b"endpoint", b"path"], bindings) else {
         return;
     };
-    if !classify::is_url_like(&url) {
-        return;
-    }
     let method = object_string_value(obj, &[b"method"])
         .or_else(|| method_near(bytes, i).map(str::to_string));
-    let mut shape = shape::Shape::inferred(
+    let shape = shape::Shape::inferred(
         method.as_deref(),
         contains_key(obj, b"data") || contains_key(obj, b"body"),
     );
-    shape.apply_query_params(&url);
-    out.record_api(
-        classify::normalize_api_url(&url),
-        shape,
-        Provenance::channel(Channel::ApiClient),
-    );
+    out.try_record_api(url, shape, Provenance::channel(Channel::ApiClient));
 }
 
 fn collect_string_bindings(bytes: &[u8]) -> FxHashMap<String, String> {
@@ -282,7 +267,7 @@ fn template_with_bindings(
 }
 
 fn useful_binding(value: &str) -> bool {
-    classify::is_url_like(value)
+    super::classify::is_url_like(value)
         || value == "/api"
         || value.starts_with("/api/")
         || value.starts_with("/graphql")

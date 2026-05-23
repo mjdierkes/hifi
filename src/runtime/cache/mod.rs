@@ -1,37 +1,105 @@
-//! Best-effort disk cache.
-//!
-//! Cache failures should not prevent a scan from succeeding. Reads return
-//! `Option` and writes intentionally swallow I/O errors; callers treat cache as
-//! an accelerator, not as required state.
-//!
-//! The cache stores processed scan output, per-site asset scan data plus HTTP
-//! validators, and content-addressed chunk scan data.
+//! Best-effort disk cache for processed scans, asset data, and content-addressed chunks.
 
 use super::cache_writer;
+use super::codec::{
+    decode_frame, document, encode_frame, put_opt_string, put_string, put_string_vec, put_u32,
+    Reader,
+};
 use crate::{
     discover::{AssetKind, AssetRef, AssetSource, DocumentScan},
-    framework::{DetectedSite, FrameworkId},
+    framework::{next::NextConfig, DetectedSite, FrameworkId},
     hash::FxHashMap,
-    framework::next::NextConfig,
     scan::findings::{Channel, Evidence, EvidenceKind, FindingsBuilder, Provenance},
-    scan::Shape,
     url::Url,
 };
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock, RwLock},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 const SCANNER_CACHE_VERSION: &str = env!("HIFI_BUILD_HASH");
+const HIFI3_MAGIC: &[u8; 8] = b"HIFI3\0\0\0";
+
 pub const CACHE_FRESH_SECS: u64 = 300;
 pub const CACHE_STALE_SECS: u64 = 3600;
 pub const CHUNK_URL_FRESH_SECS: u64 = 24 * 60 * 60;
-/// Wide stale window because every stale hit returns instantly and triggers a
-/// background revalidate. Past this point we still revalidate in the
-/// foreground via a conditional GET; the content cache makes that cheap.
 pub const CHUNK_URL_STALE_SECS: u64 = 30 * 24 * 60 * 60;
+
+pub type AssetData = DocumentScan;
+
+#[derive(Clone, Default)]
+pub struct AssetValidators {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+impl AssetValidators {
+    pub fn is_empty(&self) -> bool {
+        self.etag.is_none() && self.last_modified.is_none()
+    }
+}
+
+pub struct CachedAsset {
+    pub data: AssetData,
+    pub age_secs: u64,
+    pub validators: AssetValidators,
+}
+
+#[derive(Clone)]
+pub struct CachedChunk {
+    pub data: Arc<AssetData>,
+    pub validators: AssetValidators,
+    pub content_hash: String,
+}
+
+pub enum CacheAction {
+    Hit(Arc<AssetData>),
+    StaleRevalidate {
+        data: Arc<AssetData>,
+        validators: AssetValidators,
+        content_hash: String,
+    },
+    Revalidate(CachedAsset),
+    Miss,
+}
+
+pub fn resolve_asset(asset: &AssetRef, cache_key: Option<&str>, enabled: bool) -> CacheAction {
+    if !enabled {
+        return CacheAction::Miss;
+    }
+    if asset.kind == AssetKind::Script {
+        if let Some(chunk) = CHUNK.read_url(&asset.url, CHUNK_URL_FRESH_SECS) {
+            return CacheAction::Hit(chunk.data);
+        }
+        if let Some(chunk) = CHUNK.read_url(&asset.url, CHUNK_URL_STALE_SECS) {
+            return CacheAction::StaleRevalidate {
+                data: chunk.data,
+                validators: chunk.validators,
+                content_hash: chunk.content_hash,
+            };
+        }
+    }
+    match read_asset_cached(&asset.url, cache_key) {
+        Some(cached) if cached.age_secs < CACHE_FRESH_SECS => CacheAction::Hit(Arc::new(cached.data)),
+        Some(cached) => CacheAction::Revalidate(cached),
+        None => CacheAction::Miss,
+    }
+}
+
+pub fn persist_asset(
+    url: &Url,
+    cache_key: Option<&str>,
+    data: Arc<AssetData>,
+    validators: &AssetValidators,
+    content_hash: Option<&str>,
+) {
+    write_asset_with_validators_deferred(url, data.clone(), cache_key, validators);
+    if let Some(hash) = content_hash {
+        CHUNK.write_deferred(url, hash, data, validators);
+    }
+}
 
 #[derive(Clone)]
 pub struct ScanCache {
@@ -55,61 +123,33 @@ impl ScanCache {
 
     pub fn write_binary_deferred(&self, bytes: Arc<[u8]>) {
         let path = self.path.clone();
-        spawn_cache_write(move || write_bytes(&path, &bytes));
+        cache_writer::defer(move || write_bytes(&path, &bytes));
     }
 }
 
 #[derive(Clone, Copy, Default)]
 pub struct ChunkCache;
 
+pub const CHUNK: ChunkCache = ChunkCache;
+
 impl ChunkCache {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn read_fresh_url(&self, url: &Url) -> Option<CachedChunk> {
-        self.read_url(url, CHUNK_URL_FRESH_SECS)
-    }
-
-    pub fn read_stale_url(&self, url: &Url) -> Option<CachedChunk> {
-        self.read_url(url, CHUNK_URL_STALE_SECS)
-    }
-
-    fn read_url(&self, url: &Url, max_age_secs: u64) -> Option<CachedChunk> {
-        if let Some(cached) = url_index_memory_get(url, max_age_secs) {
-            return Some(cached);
-        }
-        let (cached, age_secs) = read_chunk_url(url, max_age_secs)?;
-        url_index_memory_put(url, &cached, age_secs);
-        Some(cached)
+    pub fn read_url(&self, url: &Url, max_age_secs: u64) -> Option<CachedChunk> {
+        read_mem_disk(
+            || url_index_memory_get(url, max_age_secs),
+            || read_chunk_disk(url, max_age_secs),
+            |cached, age| url_index_memory_put(url, &cached, age),
+        )
     }
 
     pub fn read_content_findings(&self, content_hash: &str) -> Option<FindingsBuilder> {
-        if let Some(findings) = content_memory_get(content_hash) {
-            // Memory cache stores Arc<FindingsBuilder> so the hot path is a
-            // pointer clone, not a deep clone of the findings struct.
-            return Some((*findings).clone());
-        }
-        let findings = read_chunk_findings(content_hash)?;
-        content_memory_put(content_hash, &findings);
-        Some(findings)
+        read_mem_disk(
+            || content_memory_get(content_hash).map(|f| (*f).clone()),
+            || read_chunk_findings(content_hash).map(|f| (f, 0)),
+            |findings, _| content_memory_put(content_hash, &findings),
+        )
     }
 
     pub fn write_deferred(
-        &self,
-        url: &Url,
-        content_hash: &str,
-        asset: Arc<AssetData>,
-        validators: &AssetValidators,
-    ) {
-        self.remember(url, content_hash, asset.clone(), validators);
-        let url = url.clone();
-        let content_hash = content_hash.to_owned();
-        let validators = validators.clone();
-        spawn_cache_write(move || write_chunk(&url, &content_hash, &asset, &validators));
-    }
-
-    fn remember(
         &self,
         url: &Url,
         content_hash: &str,
@@ -120,13 +160,30 @@ impl ChunkCache {
         url_index_memory_put(
             url,
             &CachedChunk {
-                data: asset,
+                data: asset.clone(),
                 validators: validators.clone(),
                 content_hash: content_hash.to_owned(),
             },
             0,
         );
+        let url = url.clone();
+        let content_hash = content_hash.to_owned();
+        let validators = validators.clone();
+        cache_writer::defer(move || write_chunk(&url, &content_hash, &asset, &validators));
     }
+}
+
+fn read_mem_disk<T: Clone>(
+    mem: impl FnOnce() -> Option<T>,
+    disk: impl FnOnce() -> Option<(T, u64)>,
+    store: impl FnOnce(T, u64),
+) -> Option<T> {
+    if let Some(value) = mem() {
+        return Some(value);
+    }
+    let (value, age) = disk()?;
+    store(value.clone(), age);
+    Some(value)
 }
 
 #[derive(Clone)]
@@ -135,54 +192,38 @@ struct UrlIndexEntry {
     inserted_at: SystemTime,
 }
 
-// Conservative caps: each entry holds a full DocumentScan or findings struct,
-// which can run into tens of KB on big chunks. Disk remains the source of truth
-// when the process-local accelerator is cleared.
 const URL_INDEX_MEMORY_MAX_ENTRIES: usize = 1024;
 const CONTENT_MEMORY_MAX_ENTRIES: usize = 512;
 
-/// Process-wide in-memory cache: chunk URL -> latest known index entry.
-fn url_index_memory() -> &'static RwLock<BoundedMemory<UrlIndexEntry>> {
-    static MEMORY: OnceLock<RwLock<BoundedMemory<UrlIndexEntry>>> = OnceLock::new();
-    MEMORY.get_or_init(|| RwLock::new(BoundedMemory::new(URL_INDEX_MEMORY_MAX_ENTRIES)))
+macro_rules! memory_store {
+    ($name:ident, $val:ty, $cap:expr) => {
+        fn $name() -> &'static RwLock<BoundedMemory<$val>> {
+            static MEMORY: OnceLock<RwLock<BoundedMemory<$val>>> = OnceLock::new();
+            MEMORY.get_or_init(|| RwLock::new(BoundedMemory::new($cap)))
+        }
+    };
 }
 
+memory_store!(url_index_memory, UrlIndexEntry, URL_INDEX_MEMORY_MAX_ENTRIES);
+memory_store!(content_memory, Arc<FindingsBuilder>, CONTENT_MEMORY_MAX_ENTRIES);
+
 fn url_index_memory_get(url: &Url, max_age_secs: u64) -> Option<CachedChunk> {
-    let mut map = url_index_memory().write().ok()?;
-    let entry = map.get(url.as_str())?.clone();
+    let entry = url_index_memory().write().ok()?.get(url.as_str())?.clone();
     (cache_age_secs(entry.inserted_at) < max_age_secs).then_some(entry.cached)
 }
 
 fn url_index_memory_put(url: &Url, cached: &CachedChunk, age_secs: u64) {
-    let Ok(mut map) = url_index_memory().write() else {
-        return;
-    };
-    map.put(
-        url.as_str().to_owned(),
-        UrlIndexEntry {
-            cached: cached.clone(),
-            inserted_at: SystemTime::now()
-                .checked_sub(std::time::Duration::from_secs(age_secs))
-                .unwrap_or_else(SystemTime::now),
-        },
-    );
-}
-
-fn cache_age_secs(inserted_at: SystemTime) -> u64 {
-    SystemTime::now()
-        .duration_since(inserted_at)
-        .map(|d| d.as_secs())
-        .unwrap_or(u64::MAX)
-}
-
-/// Process-wide in-memory cache: content_hash -> findings.
-///
-/// Different URLs serving identical chunk bytes (same framework version across
-/// sites) collapse to a single entry. Values are reference-counted so hits are
-/// pointer clones, not deep copies of the findings struct.
-fn content_memory() -> &'static RwLock<BoundedMemory<Arc<FindingsBuilder>>> {
-    static MEMORY: OnceLock<RwLock<BoundedMemory<Arc<FindingsBuilder>>>> = OnceLock::new();
-    MEMORY.get_or_init(|| RwLock::new(BoundedMemory::new(CONTENT_MEMORY_MAX_ENTRIES)))
+    if let Ok(mut map) = url_index_memory().write() {
+        map.put(
+            url.as_str().to_owned(),
+            UrlIndexEntry {
+                cached: cached.clone(),
+                inserted_at: SystemTime::now()
+                    .checked_sub(Duration::from_secs(age_secs))
+                    .unwrap_or_else(SystemTime::now),
+            },
+        );
+    }
 }
 
 fn content_memory_get(content_hash: &str) -> Option<Arc<FindingsBuilder>> {
@@ -190,10 +231,16 @@ fn content_memory_get(content_hash: &str) -> Option<Arc<FindingsBuilder>> {
 }
 
 fn content_memory_put(content_hash: &str, findings: &FindingsBuilder) {
-    let Ok(mut map) = content_memory().write() else {
-        return;
-    };
-    map.put(content_hash.to_owned(), Arc::new(findings.clone()));
+    if let Ok(mut map) = content_memory().write() {
+        map.put(content_hash.to_owned(), Arc::new(findings.clone()));
+    }
+}
+
+fn cache_age_secs(inserted_at: SystemTime) -> u64 {
+    SystemTime::now()
+        .duration_since(inserted_at)
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX)
 }
 
 struct BoundedMemory<V> {
@@ -234,111 +281,66 @@ fn hash_parts<'a>(parts: impl Iterator<Item = &'a str>) -> u64 {
     h
 }
 
-pub type AssetData = DocumentScan;
-
-#[derive(Clone, Default)]
-pub struct AssetValidators {
-    pub etag: Option<String>,
-    pub last_modified: Option<String>,
-}
-
-impl AssetValidators {
-    pub fn is_empty(&self) -> bool {
-        self.etag.is_none() && self.last_modified.is_none()
-    }
-}
-
-pub struct CachedAsset {
-    pub data: AssetData,
-    pub age_secs: u64,
-    pub validators: AssetValidators,
-}
-
-#[derive(Clone)]
-pub struct CachedChunk {
-    pub data: Arc<AssetData>,
-    pub validators: AssetValidators,
-    pub content_hash: String,
-}
-
-const HIFI3_MAGIC: &[u8; 8] = b"HIFI3\0\0\0";
-
 fn encode_cached_scan(
-    magic: &[u8; 8],
     validators: &AssetValidators,
     content_hash: Option<&str>,
     data: &AssetData,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.findings.evidence.len() * 48 + 160);
-    out.extend_from_slice(magic);
-    put_validators(&mut out, validators);
-    if let Some(content_hash) = content_hash {
-        super::codec::wire::put_string(&mut out, content_hash);
-    }
-    put_document_scan(&mut out, data);
-    out
+    encode_frame(HIFI3_MAGIC, data.findings.evidence.len() * 48 + 160, |out| {
+        put_opt_string(out, validators.etag.as_deref());
+        put_opt_string(out, validators.last_modified.as_deref());
+        if let Some(content_hash) = content_hash {
+            put_string(out, content_hash);
+        }
+        put_document_scan(out, data);
+    })
 }
 
 fn decode_cached_scan(
     bytes: &[u8],
-    magic: &[u8; 8],
     has_content_hash: bool,
 ) -> Option<(AssetValidators, Option<String>, AssetData)> {
-    let mut r = super::codec::wire::Reader::new(bytes);
-    (r.take_exact(magic.len())? == magic).then_some(())?;
-    let validators = read_validators(&mut r)?;
-    let content_hash = if has_content_hash {
-        Some(r.string()?)
-    } else {
-        None
-    };
-    let data = read_document_scan(&mut r)?;
-    r.finish()?;
-    Some((validators, content_hash, data))
+    decode_frame(bytes, HIFI3_MAGIC, |r| {
+        let validators = AssetValidators {
+            etag: r.opt_string()?,
+            last_modified: r.opt_string()?,
+        };
+        let content_hash = if has_content_hash {
+            Some(r.string()?)
+        } else {
+            None
+        };
+        Some((validators, content_hash, read_document_scan(r)?))
+    })
 }
 
 fn encode_findings(findings: &FindingsBuilder) -> Vec<u8> {
-    let mut out = Vec::with_capacity(findings.evidence.len() * 48 + 16);
-    out.extend_from_slice(HIFI3_MAGIC);
-    put_evidence_vec(&mut out, &findings.evidence);
-    out
+    encode_frame(HIFI3_MAGIC, findings.evidence.len() * 48 + 16, |out| {
+        put_evidence_vec(out, &findings.evidence);
+    })
 }
 
 fn decode_findings(bytes: &[u8]) -> Option<FindingsBuilder> {
-    let mut r = super::codec::wire::Reader::new(bytes);
-    (r.take_exact(HIFI3_MAGIC.len())? == HIFI3_MAGIC).then_some(())?;
-    let findings = FindingsBuilder {
-        evidence: read_evidence_vec(&mut r)?,
-    };
-    r.finish()?;
-    Some(findings)
-}
-
-fn put_validators(out: &mut Vec<u8>, validators: &AssetValidators) {
-    super::codec::wire::put_opt_string(out, validators.etag.as_deref());
-    super::codec::wire::put_opt_string(out, validators.last_modified.as_deref());
-}
-
-fn read_validators(r: &mut super::codec::wire::Reader<'_>) -> Option<AssetValidators> {
-    Some(AssetValidators {
-        etag: r.opt_string()?,
-        last_modified: r.opt_string()?,
+    decode_frame(bytes, HIFI3_MAGIC, |r| {
+        Some(FindingsBuilder {
+            evidence: read_evidence_vec(r)?,
+        })
     })
 }
 
 fn put_document_scan(out: &mut Vec<u8>, data: &DocumentScan) {
     put_evidence_vec(out, &data.findings.evidence);
-    super::codec::wire::put_opt_string(out, data.revision.as_deref());
+    put_opt_string(out, data.revision.as_deref());
     put_site(out, &data.site);
-    super::codec::wire::put_u32(out, data.assets.len());
+    put_u32(out, data.assets.len());
     for asset in &data.assets {
-        super::codec::wire::put_string(out, asset.url.as_str());
+        put_string(out, asset.url.as_str());
         out.push(asset_kind_to_u8(asset.kind));
         out.push(asset_source_to_u8(asset.source));
     }
 }
 
-fn read_document_scan(r: &mut super::codec::wire::Reader<'_>) -> Option<DocumentScan> {
+fn read_document_scan(r: &mut Reader<'_>) -> Option<DocumentScan> {
     let evidence = read_evidence_vec(r)?;
     let revision = r.opt_string()?;
     let site = read_site(r)?;
@@ -360,9 +362,9 @@ fn read_document_scan(r: &mut super::codec::wire::Reader<'_>) -> Option<Document
 }
 
 fn put_evidence_vec(out: &mut Vec<u8>, evidence: &[Evidence]) {
-    super::codec::wire::put_u32(out, evidence.len());
+    put_u32(out, evidence.len());
     for item in evidence {
-        super::codec::wire::put_string(out, &item.url);
+        put_string(out, &item.url);
         out.push(evidence_kind_to_u8(item.kind));
         out.push(item.provenance.channel as u8);
         out.push(
@@ -374,14 +376,14 @@ fn put_evidence_vec(out: &mut Vec<u8>, evidence: &[Evidence]) {
         match &item.shape {
             Some(shape) => {
                 out.push(1);
-                super::codec::document::put_shape(out, shape);
+                document::put_shape(out, shape);
             }
             None => out.push(0),
         }
     }
 }
 
-fn read_evidence_vec(r: &mut super::codec::wire::Reader<'_>) -> Option<Vec<Evidence>> {
+fn read_evidence_vec(r: &mut Reader<'_>) -> Option<Vec<Evidence>> {
     let len = r.u32()? as usize;
     let mut evidence = Vec::with_capacity(len);
     for _ in 0..len {
@@ -398,7 +400,7 @@ fn read_evidence_vec(r: &mut super::codec::wire::Reader<'_>) -> Option<Vec<Evide
         };
         let shape = match r.u8()? {
             0 => None,
-            1 => Some(super::codec::document::read_shape(r)?),
+            1 => Some(document::read_shape(r)?),
             _ => return None,
         };
         evidence.push(Evidence {
@@ -435,19 +437,19 @@ fn put_site(out: &mut Vec<u8>, site: &DetectedSite) {
         None => out.push(0),
         Some(config) => {
             out.push(1);
-            super::codec::wire::put_opt_string(out, config.build_id.as_deref());
-            super::codec::wire::put_opt_string(out, config.asset_prefix.as_deref());
-            super::codec::wire::put_opt_string(out, config.base_path.as_deref());
-            super::codec::wire::put_string_vec(out, &config.locales);
-            super::codec::wire::put_opt_string(out, config.default_locale.as_deref());
-            super::codec::wire::put_opt_string(out, config.locale.as_deref());
-            super::codec::wire::put_opt_string(out, config.page.as_deref());
+            put_opt_string(out, config.build_id.as_deref());
+            put_opt_string(out, config.asset_prefix.as_deref());
+            put_opt_string(out, config.base_path.as_deref());
+            put_string_vec(out, &config.locales);
+            put_opt_string(out, config.default_locale.as_deref());
+            put_opt_string(out, config.locale.as_deref());
+            put_opt_string(out, config.page.as_deref());
         }
     }
-    super::codec::wire::put_opt_string(out, site.sveltekit_immutable_root.as_deref());
+    put_opt_string(out, site.sveltekit_immutable_root.as_deref());
 }
 
-fn read_site(r: &mut super::codec::wire::Reader<'_>) -> Option<DetectedSite> {
+fn read_site(r: &mut Reader<'_>) -> Option<DetectedSite> {
     let mut active = [false; 5];
     for slot in &mut active {
         *slot = r.u8()? != 0;
@@ -499,7 +501,7 @@ u8_codec!(asset_source_to_u8, asset_source_from_u8, AssetSource, {
 pub fn read_asset_cached(url: &Url, cache_key: Option<&str>) -> Option<CachedAsset> {
     let path = asset_path_for(url, cache_key);
     let (bytes, age_secs) = read_fresh(&path, CACHE_STALE_SECS)?;
-    let (validators, _, data) = decode_cached_scan(&bytes, HIFI3_MAGIC, false)?;
+    let (validators, _, data) = decode_cached_scan(&bytes, false)?;
     Some(CachedAsset {
         data,
         age_secs,
@@ -513,10 +515,9 @@ pub(crate) fn write_asset_with_validators(
     cache_key: Option<&str>,
     validators: &AssetValidators,
 ) {
-    let path = asset_path_for(url, cache_key);
     write_bytes(
-        &path,
-        &encode_cached_scan(HIFI3_MAGIC, validators, None, asset),
+        &asset_path_for(url, cache_key),
+        &encode_cached_scan(validators, None, asset),
     );
 }
 
@@ -528,11 +529,8 @@ pub fn write_asset_with_validators_deferred(
 ) {
     let path = asset_path_for(url, cache_key);
     let validators = validators.clone();
-    spawn_cache_write(move || {
-        write_bytes(
-            &path,
-            &encode_cached_scan(HIFI3_MAGIC, &validators, None, &asset),
-        );
+    cache_writer::defer(move || {
+        write_bytes(&path, &encode_cached_scan(&validators, None, &asset));
     });
 }
 
@@ -548,7 +546,7 @@ fn write_chunk(url: &Url, content_hash: &str, asset: &AssetData, validators: &As
     );
     write_bytes(
         &chunk_index_path_for(url),
-        &encode_cached_scan(HIFI3_MAGIC, validators, Some(content_hash), asset),
+        &encode_cached_scan(validators, Some(content_hash), asset),
     );
 }
 
@@ -556,9 +554,9 @@ fn asset_path_for(url: &Url, cache_key: Option<&str>) -> PathBuf {
     scanner_hashed_path("assets", url, cache_key, "bin")
 }
 
-fn read_chunk_url(url: &Url, max_age_secs: u64) -> Option<(CachedChunk, u64)> {
+fn read_chunk_disk(url: &Url, max_age_secs: u64) -> Option<(CachedChunk, u64)> {
     let (bytes, age_secs) = read_fresh(&chunk_index_path_for(url), max_age_secs)?;
-    let (validators, content_hash, data) = decode_cached_scan(&bytes, HIFI3_MAGIC, true)?;
+    let (validators, content_hash, data) = decode_cached_scan(&bytes, true)?;
     Some((
         CachedChunk {
             data: Arc::new(data),
@@ -567,10 +565,6 @@ fn read_chunk_url(url: &Url, max_age_secs: u64) -> Option<(CachedChunk, u64)> {
         },
         age_secs,
     ))
-}
-
-fn spawn_cache_write(write: impl FnOnce() + Send + 'static) {
-    cache_writer::defer(write);
 }
 
 fn chunk_index_path_for(url: &Url) -> PathBuf {
@@ -653,19 +647,19 @@ fn dir() -> &'static Path {
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn platform_cache_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Caches/hifi"))
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn platform_cache_dir() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|s| !s.is_empty()) {
-        return Some(PathBuf::from(xdg).join("hifi"));
+    #[cfg(target_os = "macos")]
+    {
+        return Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Caches/hifi"));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".cache").join("hifi"))
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|s| !s.is_empty()) {
+            return Some(PathBuf::from(xdg).join("hifi"));
+        }
+        Some(PathBuf::from(std::env::var_os("HOME")?).join(".cache").join("hifi"))
+    }
 }
 
 #[cfg(windows)]
@@ -769,15 +763,14 @@ mod tests {
         let content_hash =
             crate::hash::hash128_hex(br#"fetch("/api/shared");"static/chunks/child.js""#);
 
-        let chunks = ChunkCache::new();
-        chunks.write_deferred(&url, &content_hash, Arc::new(scan), &validators);
-        let cached = chunks.read_fresh_url(&url).unwrap();
+        CHUNK.write_deferred(&url, &content_hash, Arc::new(scan), &validators);
+        let cached = CHUNK.read_url(&url, CHUNK_URL_FRESH_SECS).unwrap();
 
         assert_eq!(cached.validators.etag.as_deref(), Some(r#""framework-v1""#));
         assert_eq!(cached.content_hash, content_hash);
         assert!(cached.data.findings.api_map().contains_key("/api/shared"));
         assert_eq!(cached.data.assets.len(), 1);
-        assert!(chunks
+        assert!(CHUNK
             .read_content_findings(&content_hash)
             .unwrap()
             .api_map()

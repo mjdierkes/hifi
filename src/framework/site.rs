@@ -4,7 +4,7 @@ use crate::url::Url;
 
 use super::{next, nuxt, sveltekit};
 
-fn is_astro_context(bytes: &[u8], base: &Url) -> bool {
+pub(crate) fn is_astro_context(bytes: &[u8], base: &Url) -> bool {
     base.path().contains("/_astro/")
         || base.path().contains("/_actions/")
         || source::contains(bytes, b"/_astro/")
@@ -13,7 +13,7 @@ fn is_astro_context(bytes: &[u8], base: &Url) -> bool {
         || source::contains(bytes, b"_actions/")
 }
 
-fn is_remix_context(bytes: &[u8], base: &Url) -> bool {
+pub(crate) fn is_remix_context(bytes: &[u8], base: &Url) -> bool {
     base.path().contains("/build/")
         || base.query().is_some_and(|q| q.contains("_data="))
         || source::contains(bytes, b"window.__remixContext")

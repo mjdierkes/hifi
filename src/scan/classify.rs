@@ -1,4 +1,4 @@
-use super::literals::{BAD_EXTS, ROUTE_BAD_EXTS};
+use crate::generated::{BAD_EXTS, ROUTE_BAD_EXTS};
 
 // API candidates are values that look useful but were not observed as a call
 // target. They stay separate from confirmed APIs so output can preserve

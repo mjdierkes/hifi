@@ -1,10 +1,6 @@
-use super::literals::{
-    CALL_LITERALS, ROUTE_CALL_LITERALS, ROUTE_START_LITERALS, ROUTE_VALUE_LITERALS,
-};
+use crate::generated;
 use crate::literal::LiteralSet;
 use std::sync::LazyLock;
-
-const CANDIDATE_LITERALS: &[&str] = &["/api", "/graphql", "/trpc"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PatternKind {
@@ -15,38 +11,32 @@ pub(crate) enum PatternKind {
     RouteStart,
 }
 
-// Each literal declares the kind of evidence it represents. That keeps the
-// Aho-Corasick index from becoming hidden control flow.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SearchPattern {
     pub(crate) literal: &'static str,
     pub(crate) kind: PatternKind,
 }
 
-const PATTERN_GROUPS: &[(&[&str], PatternKind)] = &[
-    (CALL_LITERALS, PatternKind::ApiCall),
-    (CANDIDATE_LITERALS, PatternKind::ApiCandidate),
-    (ROUTE_CALL_LITERALS, PatternKind::RouteCall),
-    (ROUTE_VALUE_LITERALS, PatternKind::RouteValue),
-    (ROUTE_START_LITERALS, PatternKind::RouteStart),
-];
-
-pub(crate) static DOCUMENT_PATTERNS: LazyLock<Vec<SearchPattern>> = LazyLock::new(|| {
-    PATTERN_GROUPS
-        .iter()
-        .flat_map(|(literals, kind)| {
-            literals.iter().map(|literal| SearchPattern {
-                literal,
-                kind: *kind,
-            })
-        })
-        .collect()
-});
+impl PatternKind {
+    fn from_tag(tag: u8) -> Self {
+        match tag {
+            0 => Self::ApiCall,
+            1 => Self::ApiCandidate,
+            2 => Self::RouteCall,
+            3 => Self::RouteValue,
+            _ => Self::RouteStart,
+        }
+    }
+}
 
 pub(crate) static DOCUMENT_LITERALS: LazyLock<LiteralSet<SearchPattern>> = LazyLock::new(|| {
-    LiteralSet::from_strs(
-        DOCUMENT_PATTERNS
-            .iter()
-            .map(|pattern| (pattern.literal, *pattern)),
-    )
+    LiteralSet::from_strs(generated::DOCUMENT_PATTERNS.iter().map(|&(literal, tag)| {
+        (
+            literal,
+            SearchPattern {
+                literal,
+                kind: PatternKind::from_tag(tag),
+            },
+        )
+    }))
 });

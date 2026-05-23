@@ -159,14 +159,13 @@ pub fn resolve_asset(base: &Url, raw: &str, context: bool) -> Option<Url> {
         return base.join(raw).ok();
     }
     if raw.starts_with("static/") && context {
-        return base.join(&format!("/_next/{raw}")).ok();
+        return super::resolve::resolve_under(base, raw, true, &["static/"], "/_next/");
     }
     None
 }
 
 pub fn should_skip(url: &Url) -> bool {
-    let path = url.path();
-    path.contains("/_next/") && super::path_contains_any(path, NEXT_SKIP_FRAGMENTS)
+    super::resolve::should_skip_fragments(url, "/_next/", NEXT_SKIP_FRAGMENTS)
 }
 
 pub fn is_manifest(path: &str) -> bool {

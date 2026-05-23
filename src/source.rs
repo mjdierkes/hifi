@@ -306,14 +306,12 @@ pub fn is_identifier_boundary(bytes: &[u8], pos: usize, len: usize) -> bool {
             .is_none_or(|b| !is_identifier_continue(*b))
 }
 
-pub fn keyed_string_value(
-    bytes: &[u8],
-    key: &[u8],
-    separators: &[u8],
-    allow_quoted_key: bool,
-) -> Option<String> {
+pub(crate) fn each_field(bytes: &[u8], key: &[u8], separators: &[u8], allow_quoted_key: bool, mut visit: impl FnMut(usize) -> bool) {
     let mut offset = 0;
-    while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
+    while offset < bytes.len() {
+        let Some(rel) = memchr::memmem::find(&bytes[offset..], key) else {
+            break;
+        };
         let pos = offset + rel;
         offset = pos + key.len();
         if !is_identifier_boundary(bytes, pos, key.len()) {
@@ -329,15 +327,31 @@ pub fn keyed_string_value(
         } else if matches!(bytes.get(i), Some(b'"' | b'\'')) {
             continue;
         }
-        if !bytes.get(i).is_some_and(|b| separators.contains(b)) {
+        if !bytes.get(i).is_some_and(|b| separators.contains(&b)) {
             continue;
         }
-        i = skip_ws(bytes, i + 1);
-        if let Some(value) = quoted_string_at(bytes, i, TemplateMode::Preserve) {
-            return Some(value);
+        if visit(skip_ws(bytes, i + 1)) {
+            return;
         }
     }
-    None
+}
+
+pub fn field_string(bytes: &[u8], key: &[u8], separators: &[u8], allow_quoted_key: bool) -> Option<String> {
+    let mut out = None;
+    each_field(bytes, key, separators, allow_quoted_key, |i| {
+        out = quoted_string_at(bytes, i, TemplateMode::Preserve);
+        true
+    });
+    out
+}
+
+pub fn scan_field_strings(bytes: &[u8], key: &[u8], separators: &[u8], allow_quoted_key: bool, mut visit: impl FnMut(String)) {
+    each_field(bytes, key, separators, allow_quoted_key, |i| {
+        if let Some(value) = quoted_string_at(bytes, i, TemplateMode::Preserve) {
+            visit(value);
+        }
+        false
+    });
 }
 
 pub fn balanced_end(bytes: &[u8], open: usize) -> Option<usize> {

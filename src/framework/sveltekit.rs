@@ -15,6 +15,15 @@ const SKIP_FRAGMENTS: &[&str] = &[
     "/_app/immutable/chunks/runtime.",
     "/_app/immutable/chunks/vendor",
 ];
+const CONTEXT_PREFIXES: &[&str] = &["nodes/", "chunks/", "entry/", "assets/"];
+const IMMUTABLE_CHILD_PATHS: &[&str] = &[
+    "/immutable/entry/",
+    "/immutable/nodes/",
+    "/immutable/chunks/",
+    "/immutable/assets/",
+];
+const MANIFEST_ENDS_WITH: &[&str] = &["/_app/version.json"];
+const MANIFEST_GATED: &[(&str, &str)] = &[("/immutable/", "/version.json")];
 
 pub fn is_context(bytes: &[u8], base: &Url) -> bool {
     base.path().contains("/_app/immutable/")
@@ -34,52 +43,30 @@ pub fn is_context(bytes: &[u8], base: &Url) -> bool {
 }
 
 pub fn should_skip(url: &Url) -> bool {
-    let path = url.path();
-    path.contains("/immutable/") && super::path_contains_any(path, SKIP_FRAGMENTS)
+    super::resolve::should_skip_fragments(url, "/immutable/", SKIP_FRAGMENTS)
 }
 
 pub fn is_manifest(path: &str) -> bool {
-    source::ends_with_ascii_ignore_case(path, "/_app/version.json")
-        || (source::ends_with_ascii_ignore_case(path, "/version.json")
-            && path.contains("/immutable/"))
+    super::resolve::manifest_matches(path, MANIFEST_ENDS_WITH, &[], MANIFEST_GATED)
 }
 
 pub fn is_payload(raw: &str, path: &str) -> bool {
     source::ends_with_ascii_ignore_case(path, "/__data.json") || raw.contains("/__data.json?")
 }
 
-pub fn resolve_asset(base: &Url, raw: &str) -> Option<Url> {
-    if raw.starts_with("_app/") {
-        return base.join(&format!("/{raw}")).ok();
-    }
-    None
-}
-
-pub fn resolve_context_asset(
+pub fn resolve(
     base: &Url,
     raw: &str,
     context: bool,
     immutable_root: Option<&str>,
 ) -> Option<Url> {
-    if !context {
-        return None;
-    }
-    if raw.starts_with("nodes/")
-        || raw.starts_with("chunks/")
-        || raw.starts_with("entry/")
-        || raw.starts_with("assets/")
-    {
+    super::resolve::resolve_prefixed(base, raw, "_app/").or_else(|| {
         let root = immutable_root
             .map(str::to_owned)
             .or_else(|| observed_immutable_root(base))
             .unwrap_or_else(|| "/_app/immutable/".to_owned());
-        return base.join(&format!("{root}{raw}")).ok();
-    }
-    None
-}
-
-pub fn route_from_payload(base: &Url) -> Option<String> {
-    super::route_from_suffix(base, "/__data.json")
+        super::resolve::resolve_under(base, raw, context, CONTEXT_PREFIXES, &root)
+    })
 }
 
 pub fn data_path_for_route(route: &str) -> Option<String> {
@@ -163,9 +150,9 @@ pub fn primary_immutable_root(bytes: &[u8], base: &Url) -> Option<String> {
 }
 
 pub fn base_path(bytes: &[u8]) -> Option<String> {
-    string_value_after_key(bytes, b"base")
-        .or_else(|| string_value_after_key(bytes, b"baseUrl"))
-        .or_else(|| string_value_after_key(bytes, b"paths.base"))
+    super::resolve::keyed_string(bytes, b"base", b":=", false)
+        .or_else(|| super::resolve::keyed_string(bytes, b"baseUrl", b":=", false))
+        .or_else(|| super::resolve::keyed_string(bytes, b"paths.base", b":=", false))
         .filter(|value| value.starts_with('/') && !value.starts_with("//"))
 }
 
@@ -200,9 +187,11 @@ pub fn record_form_actions(bytes: &[u8], base: &Url, findings: &mut crate::scan:
 
 pub fn record_data_dependencies(bytes: &[u8], findings: &mut crate::scan::FindingsBuilder) {
     let slice = super::json_slice(bytes);
-    crate::json::walk_strings(slice, |key, value| {
-        if key.is_some_and(dependency_key_context) {
-            record_dependency_url(value, findings);
+    crate::json::walk(slice, |evt| {
+        if let crate::json::Visit::String(key, value) = evt {
+            if key.is_some_and(dependency_key_context) {
+                record_dependency_url(value, findings);
+            }
         }
     });
     collect_literal_dependency_values(bytes, findings);
@@ -248,41 +237,25 @@ fn app_root_from_immutable(root: &str) -> Option<String> {
 }
 
 fn collect_literal_immutable_roots(bytes: &[u8], out: &mut Vec<String>) {
-    super::scan_string_tokens(
-        bytes,
-        &[
-            b"/immutable/entry/".as_slice(),
-            b"/immutable/nodes/".as_slice(),
-            b"/immutable/chunks/".as_slice(),
-            b"/immutable/assets/".as_slice(),
-        ],
-        TemplateMode::Preserve,
-        |raw| {
-            let Some(root) = root_before_immutable_child(raw) else {
-                return;
-            };
-            out.push(root);
-        },
-    );
+    for child in IMMUTABLE_CHILD_PATHS {
+        super::scan_string_tokens(bytes, &[child.as_bytes()], TemplateMode::Preserve, |raw| {
+            if let Some(root) = root_before_immutable_child(raw) {
+                out.push(root);
+            }
+        });
+    }
 }
 
 fn root_before_immutable_child(raw: &str) -> Option<String> {
-    for child in [
-        "/immutable/entry/",
-        "/immutable/nodes/",
-        "/immutable/chunks/",
-        "/immutable/assets/",
-    ] {
-        if let Some(pos) = raw.find(child) {
-            return Some(raw[..pos + "/immutable/".len()].to_owned());
-        }
-    }
-    None
+    IMMUTABLE_CHILD_PATHS.iter().find_map(|child| {
+        raw.find(child)
+            .map(|pos| raw[..pos + "/immutable/".len()].to_owned())
+    })
 }
 
 fn app_dir(bytes: &[u8]) -> Option<String> {
-    string_value_after_key(bytes, b"appDir")
-        .or_else(|| string_value_after_key(bytes, b"app_dir"))
+    super::resolve::keyed_string(bytes, b"appDir", b":=", false)
+        .or_else(|| super::resolve::keyed_string(bytes, b"app_dir", b":=", false))
         .filter(|value| {
             !value.is_empty()
                 && !value.contains("..")
@@ -292,10 +265,6 @@ fn app_dir(bytes: &[u8]) -> Option<String> {
         })
 }
 
-fn string_value_after_key(bytes: &[u8], key: &[u8]) -> Option<String> {
-    source::keyed_string_value(bytes, key, b":=", false)
-}
-
 fn collect_literal_routes(bytes: &[u8], out: &mut Vec<String>) {
     collect_keyed_literal_routes(bytes, out);
     collect_route_id_literals(bytes, out);
@@ -303,32 +272,8 @@ fn collect_literal_routes(bytes: &[u8], out: &mut Vec<String>) {
 }
 
 fn collect_keyed_literal_routes(bytes: &[u8], out: &mut Vec<String>) {
-    for key in [
-        b"id".as_slice(),
-        b"route".as_slice(),
-        b"path".as_slice(),
-        b"href".as_slice(),
-    ] {
-        let mut offset = 0;
-        while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
-            let pos = offset + rel;
-            if !source::is_identifier_boundary_before(bytes, pos) {
-                offset = pos + key.len();
-                continue;
-            }
-            let mut i = source::skip_ws(bytes, pos + key.len());
-            if bytes.get(i) != Some(&b':') {
-                offset = pos + key.len();
-                continue;
-            }
-            i = source::skip_ws(bytes, i + 1);
-            let Some(route) = source::quoted_string_at(bytes, i, TemplateMode::Preserve) else {
-                offset = pos + key.len();
-                continue;
-            };
-            push_route(out, &route);
-            offset = i + route.len();
-        }
+    for key in [b"id".as_slice(), b"route", b"path", b"href"] {
+        source::scan_field_strings(bytes, key, b":", false, |route| push_route(out, &route));
     }
 }
 
@@ -546,7 +491,7 @@ fn record_dependency_url(raw: &str, findings: &mut crate::scan::FindingsBuilder)
 }
 
 fn route_from_page(base: &Url) -> Option<String> {
-    route_from_payload(base).or_else(|| {
+    super::route_from_suffix(base, "/__data.json").or_else(|| {
         let path = base.path();
         crate::scan::classify::is_client_route(path).then(|| path.to_owned())
     })

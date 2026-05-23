@@ -9,6 +9,7 @@ use crate::url::Url;
 pub mod next;
 pub mod nuxt;
 pub mod sveltekit;
+mod resolve;
 mod site;
 
 pub use site::{DetectedSite, FrameworkId};
@@ -37,10 +38,7 @@ const POLICIES: &[FrameworkPolicy] = &[
         should_skip: nuxt::should_skip,
         is_manifest: nuxt::is_manifest,
         is_payload: nuxt::is_payload,
-        resolve: |base, raw, site| {
-            nuxt::resolve_asset(base, raw)
-                .or_else(|| nuxt::resolve_context_asset(base, raw, site.has(FrameworkId::Nuxt)))
-        },
+        resolve: |base, raw, site| nuxt::resolve(base, raw, site.has(FrameworkId::Nuxt)),
     },
     FrameworkPolicy {
         id: FrameworkId::SvelteKit,
@@ -49,54 +47,33 @@ const POLICIES: &[FrameworkPolicy] = &[
         is_manifest: sveltekit::is_manifest,
         is_payload: sveltekit::is_payload,
         resolve: |base, raw, site| {
-            sveltekit::resolve_asset(base, raw).or_else(|| {
-                sveltekit::resolve_context_asset(
-                    base,
-                    raw,
-                    site.has(FrameworkId::SvelteKit),
-                    site.sveltekit_immutable_root.as_deref(),
-                )
-            })
+            sveltekit::resolve(
+                base,
+                raw,
+                site.has(FrameworkId::SvelteKit),
+                site.sveltekit_immutable_root.as_deref(),
+            )
         },
     },
     FrameworkPolicy {
         id: FrameworkId::Astro,
-        detect: |bytes, base, _| {
-            base.path().contains("/_astro/")
-                || base.path().contains("/_actions/")
-                || source::contains(bytes, b"/_astro/")
-                || source::contains(bytes, b"astro-island")
-                || source::contains(bytes, b"astro:actions")
-                || source::contains(bytes, b"_actions/")
-        },
+        detect: |bytes, base, _| site::is_astro_context(bytes, base),
         should_skip: |url| {
-            let path = url.path();
-            path.contains("/_astro/")
-                && path_contains_any(
-                    path,
-                    &["/_astro/hoisted.", "/_astro/polyfills", "/_astro/client."],
-                )
+            resolve::should_skip_fragments(
+                url,
+                "/_astro/",
+                &["/_astro/hoisted.", "/_astro/polyfills", "/_astro/client."],
+            )
         },
         is_manifest: |_| false,
         is_payload: |raw, path| raw.contains("/_actions/") || path.contains("/_server-islands/"),
-        resolve: |base, raw, _| {
-            raw.starts_with("_astro/")
-                .then(|| base.join(&format!("/{raw}")).ok())
-                .flatten()
-        },
+        resolve: |base, raw, _| resolve::resolve_prefixed(base, raw, "_astro/"),
     },
     FrameworkPolicy {
         id: FrameworkId::Remix,
-        detect: |bytes, base, _| {
-            base.path().contains("/build/")
-                || base.query().is_some_and(|q| q.contains("_data="))
-                || source::contains(bytes, b"window.__remixContext")
-                || source::contains(bytes, b"__remixManifest")
-                || source::contains(bytes, b"remix-route")
-                || source::contains(bytes, b"/build/routes/")
-        },
+        detect: |bytes, base, _| site::is_remix_context(bytes, base),
         should_skip: |url| {
-            path_contains_any(
+            resolve::path_contains_any(
                 url.path(),
                 &[
                     "/build/_shared/",
@@ -107,33 +84,19 @@ const POLICIES: &[FrameworkPolicy] = &[
             )
         },
         is_manifest: |path| {
-            source::ends_with_ascii_ignore_case(path, "/manifest.js")
-                || source::ends_with_ascii_ignore_case(path, "/manifest.json")
-                || path.contains("/manifest-")
+            resolve::manifest_matches(
+                path,
+                &["/manifest.js", "/manifest.json"],
+                &["/manifest-"],
+                &[],
+            )
         },
         is_payload: |raw, path| {
             raw.contains("?_data=") || raw.contains("&_data=") || path.contains("/_data/")
         },
-        resolve: |base, raw, site| {
-            if raw.starts_with("build/") {
-                return base.join(&format!("/{raw}")).ok();
-            }
-            if site.has(FrameworkId::Remix) {
-                if raw.starts_with("routes/") {
-                    return base.join(&format!("/build/{raw}")).ok();
-                }
-                if raw.starts_with("assets/routes/") {
-                    return base.join(&format!("/{raw}")).ok();
-                }
-            }
-            None
-        },
+        resolve: |base, raw, site| resolve::resolve_remix(base, raw, site.has(FrameworkId::Remix)),
     },
 ];
-
-pub(crate) fn path_contains_any(path: &str, fragments: &[&str]) -> bool {
-    fragments.iter().any(|fragment| path.contains(fragment))
-}
 
 pub(crate) fn route_from_suffix(base: &Url, suffix: &str) -> Option<String> {
     let route = base.path().strip_suffix(suffix)?;
@@ -387,8 +350,8 @@ fn record_payload_route(
         return;
     }
     let route = match framework {
-        FrameworkId::Nuxt => nuxt::route_from_payload(base),
-        FrameworkId::SvelteKit => sveltekit::route_from_payload(base),
+        FrameworkId::Nuxt => route_from_suffix(base, "/_payload.json"),
+        FrameworkId::SvelteKit => route_from_suffix(base, "/__data.json"),
         FrameworkId::Remix => {
             let path = base.path();
             if base.query_pairs().any(|(key, _)| key == "_data") {

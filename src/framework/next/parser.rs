@@ -68,32 +68,23 @@ pub fn parse_next_data(bytes: &[u8]) -> Option<NextConfig> {
 }
 
 fn json_string_field(bytes: &[u8], key: &[u8]) -> Option<String> {
-    let pos = json_key_pos(bytes, key)?;
-    let mut i = source::skip_ws(bytes, pos + key.len() + 2);
-    if bytes.get(i) != Some(&b':') {
-        return None;
-    }
-    i = source::skip_ws(bytes, i + 1);
-    if bytes.get(i) != Some(&b'"') {
-        return None;
-    }
-    source::quoted_string(bytes, i + 1, b'"', source::TemplateMode::Preserve)
+    source::field_string(bytes, key, b":", true)
 }
 
 fn json_string_array_field(bytes: &[u8], key: &[u8]) -> Vec<String> {
-    let Some(pos) = json_key_pos(bytes, key) else {
+    let mut i = None;
+    source::each_field(bytes, key, b":", true, |start| {
+        i = Some(start);
+        true
+    });
+    let Some(mut i) = i else {
         return Vec::new();
     };
-    let mut i = source::skip_ws(bytes, pos + key.len() + 2);
-    if bytes.get(i) != Some(&b':') {
-        return Vec::new();
-    }
-    i = source::skip_ws(bytes, i + 1);
     if bytes.get(i) != Some(&b'[') {
         return Vec::new();
     }
-    i += 1;
     let mut out = Vec::new();
+    let mut i = i + 1;
     while i < bytes.len() {
         i = source::skip_ws(bytes, i);
         match bytes.get(i) {
@@ -110,21 +101,6 @@ fn json_string_array_field(bytes: &[u8], key: &[u8]) -> Vec<String> {
         }
     }
     out
-}
-
-fn json_key_pos(bytes: &[u8], key: &[u8]) -> Option<usize> {
-    let mut offset = 0;
-    while let Some(rel) = memchr::memmem::find(&bytes[offset..], key) {
-        let pos = offset + rel;
-        let quoted_key = pos > 0
-            && bytes.get(pos - 1) == Some(&b'"')
-            && bytes.get(pos + key.len()) == Some(&b'"');
-        if quoted_key {
-            return Some(pos - 1);
-        }
-        offset = pos + key.len();
-    }
-    None
 }
 
 /// Strip the locale prefix from a route path when it matches one of the
@@ -497,12 +473,14 @@ fn walk_flight_payload(payload: &str, out: &mut Vec<String>) {
         if json.is_empty() {
             continue;
         }
-        crate::json::walk_strings(json.as_bytes(), |key, value| {
-            if let Some(k) = key {
-                if matches!(k, "href" | "src" | "action" | "url" | "data-href")
-                    && flight_value_ok(value)
-                {
-                    out.push(value.to_owned());
+        crate::json::walk(json.as_bytes(), |evt| {
+            if let crate::json::Visit::String(key, value) = evt {
+                if let Some(k) = key {
+                    if matches!(k, "href" | "src" | "action" | "url" | "data-href")
+                        && flight_value_ok(value)
+                    {
+                        out.push(value.to_owned());
+                    }
                 }
             }
         });

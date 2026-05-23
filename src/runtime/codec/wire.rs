@@ -29,6 +29,25 @@ pub(crate) fn put_string_vec(out: &mut Vec<u8>, values: &[String]) {
     }
 }
 
+pub(crate) fn encode_frame(magic: &[u8; 8], cap: usize, body: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut out = Vec::with_capacity(cap);
+    out.extend_from_slice(magic);
+    body(&mut out);
+    out
+}
+
+pub(crate) fn decode_frame<T>(
+    bytes: &[u8],
+    magic: &[u8; 8],
+    body: impl FnOnce(&mut Reader<'_>) -> Option<T>,
+) -> Option<T> {
+    let mut r = Reader::new(bytes);
+    (r.take_exact(magic.len())? == magic).then_some(())?;
+    let value = body(&mut r)?;
+    r.finish()?;
+    Some(value)
+}
+
 pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,

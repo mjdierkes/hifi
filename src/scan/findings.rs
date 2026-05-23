@@ -1,6 +1,7 @@
 use crate::framework::FrameworkId;
 use crate::hash::FxHashMap;
 
+use super::classify;
 use super::shape::Shape;
 
 pub type ApiMap = FxHashMap<String, Shape>;
@@ -110,7 +111,7 @@ impl Evidence {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct FindingsBuilder {
     pub evidence: Vec<Evidence>,
 }
@@ -131,6 +132,33 @@ impl FindingsBuilder {
         ScanResult {
             evidence: self.evidence,
         }
+    }
+
+    pub fn try_record_api(&mut self, url: String, shape: Shape, provenance: Provenance) -> bool {
+        if !classify::is_url_like(&url) {
+            return false;
+        }
+        let mut shape = shape;
+        shape.apply_query_params(&url);
+        self.record_api(classify::normalize_api_url(&url), shape, provenance);
+        true
+    }
+
+    pub fn try_record_route(&mut self, url: String, provenance: Provenance) -> bool {
+        if !classify::is_client_route(&url) {
+            return false;
+        }
+        self.record_route(url, provenance);
+        true
+    }
+
+    pub fn try_record_candidate(&mut self, url: impl Into<String>, provenance: Provenance) -> bool {
+        let url = url.into();
+        if !classify::is_api_candidate(&url) {
+            return false;
+        }
+        self.record_candidate(classify::normalize_api_url(&url), provenance);
+        true
     }
 
     pub fn record_api(&mut self, url: String, shape: Shape, provenance: Provenance) {

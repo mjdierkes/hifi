@@ -226,60 +226,6 @@ fn prewarm_key(url: &Url) -> Option<String> {
     Some(format!("{}://{host}:{port}", url.scheme()))
 }
 
-enum CacheResolution {
-    Fresh(Arc<AssetData>),
-    StaleRevalidate {
-        data: Arc<AssetData>,
-        validators: cache::AssetValidators,
-        content_hash: String,
-    },
-    Conditional(cache::CachedAsset),
-    Miss,
-}
-
-fn resolve_cache(
-    asset: &AssetRef,
-    use_cache: bool,
-    cache_key: Option<&str>,
-) -> CacheResolution {
-    if !use_cache {
-        return CacheResolution::Miss;
-    }
-    let chunk_cache = cache::ChunkCache::new();
-    if asset.kind == discover::AssetKind::Script {
-        if let Some(chunk) = chunk_cache.read_fresh_url(&asset.url) {
-            return CacheResolution::Fresh(chunk.data);
-        }
-        if let Some(chunk) = chunk_cache.read_stale_url(&asset.url) {
-            return CacheResolution::StaleRevalidate {
-                data: chunk.data,
-                validators: chunk.validators,
-                content_hash: chunk.content_hash,
-            };
-        }
-    }
-    if let Some(cached) = cache::read_asset_cached(&asset.url, cache_key) {
-        if cached.age_secs < cache::CACHE_FRESH_SECS {
-            return CacheResolution::Fresh(Arc::new(cached.data));
-        }
-        return CacheResolution::Conditional(cached);
-    }
-    CacheResolution::Miss
-}
-
-fn persist_fetched(
-    url: &Url,
-    cache_key: Option<&str>,
-    data: Arc<AssetData>,
-    validators: &cache::AssetValidators,
-    content_hash: Option<&str>,
-) {
-    cache::write_asset_with_validators_deferred(url, data.clone(), cache_key, validators);
-    if let Some(hash) = content_hash {
-    cache::ChunkCache::new().write_deferred(url, hash, data, validators);
-    }
-}
-
 async fn fetch_scan(
     client: Client,
     asset: AssetRef,
@@ -288,9 +234,9 @@ async fn fetch_scan(
     allow_private: bool,
     site: DetectedSite,
 ) -> Result<Arc<AssetData>, FetchFailure> {
-    let cached = match resolve_cache(&asset, use_cache, cache_key) {
-        CacheResolution::Fresh(data) => return Ok(data),
-        CacheResolution::StaleRevalidate {
+    let cached = match cache::resolve_asset(&asset, cache_key, use_cache) {
+        cache::CacheAction::Hit(data) => return Ok(data),
+        cache::CacheAction::StaleRevalidate {
             data,
             validators,
             content_hash,
@@ -306,8 +252,8 @@ async fn fetch_scan(
             );
             return Ok(data);
         }
-        CacheResolution::Conditional(c) => Some(c),
-        CacheResolution::Miss => None,
+        cache::CacheAction::Revalidate(c) => Some(c),
+        cache::CacheAction::Miss => None,
     };
 
     let validators = cached.as_ref().map(|asset_data| &asset_data.validators);
@@ -324,7 +270,7 @@ async fn fetch_scan(
         FetchedBody::NotModified => {
             let cached = cached.ok_or(FetchFailure::Other)?;
             let asset_data = Arc::new(cached.data);
-            persist_fetched(
+            cache::persist_asset(
                 &asset.url,
                 cache_key,
                 asset_data.clone(),
@@ -336,7 +282,7 @@ async fn fetch_scan(
         FetchedBody::Body(scan, validators, content_hash) => {
             let asset_data = Arc::new(*scan);
             if use_cache {
-                persist_fetched(
+                cache::persist_asset(
                     &asset.url,
                     cache_key,
                     asset_data.clone(),
@@ -410,7 +356,7 @@ async fn fetch_asset_body(
         .then(|| crate::hash::hash128_hex(&body));
     let cached_findings = content_hash
         .as_deref()
-        .and_then(|hash| cache::ChunkCache::new().read_content_findings(hash));
+        .and_then(|hash| cache::CHUNK.read_content_findings(hash));
     let scan_url = current_url.clone();
     let scan = tokio::task::spawn_blocking(move || {
         discover::scan_document_with_config_and_findings(
@@ -485,8 +431,8 @@ fn spawn_revalidate_chunk(
             FetchedBody::NotModified => {
                 // Server confirmed bytes unchanged: refresh validator sidecar
                 // timestamps so future scans treat the entry as fresh again.
-                if let Some(existing) = cache::ChunkCache::new().read_stale_url(&asset.url) {
-                    cache::ChunkCache::new().write_deferred(
+                if let Some(existing) = cache::CHUNK.read_url(&asset.url, cache::CHUNK_URL_STALE_SECS) {
+                    cache::CHUNK.write_deferred(
                         &asset.url,
                         &cached_content_hash,
                         existing.data,
@@ -495,7 +441,7 @@ fn spawn_revalidate_chunk(
                 }
             }
             FetchedBody::Body(scan, new_validators, content_hash) => {
-                persist_fetched(
+                cache::persist_asset(
                     &asset.url,
                     cache_key.as_deref(),
                     Arc::new(*scan),

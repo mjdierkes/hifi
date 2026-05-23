@@ -61,7 +61,7 @@ impl AssetRef {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct DocumentScan {
     pub findings: FindingsBuilder,
     pub assets: Vec<AssetRef>,
@@ -159,18 +159,14 @@ pub(crate) fn push_asset(
 pub(crate) fn push_candidate(findings: &mut FindingsBuilder, raw: &str) {
     framework::next::push_framework_candidate(findings, raw);
     let path = raw.split(['?', '#']).next().unwrap_or(raw);
-    if (framework::nuxt::is_payload(raw, path)
+    if framework::nuxt::is_payload(raw, path)
         || framework::sveltekit::is_payload(raw, path)
         || raw.contains("/_actions/")
         || path.contains("/_server-islands/")
         || raw.contains("?_data=")
         || raw.contains("&_data=")
-        || path.contains("/_data/"))
-        && crate::scan::classify::is_api_candidate(raw)
+        || path.contains("/_data/")
     {
-        findings.record_candidate(
-            crate::scan::classify::normalize_api_url(raw),
-            Provenance::literal(),
-        );
+        findings.try_record_candidate(raw, Provenance::literal());
     }
 }

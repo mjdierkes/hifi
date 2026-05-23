@@ -10,6 +10,7 @@
 //! This is not a conformance-grade JSON parser. It accepts what production
 //! frameworks emit and rejects everything else by returning `None`.
 
+use std::borrow::Cow;
 use std::str;
 
 #[derive(Debug)]
@@ -293,19 +294,7 @@ fn push_char(out: &mut Vec<u8>, code: u32) -> Option<()> {
     Some(())
 }
 
-/// Walk every string value in `bytes`, calling `visit(parent_key, value)` for
-/// each. `parent_key` is the key the value lives under in its immediate
-/// object, or `None` if the value is an array element. Object keys
-/// themselves are not visited as strings.
-pub fn walk_strings(bytes: &[u8], mut visit: impl FnMut(Option<&str>, &str)) {
-    walk(bytes, |evt| {
-        if let Visit::String(key, value) = evt {
-            visit(key, value);
-        }
-    });
-}
-
-/// Walk events emitted by [`walk`].
+/// Walk events emitted by the JSON scanner.
 pub enum Visit<'a> {
     /// An object key. Fires for every key in every object.
     Key(&'a str),
@@ -315,28 +304,27 @@ pub enum Visit<'a> {
     String(Option<&'a str>, &'a str),
 }
 
-/// Walk strings and object keys with a single visitor closure.
+/// Walk strings and object keys; ignore events the closure does not handle.
 pub fn walk(bytes: &[u8], mut visit: impl FnMut(Visit<'_>)) {
     let mut p = Parser::new(bytes);
     // Stack tracks the parent_key context across object boundaries. Arrays do
     // NOT push: the parent key visible to an array's elements is the key the
     // array itself lives under (e.g. `{"routes": ["/a"]}` should report
     // parent_key=Some("routes") for "/a").
-    let mut key_stack: Vec<Option<String>> = Vec::new();
-    let mut current_key: Option<String> = None;
+    let mut key_stack: Vec<Option<Cow<'_, str>>> = Vec::new();
+    let mut current_key: Option<Cow<'_, str>> = None;
     while let Some(evt) = p.next() {
         match evt {
-            Event::BeginObject => {
-                key_stack.push(current_key.take());
-            }
-            Event::EndObject => {
-                current_key = key_stack.pop().unwrap_or(None);
-            }
+            Event::BeginObject => key_stack.push(current_key.take()),
+            Event::EndObject => current_key = key_stack.pop().unwrap_or(None),
             Event::BeginArray | Event::EndArray => {}
             Event::Key(k) => {
-                let s = k.as_str();
-                visit(Visit::Key(s));
-                current_key = Some(s.to_owned());
+                let cow = match k {
+                    JsonStr::Borrowed(b) => Cow::Borrowed(b),
+                    JsonStr::Owned(o) => Cow::Owned(o),
+                };
+                visit(Visit::Key(cow.as_ref()));
+                current_key = Some(cow);
             }
             Event::String(s) => {
                 visit(Visit::String(current_key.as_deref(), s.as_str()));
@@ -361,19 +349,14 @@ pub fn object_keys(bytes: &[u8], parent_key: Option<&str>) -> Option<Vec<String>
                         if !matches!(p.next()?, Event::BeginObject) {
                             return None;
                         }
-                        return read_object_keys(&mut p);
+                        break;
                     }
                     p.skip_value()?;
                 }
                 _ => return None,
             }
         }
-    } else {
-        read_object_keys(&mut p)
     }
-}
-
-fn read_object_keys(p: &mut Parser<'_>) -> Option<Vec<String>> {
     let mut keys = Vec::new();
     loop {
         match p.next()? {
@@ -409,8 +392,10 @@ mod tests {
     fn walk_strings_visits_with_key_context() {
         let bytes = br#"{"href":"/dashboard","nested":{"action":"/api"}}"#;
         let mut hits: Vec<(Option<String>, String)> = Vec::new();
-        walk_strings(bytes, |k, v| {
-            hits.push((k.map(str::to_owned), v.to_owned()));
+        walk(bytes, |evt| {
+            if let Visit::String(k, v) = evt {
+                hits.push((k.map(str::to_owned), v.to_owned()));
+            }
         });
         assert_eq!(
             hits,
@@ -425,7 +410,11 @@ mod tests {
     fn walk_strings_handles_array_elements() {
         let bytes = br#"{"deps":["/a","/b"]}"#;
         let mut hits: Vec<String> = Vec::new();
-        walk_strings(bytes, |_k, v| hits.push(v.to_owned()));
+        walk(bytes, |evt| {
+            if let Visit::String(_, v) = evt {
+                hits.push(v.to_owned());
+            }
+        });
         assert_eq!(hits, vec!["/a", "/b"]);
     }
 
@@ -433,7 +422,11 @@ mod tests {
     fn handles_escapes() {
         let bytes = br#"{"k":"a\/b\nA"}"#;
         let mut hits: Vec<String> = Vec::new();
-        walk_strings(bytes, |_k, v| hits.push(v.to_owned()));
+        walk(bytes, |evt| {
+            if let Visit::String(_, v) = evt {
+                hits.push(v.to_owned());
+            }
+        });
         assert_eq!(hits, vec!["a/b\nA"]);
     }
 
@@ -441,7 +434,11 @@ mod tests {
     fn handles_unicode_surrogate_pairs() {
         let bytes = br#"{"k":"route-\ud83d\ude00"}"#;
         let mut hits: Vec<String> = Vec::new();
-        walk_strings(bytes, |_k, v| hits.push(v.to_owned()));
+        walk(bytes, |evt| {
+            if let Visit::String(_, v) = evt {
+                hits.push(v.to_owned());
+            }
+        });
         assert_eq!(hits, vec!["route-\u{1f600}"]);
     }
 
@@ -449,7 +446,11 @@ mod tests {
     fn rejects_unpaired_surrogates() {
         let bytes = br#"{"k":"route-\ud83d"}"#;
         let mut hits: Vec<String> = Vec::new();
-        walk_strings(bytes, |_k, v| hits.push(v.to_owned()));
+        walk(bytes, |evt| {
+            if let Visit::String(_, v) = evt {
+                hits.push(v.to_owned());
+            }
+        });
         assert!(hits.is_empty());
     }
 }

@@ -1,4 +1,5 @@
 pub mod app;
+mod generated;
 mod discover;
 mod framework;
 mod grep;
