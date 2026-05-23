@@ -133,6 +133,7 @@ pub async fn scan_site(
         }
     }
 
+    client.backpressure().set_capacity(concurrency);
     let asset_stats = fetch::scan_assets(
         fetch::ScanEnv {
             client: client.clone(),

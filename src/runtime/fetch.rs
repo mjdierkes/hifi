@@ -325,6 +325,7 @@ async fn fetch_asset_body(
 ) -> Result<FetchedBody, FetchFailure> {
     let mut current_url = asset.url.clone();
     let mut redirects = 0;
+    let _bp_guard = client.backpressure().enter();
     let response = loop {
         net::validate_request_url(&current_url, allow_private)
             .await

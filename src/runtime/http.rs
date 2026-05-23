@@ -12,7 +12,7 @@ use std::{
     error, fmt, io,
     io::IoSlice,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -52,6 +52,52 @@ struct ClientInner {
     default_headers: Vec<(String, String)>,
     h2: Mutex<FxHashMap<Origin, Arc<H2Session>>>,
     http1_pool: http1::Pool,
+    backpressure: Arc<Backpressure>,
+}
+
+/// Shared load signal used to tune HTTP/2 flow-control generosity.
+pub struct Backpressure {
+    inflight: AtomicUsize,
+    capacity: AtomicUsize,
+}
+
+impl Backpressure {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inflight: AtomicUsize::new(0),
+            capacity: AtomicUsize::new(capacity.max(1)),
+        }
+    }
+
+    pub fn enter(self: &Arc<Self>) -> InflightGuard {
+        self.inflight.fetch_add(1, Ordering::Relaxed);
+        InflightGuard(self.clone())
+    }
+
+    pub fn set_capacity(&self, capacity: usize) {
+        self.capacity.store(capacity.max(1), Ordering::Relaxed);
+    }
+
+    fn generosity(&self) -> f32 {
+        let cap = self.capacity.load(Ordering::Relaxed).max(1) as f32;
+        let inflight = self.inflight.load(Ordering::Relaxed) as f32;
+        let pressure = (inflight / cap).clamp(0.0, 1.5);
+        (1.0 - pressure * 0.5).clamp(0.25, 1.0)
+    }
+}
+
+impl Default for Backpressure {
+    fn default() -> Self {
+        Self::new(256)
+    }
+}
+
+pub struct InflightGuard(Arc<Backpressure>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,7 +231,12 @@ impl Client {
         if let Some(session) = self.inner.h2.lock().await.get(&origin).cloned() {
             return Ok(session);
         }
-        let session = connect_h2(origin.clone(), self.inner.tls_h2.clone()).await?;
+        let session = connect_h2(
+            origin.clone(),
+            self.inner.tls_h2.clone(),
+            self.inner.backpressure.clone(),
+        )
+        .await?;
         let mut sessions = self.inner.h2.lock().await;
         Ok(sessions.entry(origin).or_insert(session).clone())
     }
@@ -224,8 +275,15 @@ impl ClientBuilder {
                 default_headers: self.default_headers,
                 h2: Mutex::new(FxHashMap::default()),
                 http1_pool: http1::Pool::default(),
+                backpressure: Arc::new(Backpressure::default()),
             }),
         }
+    }
+}
+
+impl Client {
+    pub fn backpressure(&self) -> Arc<Backpressure> {
+        self.inner.backpressure.clone()
     }
 }
 
@@ -280,13 +338,19 @@ struct H2Session {
     streams: Mutex<FxHashMap<u32, mpsc::UnboundedSender<StreamMessage>>>,
     decoder: Mutex<HpackDecoder>,
     next_stream_id: AtomicU32,
+    backpressure: Arc<Backpressure>,
+    conn_pending_credit: AtomicU32,
 }
 
 enum H2Write {
     Frames(Vec<HiBytes>),
 }
 
-async fn connect_h2(origin: Origin, tls: TlsConnector) -> Result<Arc<H2Session>, Error> {
+async fn connect_h2(
+    origin: Origin,
+    tls: TlsConnector,
+    backpressure: Arc<Backpressure>,
+) -> Result<Arc<H2Session>, Error> {
     let tcp = connect_tcp(&origin).await?;
     let name = ServerName::try_from(origin.host.clone())
         .map_err(|_| Error::BadDnsName(origin.host.clone()))?;
@@ -302,6 +366,7 @@ async fn connect_h2(origin: Origin, tls: TlsConnector) -> Result<Arc<H2Session>,
     }
 
     stream.write_all(H2_PREFACE).await?;
+    let initial_window = scaled_initial_window(&backpressure);
     write_frame(
         &mut stream,
         FrameHeader {
@@ -310,20 +375,22 @@ async fn connect_h2(origin: Origin, tls: TlsConnector) -> Result<Arc<H2Session>,
             flags: 0,
             stream_id: 0,
         },
-        &settings_payload(),
+        &settings_payload(initial_window),
     )
     .await?;
-    write_frame(
-        &mut stream,
-        FrameHeader {
-            len: 4,
-            kind: FrameType::WindowUpdate as u8,
-            flags: 0,
-            stream_id: 0,
-        },
-        &(SCANNER_INITIAL_WINDOW - DEFAULT_H2_WINDOW).to_be_bytes(),
-    )
-    .await?;
+    if initial_window > DEFAULT_H2_WINDOW {
+        write_frame(
+            &mut stream,
+            FrameHeader {
+                len: 4,
+                kind: FrameType::WindowUpdate as u8,
+                flags: 0,
+                stream_id: 0,
+            },
+            &(initial_window - DEFAULT_H2_WINDOW).to_be_bytes(),
+        )
+        .await?;
+    }
     let (reader, writer) = tokio::io::split(stream);
     let (writer_tx, writer_rx) = mpsc::unbounded_channel();
     let session = Arc::new(H2Session {
@@ -332,10 +399,17 @@ async fn connect_h2(origin: Origin, tls: TlsConnector) -> Result<Arc<H2Session>,
         streams: Mutex::new(FxHashMap::default()),
         decoder: Mutex::new(HpackDecoder::default()),
         next_stream_id: AtomicU32::new(1),
+        backpressure,
+        conn_pending_credit: AtomicU32::new(0),
     });
     tokio::spawn(write_h2(writer, writer_rx));
     tokio::spawn(read_h2(session.clone(), reader));
     Ok(session)
+}
+
+fn scaled_initial_window(backpressure: &Backpressure) -> u32 {
+    let scaled = (SCANNER_INITIAL_WINDOW as f32 * backpressure.generosity()) as u32;
+    scaled.max(DEFAULT_H2_WINDOW * 4)
 }
 
 impl H2Session {
@@ -659,10 +733,10 @@ enum FrameType {
     Continuation = 9,
 }
 
-fn settings_payload() -> [u8; 12] {
+fn settings_payload(initial_window: u32) -> [u8; 12] {
     let mut out = [0u8; 12];
     out[1] = 0x04;
-    out[2..6].copy_from_slice(&SCANNER_INITIAL_WINDOW.to_be_bytes());
+    out[2..6].copy_from_slice(&initial_window.to_be_bytes());
     out[7] = 0x05;
     out[8..12].copy_from_slice(&(MAX_FRAME_SIZE as u32).to_be_bytes());
     out
@@ -712,27 +786,39 @@ fn release_window(session: &H2Session, stream_id: u32, len: usize) {
     if increment == 0 {
         return;
     }
-    let bytes = increment.to_be_bytes();
-    let _ = session.writer.send(H2Write::Frames(vec![
-        encode_frame(
-            FrameHeader {
-                len: 4,
-                kind: FrameType::WindowUpdate as u8,
-                flags: 0,
-                stream_id: 0,
-            },
-            &bytes,
-        ),
-        encode_frame(
-            FrameHeader {
-                len: 4,
-                kind: FrameType::WindowUpdate as u8,
-                flags: 0,
-                stream_id,
-            },
-            &bytes,
-        ),
-    ]));
+    let stream_bytes = increment.to_be_bytes();
+    let mut frames = vec![encode_frame(
+        FrameHeader {
+            len: 4,
+            kind: FrameType::WindowUpdate as u8,
+            flags: 0,
+            stream_id,
+        },
+        &stream_bytes,
+    )];
+
+    let pending = session
+        .conn_pending_credit
+        .fetch_add(increment, Ordering::Relaxed)
+        + increment;
+    let threshold = ((SCANNER_INITIAL_WINDOW as f32 / 4.0) * session.backpressure.generosity())
+        .max(4096.0) as u32;
+    if pending >= threshold {
+        let flush = session.conn_pending_credit.swap(0, Ordering::Relaxed);
+        if flush > 0 {
+            frames.push(encode_frame(
+                FrameHeader {
+                    len: 4,
+                    kind: FrameType::WindowUpdate as u8,
+                    flags: 0,
+                    stream_id: 0,
+                },
+                &flush.to_be_bytes(),
+            ));
+        }
+    }
+
+    let _ = session.writer.send(H2Write::Frames(frames));
 }
 
 fn encode_frame(header: FrameHeader, payload: &[u8]) -> HiBytes {
@@ -816,5 +902,18 @@ mod tests {
             payload: HiBytes::from_static(&[1, b'x', b'y', b'z', 0]),
         };
         assert_eq!(data_payload(&frame).unwrap(), HiBytes::from_static(b"xyz"));
+    }
+
+    #[test]
+    fn backpressure_generosity_shrinks_under_load() {
+        let bp = Arc::new(Backpressure::new(4));
+        let full = bp.generosity();
+        let _g1 = bp.enter();
+        let _g2 = bp.enter();
+        let _g3 = bp.enter();
+        let _g4 = bp.enter();
+        let loaded = bp.generosity();
+        assert!(loaded < full);
+        assert!(loaded >= 0.25);
     }
 }
